@@ -1,10 +1,10 @@
 from typing import Any, List
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from app.context.api_schema import BaseRequest, StandardResponse
+from app.core.api_schema import BaseRequest, StandardResponse
 
 
 logger = logging.getLogger(__name__)
@@ -41,13 +41,9 @@ class DomainListResponseData(BaseModel):
     summary="查询已集成的垂类领域列表",
     description="作为大模型垂类领域整合后端的示例接口，返回当前可用的垂直领域配置。",
 )
-async def list_domains(
-    body: DomainListRequest,
-) -> StandardResponse[DomainListResponseData]:
-    # 业务日志示例：记录请求参数和 trace_id，便于定位问题
-    logger.info(f"list_domains called | only_active={body.only_active} | trace_id={body.trace_id}")
+async def list_domains(request: Request, body: DomainListRequest) -> StandardResponse[DomainListResponseData]:
+    logger.info(f"list_domains called | only_active={body.only_active}")
 
-    # 实际场景中这里会从数据库或配置中心读取
     mock_items: List[DomainConfig] = [
         DomainConfig(
             name="finance",
@@ -73,4 +69,3 @@ async def list_domains(
         data=data,
         trace_id=body.trace_id,
     )
-

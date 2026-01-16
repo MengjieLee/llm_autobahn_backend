@@ -31,17 +31,17 @@ fi
 echo "使用 conda run 启动 FastAPI 应用..."
 
 # 后台启动应用（不再通过管道重定向日志，避免缓冲导致延迟）
-conda run -n "${ENV_NAME}" uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level critical 2>&1 &
+conda run -n "${ENV_NAME}" uvicorn app.main:app --host 0.0.0.0 --port 8739 --log-level critical 2>&1 &
 APP_PID=$!
 
 echo "FastAPI 进程已启动，PID=${APP_PID}，正在等待健康检查通过..."
 
 # 简单轮询健康检查，最多等待 30 秒
-START_MSG="LLM Autobahn Backend 启动成功，监听 0.0.0.0:8000"
+START_MSG="LLM Autobahn Backend 启动成功，监听 0.0.0.0:8739"
 TIMEOUT_MSG="LLM Autobahn Backend 启动健康检查超时，请检查应用日志"
 
 for i in {1..30}; do
-  if curl -s "http://127.0.0.1:8000/health" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+  if curl -s "http://127.0.0.1:8739/health" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
     echo "${START_MSG}"
     break
   fi

@@ -8,15 +8,15 @@ from fastapi.responses import JSONResponse
 from app.api.router import api_router
 from app.conf.config import settings
 from app.conf.logging_config import setup_logging
-from app.context.exceptions import (
+from app.core.exceptions import (
     BizException,
     biz_exception_handler,
     generic_exception_handler,
     http_exception_handler,
 )
-from app.context.middleware import request_id_middleware
+from app.core.middleware import request_id_middleware, auth_middleware
 from fastapi.middleware.cors import CORSMiddleware
-from app.context.api_schema import ErrorResponse
+from app.core.api_schema import ErrorResponse
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # 中间件
+    # 中间件（注意执行顺序：从外到内）
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # 放行「所有」前端域名（开发环境推荐）
@@ -54,7 +54,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],  # 放行「所有」请求方法：GET/POST/PUT/DELETE/OPTIONS等
         allow_headers=["*"],  # 放行「所有」请求头：Authorization/Content-Type等
     )
-    app.middleware("http")(request_id_middleware)
+    app.middleware("http")(request_id_middleware)  # 添加 trace_id
+    app.middleware("http")(auth_middleware)  # 鉴权中间件
 
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(BizException, biz_exception_handler)
