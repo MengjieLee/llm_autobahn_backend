@@ -35,6 +35,7 @@ PUBLIC_PATHS = {
 
 # 不需要鉴权的路径前缀
 PUBLIC_PATH_PREFIXES = [
+    "/api/v1/account",  # 登录相关路径
     "/api/v1/openapi",  # OpenAPI 文档相关路径
     "/api/v1/test",  # OpenAPI 文档相关路径
 ]
@@ -103,7 +104,7 @@ async def auth_middleware(request: Request, call_next: Callable) -> Response:
         )
     
     # 验证 token 有效性
-    if not is_user_valid(token):
+    if not await is_user_valid(token):
         logger.warning(f"鉴权失败：token 无效或已过期 | path={path} | trace_id={trace_id}")
         return JSONResponse(
             status_code=401,
@@ -116,7 +117,7 @@ async def auth_middleware(request: Request, call_next: Callable) -> Response:
         )
     
     # 获取用户信息并存储到 request.state
-    user_info = get_user(token)
+    user_info = await get_user(token)
     if user_info:
         request.state.user = user_info
         request.state.token = token
