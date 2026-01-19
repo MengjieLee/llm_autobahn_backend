@@ -17,6 +17,7 @@ from app.core.exceptions import (
 from app.core.middleware import request_id_middleware, auth_middleware
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.api_schema import ErrorResponse
+from context.doris_connector import get_doris_connector, close_doris_connector
 
 
 logger = logging.getLogger(__name__)
@@ -26,9 +27,20 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """推荐的 lifespan 生命周期写法，用于记录启动 / 停止日志。"""
     logger.info(f"后台启动 | name={settings.app_name} | api_prefix={settings.api_v1_prefix}")
+    doris_connector = None
+    try:
+        doris_connector = get_doris_connector()
+        app.state.doris_connector = doris_connector
+        test_result = doris_connector.test_connection()
+        if test_result.get("errcode") != 0:
+            logger.warning("Doris 连接预检查失败: %s", test_result)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("初始化 Doris 连接失败")
     try:
         yield
     finally:
+        if doris_connector:
+            close_doris_connector()
         logger.info(f"后台终止 | name={settings.app_name}", )
 
 
