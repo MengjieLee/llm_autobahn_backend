@@ -29,18 +29,22 @@ async def lifespan(app: FastAPI):
     logger.info(f"后台启动 | name={settings.app_name} | api_prefix={settings.api_v1_prefix}")
     doris_connector = None
     try:
-        doris_connector = get_doris_connector()
-        app.state.doris_connector = doris_connector
-        test_result = doris_connector.test_connection()
-        if test_result.get("errcode") != 0:
-            logger.warning("Doris 连接预检查失败: %s", test_result)
+        if settings.doris_configured:
+            doris_connector = await get_doris_connector()
+            test_result = await doris_connector.test_connection()
+            if test_result.get("errcode") != 0:
+                logger.warning("Doris 连接预检查失败: %s", test_result)
+        else:
+            logger.warning(
+                "Doris 未配置，跳过连接初始化与预检查（请设置 DEFAULT_DORIS_HOST/PORT/USER/CATALOG/DATABASE）"
+            )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("初始化 Doris 连接失败")
+        logger.exception("初始化 Doris 连接失败，已跳过 Doris，应用继续启动")
     try:
         yield
     finally:
         if doris_connector:
-            close_doris_connector()
+            await close_doris_connector()
         logger.info(f"后台终止 | name={settings.app_name}", )
 
 

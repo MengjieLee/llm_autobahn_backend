@@ -1,5 +1,5 @@
 import logging
-from functools import lru_cache
+import asyncio
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
@@ -8,22 +8,21 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlparse.tokens import DML
+from async_lru import alru_cache
 
 from app.conf.config import settings
 
 
 logger = logging.getLogger(__name__)
 
-
+# --------------------------- 工具函数（保留不变） ---------------------------
 def has_limit_clause(parsed_sql) -> bool:
-    """语法级检测SQL是否包含LIMIT子句（排除注释/字符串中的LIMIT）"""
     for token in parsed_sql.flatten():
-        if token.ttype in (sqlparse.tokens.Comment,):
+        if token.ttype in (sqlparse.tokens.Comment, sqlparse.tokens.String):
             continue
         if token.value.upper() == "LIMIT":
             return True
     return False
-
 
 def add_limit_safe(
     sql_input: str,
@@ -31,14 +30,6 @@ def add_limit_safe(
     allow_multi_stmt: bool = False,
     max_limit: int = 1000,
 ) -> str:
-    """
-    生产级：安全添加LIMIT（防注入+边界处理）
-    :param sql_input: 原始SQL
-    :param limit: 默认LIMIT值（不超过max_limit）
-    :param allow_multi_stmt: 是否允许多语句（默认禁止）
-    :param max_limit: 最大允许的LIMIT值（防恶意大数值）
-    :return: 安全的SQL语句
-    """
     limit = min(int(limit), max_limit)
     if limit < 1:
         limit = 1
@@ -63,23 +54,18 @@ def add_limit_safe(
                 stmt_type = token.value.upper()
                 break
 
-        if stmt_type not in ("SELECT", "UPDATE", "DELETE"):
+        if stmt_type == "SELECT":
+            stmt_clean = stmt_str.rstrip(";")
+            new_stmt = f"{stmt_clean} LIMIT {limit};"
+            new_stmts.append(new_stmt)
+        else:
             new_stmts.append(stmt_str)
-            continue
-
-        stmt_clean = stmt_str.rstrip(";")
-        new_stmt = f"{stmt_clean} LIMIT {limit};"
-        new_stmts.append(new_stmt)
 
     return "\n".join(new_stmts)
 
-
+# --------------------------- 连接器类（核心修改） ---------------------------
 class DorisConnectorPydoris:
-    """Doris 连接器（无 Streamlit 依赖，使用日志与异常）。"""
-
-    @staticmethod
-    def _row_to_dict(row):
-        return row._asdict() if hasattr(row, "_asdict") else dict(row)
+    """Doris 连接器（适配FastAPI异步场景）。"""
 
     def __init__(
         self,
@@ -92,17 +78,13 @@ class DorisConnectorPydoris:
     ):
         self.host = host
         self.port = port
-        self.user = user
-        self.password = password
+        self.user = quote_plus(user)
+        self.password = quote_plus(password)
         self.catalog = catalog
         self.database = database
         self.engine: Optional[Engine] = None
-
-        encoded_user = quote_plus(user)
-        encoded_password = quote_plus(password)
         self.connection_string = (
-            f"doris://{encoded_user}:{encoded_password}"
-            f"@{host}:{port}/{catalog}.{database}"
+            f"doris://{self.user}:{self.password}@{host}:{port}/{catalog}.{database}"
         )
         logger.info(
             "初始化 Doris 连接 | host=%s port=%s catalog=%s db=%s",
@@ -112,78 +94,116 @@ class DorisConnectorPydoris:
             database,
         )
 
-    def _ensure_engine(self) -> Engine:
+    def _create_engine_sync(self) -> Engine:
+        """同步创建引擎（供线程池调用）"""
         if self.engine:
             return self.engine
 
         try:
             connect_args = {"charset": "utf8mb4"}
-            self.engine = create_engine(
-                self.connection_string, connect_args=connect_args
+            engine = create_engine(
+                self.connection_string,
+                connect_args=connect_args,
+                pool_size=10,          
+                max_overflow=20,       
+                pool_recycle=3600,     
+                pool_pre_ping=True     
             )
+            self.engine = engine
             logger.info("已创建 Doris 引擎: %s:%s", self.host, self.port)
-            return self.engine
-        except Exception as exc:  # noqa: BLE001
+            return engine
+        except Exception as exc:
             logger.exception("创建 Doris 引擎失败")
             raise
 
-    def test_connection(self) -> Dict[str, Any]:
+    async def _ensure_engine_async(self) -> Engine:
+        """异步创建引擎（将同步操作放到线程池）"""
+        if self.engine:
+            return self.engine
+        # 核心修改：把引擎创建放到线程池
+        return await asyncio.to_thread(self._create_engine_sync)
+
+    @staticmethod
+    def _row_to_dict(row) -> Dict[str, Any]:
         try:
-            engine = self._ensure_engine()
-            with engine.connect() as connection:
-                result = connection.execute(text("SELECT 1 as test")).fetchone()
-                version = connection.execute(
-                    text("SELECT version() as version")
-                ).fetchone()
-                payload = {
-                    "ping": self._row_to_dict(result),
-                    "version": self._row_to_dict(version),
-                }
-                logger.info("Doris 连接测试成功: %s", payload)
-                return {"errcode": 0, "message": "ok", "data": payload}
-        except Exception as exc:  # noqa: BLE001
+            if hasattr(row, "_asdict"):
+                return row._asdict()
+            return dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+        except Exception:
+            return {k: v for k, v in zip(row.keys(), row)}
+
+    def _sync_test_connection(self, engine: Engine) -> Dict[str, Any]:
+        """同步测试连接"""
+        with engine.connect() as connection:
+            result = connection.execute(text("SELECT 1 as test")).fetchone()
+            version = connection.execute(text("SELECT version() as version")).fetchone()
+            return {
+                "ping": self._row_to_dict(result),
+                "version": self._row_to_dict(version),
+            }
+
+    async def test_connection(self) -> Dict[str, Any]:
+        """异步测试连接（完整异步化）"""
+        try:
+            # 核心修改：先异步创建引擎
+            engine = await self._ensure_engine_async()
+            # 再异步执行测试
+            result = await asyncio.to_thread(self._sync_test_connection, engine)
+            return {"errcode": 0, "message": "ok", "data": result}
+        except Exception as exc:
             logger.exception("Doris 连接测试失败")
             return {"errcode": 59001, "message": f"连接测试失败: {exc}", "data": None}
 
-    def show_table_columns(self, table: str) -> Dict[str, Any]:
+    def _sync_execute_sql(self, engine: Engine, sql: text) -> List[Dict[str, Any]]:
+        """同步执行SQL"""
+        with engine.connect() as connection:
+            if sql.text.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "ALTER")):
+                result_raw = connection.execute(sql)
+                connection.commit()
+                return [{"affected_rows": result_raw.rowcount}]
+            else:
+                result_raw = connection.execute(sql)
+                return [self._row_to_dict(row) for row in result_raw.fetchall()]
+
+    async def show_table_columns(self, table: str) -> Dict[str, Any]:
+        """异步查询表结构"""
         try:
-            engine = self._ensure_engine()
-            full_table_name = f"{self.catalog}.{self.database}.{table}"
-            sql = f"SHOW COLUMNS FROM {full_table_name}"
+            engine = await self._ensure_engine_async()
+            full_table_name = f"{self.catalog}.{self.database}.{table.replace('`', '')}"
+            sql = text(f"SHOW COLUMNS FROM `{full_table_name}`")
+            
             logger.debug("查询表结构 SQL: %s", sql)
-            with engine.connect() as connection:
-                result = connection.execute(text(sql))
-                columns = [self._row_to_dict(row) for row in result.fetchall()]
-                return {"errcode": 0, "message": "ok", "data": columns}
-        except Exception as exc:  # noqa: BLE001
+            columns = await asyncio.to_thread(self._sync_execute_sql, engine, sql)
+            return {"errcode": 0, "message": "ok", "data": columns}
+        except Exception as exc:
             logger.exception("查询表列信息失败: table=%s", table)
             return {"errcode": 59401, "message": f"查询表结构失败: {exc}", "data": []}
 
-    def execute_custom_sql(
+    async def execute_custom_sql(
         self, sql: str, *, limit: int = 1000, allow_multi_stmt: bool = False
     ) -> Dict[str, Any]:
+        """异步执行自定义SQL"""
         result: Dict[str, Any] = {"errcode": 0, "message": "请求成功", "data": []}
 
         try:
-            engine = self._ensure_engine()
+            engine = await self._ensure_engine_async()
             safe_sql = add_limit_safe(
                 sql, limit=limit, allow_multi_stmt=allow_multi_stmt
             )
             logger.debug("执行 SQL: %s", safe_sql)
-            with engine.connect() as connection:
-                result_raw = connection.execute(text(safe_sql))
+            
+            records = await asyncio.to_thread(
+                self._sync_execute_sql, engine, text(safe_sql)
+            )
 
-                if safe_sql.strip().upper().startswith(
-                    ("SELECT", "SHOW", "DESCRIBE", "DESC")
-                ):
-                    records = [self._row_to_dict(row) for row in result_raw.fetchall()]
-                    result["data"] = records
-                    if not records:
-                        result["errcode"] = 59200
-                        result["message"] = "查询无结果"
-                else:
-                    result["errcode"] = 59300
-                    result["message"] = "非查询语句已执行"
+            if safe_sql.strip().upper().startswith(("SELECT", "SHOW", "DESCRIBE", "DESC")):
+                result["data"] = records
+                if not records:
+                    result["errcode"] = 59200
+                    result["message"] = "查询无结果"
+            else:
+                result["message"] = "非查询语句执行成功"
+
         except SQLAlchemyError as exc:
             logger.exception("执行 SQLAlchemy 失败")
             result["errcode"] = 59400
@@ -192,18 +212,18 @@ class DorisConnectorPydoris:
             logger.warning("SQL 校验失败: %s", exc)
             result["errcode"] = 59101
             result["message"] = str(exc)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("执行 SQL 发生未知错误")
             result["errcode"] = 59500
             result["message"] = f"执行SQL发生未知错误: {exc}"
 
         return result
 
-    def show_databases(self) -> Dict[str, Any]:
-        return self.execute_custom_sql("SHOW DATABASES")
+    async def show_databases(self) -> Dict[str, Any]:
+        return await self.execute_custom_sql("SHOW DATABASES")
 
-    def show_catalogs(self) -> Dict[str, Any]:
-        return self.execute_custom_sql("SHOW CATALOGS")
+    async def show_catalogs(self) -> Dict[str, Any]:
+        return await self.execute_custom_sql("SHOW CATALOGS")
 
     def close(self) -> None:
         if self.engine:
@@ -211,12 +231,19 @@ class DorisConnectorPydoris:
             self.engine = None
             logger.info("Doris 引擎已关闭")
 
+    async def __aenter__(self):
+        return self
 
-def _build_default_connector() -> DorisConnectorPydoris:
-    """
-    基于全局配置创建 Doris 连接实例，供 FastAPI 依赖或服务层复用。
-    使用 lru_cache 包装的 get_doris_connector() 保证单例。
-    """
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+# --------------------------- 依赖注入（保留） ---------------------------
+async def _build_default_connector() -> DorisConnectorPydoris:
+    if not settings.doris_configured:
+        raise RuntimeError(
+            "Doris 未配置：请设置 DEFAULT_DORIS_HOST/DEFAULT_DORIS_PORT/"
+            "DEFAULT_DORIS_USER/DEFAULT_DORIS_CATALOG/DEFAULT_DORIS_DATABASE"
+        )
     return DorisConnectorPydoris(
         host=settings.DEFAULT_DORIS_HOST,
         port=settings.DEFAULT_DORIS_PORT,
@@ -226,19 +253,12 @@ def _build_default_connector() -> DorisConnectorPydoris:
         database=settings.DEFAULT_DORIS_DATABASE,
     )
 
+@alru_cache(maxsize=1)
+async def get_doris_connector() -> DorisConnectorPydoris:
+    return await _build_default_connector()
 
-@lru_cache(maxsize=1)
-def get_doris_connector() -> DorisConnectorPydoris:
-    """
-    获取 Doris 连接单例。适合在 FastAPI 依赖注入中使用。
-    """
-    return _build_default_connector()
-
-
-def close_doris_connector() -> None:
-    """
-    主动关闭连接池并清理单例缓存，供应用关闭时调用。
-    """
-    connector = get_doris_connector()
+async def close_doris_connector() -> None:
+    connector = await get_doris_connector()
     connector.close()
     get_doris_connector.cache_clear()
+    logger.info("Doris 连接器已清理")

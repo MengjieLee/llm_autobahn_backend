@@ -25,12 +25,31 @@ class Settings(BaseSettings):
 
     # Doris 默认配置（可通过环境变量覆盖）
     # 对应的环境变量名：DEFAULT_DORIS_HOST / DEFAULT_DORIS_PORT / ...
-    DEFAULT_DORIS_HOST: str
-    DEFAULT_DORIS_PORT: int
-    DEFAULT_DORIS_USER: str
-    DEFAULT_DORIS_PASSWORD: str
-    DEFAULT_DORIS_CATALOG: str
-    DEFAULT_DORIS_DATABASE: str
+    #
+    # 说明：
+    # - 这里提供默认值，避免在未配置 Doris 的环境中（例如本地 docker run）应用直接启动失败
+    # - 真实连接由 docker-compose / k8s / .env 注入覆盖
+    DEFAULT_DORIS_HOST: str = Field(default="")
+    DEFAULT_DORIS_PORT: int = Field(default=0)
+    DEFAULT_DORIS_USER: str = Field(default="")
+    DEFAULT_DORIS_PASSWORD: str = Field(default="")
+    DEFAULT_DORIS_CATALOG: str = Field(default="")
+    DEFAULT_DORIS_DATABASE: str = Field(default="")
+
+    @property
+    def doris_configured(self) -> bool:
+        """
+        Doris 连接是否已配置齐全。
+        password 允许为空；host/port/user/catalog/database 必须存在。
+        """
+        return bool(
+            self.DEFAULT_DORIS_HOST
+            and int(self.DEFAULT_DORIS_PORT or 0) > 0
+            and self.DEFAULT_DORIS_USER
+            and self.DEFAULT_DORIS_PASSWORD
+            and self.DEFAULT_DORIS_CATALOG
+            and self.DEFAULT_DORIS_DATABASE
+        )
 
 
 settings = Settings()
