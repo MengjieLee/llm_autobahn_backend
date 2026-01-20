@@ -2,21 +2,6 @@
 
 基于 FastAPI 的单体后端骨架，用于大模型垂类领域整合。
 
-### 启动方式
-
-- **同步鉴权文件环境**
-  - 确保本机已有 /path/to/your/workspace/llm_autobahn_backend/credentials.txt
-
-- **一键启动（推荐）**
-  - 在任意目录下执行：
-
-```bash
-docker run -d -p 8739:8739 --name=data_autobahn --privileged \
-    --hostname=localhost \
-    --ulimit memlock=-1 --ulimit nofile=65536:65536 \
-    -v ./.workspace_logs/:/workspace/logs/ \
-    llm_autobahn_backend:0.1.0
-```
 
 ### Docker 一键构建&运行
 
@@ -32,14 +17,13 @@ docker run -d -p 8739:8739 --name=data_autobahn --privileged \
 
 - 运行
   ```bash
-  docker run -d -p 8739:8739 --name=data_autobahn --privileged \
-    --hostname=localhost \
+  docker run --name=data_autobahn_backend --privileged \
+    --hostname=localhost --network host \
+    --shm-size 40G \
     --ulimit memlock=-1 --ulimit nofile=65536:65536 \
+    -v /mnt/cfs_bj_mt/:/mnt/cfs_bj_mt/ \
+    -v /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend/:/mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend/ \
     -v ./.workspace_logs/:/workspace/logs/ \
-    llm_autobahn_backend:0.1.0
-  ```
-
-- 开发
-  ```bash
-  docker save -o llm_autobahn_backend-0.1.0.tar llm_autobahn_backend:0.1.0
+    --workdir /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend \
+    -it llm_autobahn_backend:0.1.1 bash
   ```

@@ -35,7 +35,7 @@ WORKDIR /workspace
 # 只安装运行时必需的系统依赖
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    libmariadb3 \
+    libmariadb3 procps-ng \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && apt-get clean
