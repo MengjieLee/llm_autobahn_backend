@@ -1,4 +1,4 @@
-from context.constant import CREDENTIAL_FILE_PATH, TIME_FORMAT
+from app.conf.config import settings
 from datetime import datetime, timedelta
 import logging
 import os
@@ -92,14 +92,14 @@ async def _find_user_by_token(target_token: str) -> tuple[list | None, list | No
         file_exists = await asyncio.get_event_loop().run_in_executor(
             THREAD_POOL_EXECUTOR,
             _sync_file_exists,
-            CREDENTIAL_FILE_PATH
+            settings.CREDENTIAL_FILE_PATH
         )
     except Exception as e:
         logger.error(f"❌ 异步判断文件存在失败：{str(e)}")
         return None, None
     
     if not file_exists:
-        logger.error(f"❌ 用户文件不存在：{CREDENTIAL_FILE_PATH}")
+        logger.error(f"❌ 用户文件不存在：{settings.CREDENTIAL_FILE_PATH}")
         return None, None
     
     # 异步读取文件所有行
@@ -107,7 +107,7 @@ async def _find_user_by_token(target_token: str) -> tuple[list | None, list | No
         file_lines = await asyncio.get_event_loop().run_in_executor(
             THREAD_POOL_EXECUTOR,
             _sync_read_file_lines,
-            CREDENTIAL_FILE_PATH
+            settings.CREDENTIAL_FILE_PATH
         )
     except Exception as e:
         logger.error(f"❌ 异步读取用户文件失败：{str(e)}")
@@ -133,7 +133,7 @@ async def add_or_update_user(token: str, username: str, groups_list: list, name:
     :return: 用户字典 | None
     """
     now = datetime.now()
-    current_time = now.strftime(TIME_FORMAT)
+    current_time = now.strftime(settings.TIME_FORMAT)
     
     # 异步判断用户是否存在
     if await is_user_existed(token):
@@ -166,14 +166,14 @@ async def add_or_update_user(token: str, username: str, groups_list: list, name:
             await asyncio.get_event_loop().run_in_executor(
                 THREAD_POOL_EXECUTOR,
                 _sync_mkdir_parent,
-                CREDENTIAL_FILE_PATH
+                settings.CREDENTIAL_FILE_PATH
             )
             
             # 异步追加写入文件
             await asyncio.get_event_loop().run_in_executor(
                 THREAD_POOL_EXECUTOR,
                 _sync_append_file_line,
-                CREDENTIAL_FILE_PATH,
+                settings.CREDENTIAL_FILE_PATH,
                 line_content
             )
         except Exception as e:
@@ -217,7 +217,7 @@ async def is_user_valid(target_token: str) -> bool:
     
     # 校验登录是否过期
     try:
-        last_login_time = datetime.strptime(last_login_str, TIME_FORMAT)
+        last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT)
         if datetime.now() > last_login_time + timedelta(days=USER_LOGIN_VALID_DAYS):
             logger.warning(f"❌ 用户【{username}】已存在且未登录超过{USER_LOGIN_VALID_DAYS}天！请重新登录！")
             return False
@@ -243,14 +243,14 @@ async def update_user(target_token: str, column_name: str, new_value) -> bool:
         file_exists = await asyncio.get_event_loop().run_in_executor(
             THREAD_POOL_EXECUTOR,
             _sync_file_exists,
-            CREDENTIAL_FILE_PATH
+            settings.CREDENTIAL_FILE_PATH
         )
     except Exception as e:
         logger.error(f"❌ 异步判断文件存在失败：{str(e)}")
         return False
     
     if not file_exists:
-        logger.error(f"❌ 更新失败：用户文件 {CREDENTIAL_FILE_PATH} 不存在！")
+        logger.error(f"❌ 更新失败：用户文件 {settings.CREDENTIAL_FILE_PATH} 不存在！")
         return False
     
     # ===================== 2. 列专属数据校验+格式转换（原有逻辑不变）=====================
@@ -267,15 +267,15 @@ async def update_user(target_token: str, column_name: str, new_value) -> bool:
         processed_value = int(new_value)
     elif column_name in ["created_at", "last_login"]:
         try:
-            datetime.strptime(new_value, TIME_FORMAT)
+            datetime.strptime(new_value, settings.TIME_FORMAT)
         except ValueError:
-            logger.error(f"❌ 更新失败：{column_name}格式错误！必须符合 {TIME_FORMAT}")
+            logger.error(f"❌ 更新失败：{column_name}格式错误！必须符合 {settings.TIME_FORMAT}")
             return False
         processed_value = new_value
     
     # ===================== 3. 异步读取+更新+写入（原子操作，避免数据丢失）=====================
     column_index = ALLOW_COLUMNS.index(column_name)
-    temp_file_path = CREDENTIAL_FILE_PATH.with_suffix(".tmp")
+    temp_file_path = settings.CREDENTIAL_FILE_PATH.with_suffix(".tmp")
     user_found = False
     
     try:
@@ -283,7 +283,7 @@ async def update_user(target_token: str, column_name: str, new_value) -> bool:
         file_lines = await asyncio.get_event_loop().run_in_executor(
             THREAD_POOL_EXECUTOR,
             _sync_read_file_lines,
-            CREDENTIAL_FILE_PATH
+            settings.CREDENTIAL_FILE_PATH
         )
         
         # 3.2 遍历更新行数据（原有逻辑不变，无I/O）
@@ -327,7 +327,7 @@ async def update_user(target_token: str, column_name: str, new_value) -> bool:
                 THREAD_POOL_EXECUTOR,
                 _sync_move_file,
                 temp_file_path,
-                CREDENTIAL_FILE_PATH
+                settings.CREDENTIAL_FILE_PATH
             )
         else:
             await asyncio.get_event_loop().run_in_executor(

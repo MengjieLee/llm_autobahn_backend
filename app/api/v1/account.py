@@ -6,9 +6,9 @@ import jwt
 from fastapi import APIRouter, Header
 from pydantic import BaseModel, Field
 
+from app.conf.config import settings
 from app.core.api_schema import StandardResponse, ErrorResponse
 from context.auth_client import add_or_update_user
-from context.constant import DEFAULT_GROUPS
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ async def login(
     name = jwt_decoded.get("name")
     username = jwt_decoded.get("username")
     token = generate_auth_token(username)
-    user_dict = await add_or_update_user(token, username, DEFAULT_GROUPS, name)
+    user_dict = await add_or_update_user(token, username, settings.DEFAULT_GROUPS, name)
     data = AccountResponseData(user=AccountModel(
         name=user_dict.get("name"),
         username=user_dict.get("username"),

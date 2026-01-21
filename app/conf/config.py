@@ -1,3 +1,4 @@
+from pathlib import Path, PosixPath
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +17,20 @@ class Settings(BaseSettings):
     version: str = "0.1.1"
     api_v1_prefix: str = "/api/v1"
     debug: bool = True
+    TIME_FORMAT: str = "%Y-%m-%d: %H:%M:%S"
+
+    # 账号白名单
+    CREDENTIAL_FILE_PATH: PosixPath = Path("./credentials.txt")
+
+    # 权限组列表
+    DEFAULT_GROUPS: list[str] = []
+    GROUP_LIST: list[str] = [
+        "official",
+        "group_a",
+        "group_b",
+        "group_c"
+    ]
+    UNMODIFIABLE_GROUP: str = "official"
 
     # 日志
     log_dir: str = "logs"
@@ -53,5 +68,9 @@ class Settings(BaseSettings):
     session_token: str = Field(default="")
     endpoint: str = Field(default="")
     region: str = Field(default="")
+
+    # 序列化相关
+    medium_fields: list[str] = ["image", "images", "video", "videos", "audio", "audios"]
+    parse_json_fields: list[str] = medium_fields + ["relative_image", "conversations", "meta_data"]
 
 settings = Settings()

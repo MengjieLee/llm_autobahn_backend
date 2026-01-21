@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.core.api_schema import StandardResponse
-from src.domain.process_scheduler.svc import ProcessSchedulerService
+from src.domains.process_scheduler.svc import ProcessSchedulerService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
