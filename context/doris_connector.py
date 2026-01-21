@@ -190,7 +190,7 @@ class DorisConnectorPydoris:
             safe_sql = add_limit_safe(
                 sql, limit=limit, allow_multi_stmt=allow_multi_stmt
             )
-            logger.debug("执行 SQL: %s", safe_sql)
+            logger.info("执行 safe SQL: %s", safe_sql)
             
             records = await asyncio.to_thread(
                 self._sync_execute_sql, engine, text(safe_sql)

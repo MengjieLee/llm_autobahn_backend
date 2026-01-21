@@ -51,7 +51,7 @@ class AccountResponseData(BaseModel):
 async def login(
     x_zt_authorization: XZtAuthorizationHeader = None
 ) -> StandardResponse[AccountResponseData]:
-    logger.info(f"UUAP 网关验证。")
+    logger.info(f"UUAP 网关验证开始.")
 
     if not x_zt_authorization:
         logger.error(f"JWT 校验失败: Header 中无有效的 X-Zt-Authorization 键值")
@@ -72,6 +72,7 @@ async def login(
         token=user_dict.get("token"),
         groups=user_dict.get("groups"),
     ))
+    logger.info(f"UUAP 网关验证结束.")
     return StandardResponse[AccountResponseData](
         code=0,
         message="success",
