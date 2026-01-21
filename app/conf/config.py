@@ -23,12 +23,8 @@ class Settings(BaseSettings):
     log_max_bytes: int = 100 * 1024 * 1024  # 100MB
     log_backup_count: int = 10
 
-    # Doris 默认配置（可通过环境变量覆盖）
-    # 对应的环境变量名：DEFAULT_DORIS_HOST / DEFAULT_DORIS_PORT / ...
-    #
-    # 说明：
-    # - 这里提供默认值，避免在未配置 Doris 的环境中（例如本地 docker run）应用直接启动失败
-    # - 真实连接由 docker-compose / k8s / .env 注入覆盖
+
+    ## Doris 连接配置
     DEFAULT_DORIS_HOST: str = Field(default="")
     DEFAULT_DORIS_PORT: int = Field(default=0)
     DEFAULT_DORIS_USER: str = Field(default="")
@@ -51,5 +47,11 @@ class Settings(BaseSettings):
             and self.DEFAULT_DORIS_DATABASE
         )
 
+    # S3
+    access_key: str = Field(default="")
+    secret_key: str = Field(default="")
+    session_token: str = Field(default="")
+    endpoint: str = Field(default="")
+    region: str = Field(default="")
 
 settings = Settings()
