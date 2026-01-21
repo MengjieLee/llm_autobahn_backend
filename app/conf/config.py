@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "LLM Autobahn Backend"
-    version: str = "0.1.0"
+    version: str = "0.1.1"
     api_v1_prefix: str = "/api/v1"
     debug: bool = True
 
