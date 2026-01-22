@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     version: str = "0.1.1"
     api_v1_prefix: str = "/api/v1"
     debug: bool = True
+    log_level: str = "INFO" # DEBUG
     TIME_FORMAT: str = "%Y-%m-%d: %H:%M:%S"
 
     # 账号白名单
@@ -70,7 +71,12 @@ class Settings(BaseSettings):
     region: str = Field(default="")
 
     # 序列化相关
+    s3_prefixes: list[str] = ["http", "bos", "s3"]
+    bucket_name: str = "llm-data-process"
+    s3_default_prefix: str = f"bos://{bucket_name}"
     medium_fields: list[str] = ["image", "images", "video", "videos", "audio", "audios"]
-    parse_json_fields: list[str] = medium_fields + ["relative_image", "conversations", "meta_data"]
+    backup_fields: list[str] = ["absolute_images", "absolute_image", "absolute_videos", "absolute_video", "absolute_audios", "absolute_audio"]
+    parse_json_fields: list[str] = medium_fields + backup_fields + ["relative_image", "relative_video", "relative_audio", "conversations", "meta_data"]
+    src_root_fields: list[str] = ["src_root_path"]
 
 settings = Settings()
