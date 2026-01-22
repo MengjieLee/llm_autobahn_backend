@@ -52,7 +52,7 @@ def setup_logging() -> None:
     datefmt = "%Y-%m-%d %H:%M:%S"
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(settings.log_level)
 
     # 文件轮转
     file_handler = RotatingFileHandler(

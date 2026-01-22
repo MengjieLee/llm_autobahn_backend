@@ -32,7 +32,7 @@ async def lifespan(app: FastAPI):
         if settings.doris_configured:
             doris_connector = await get_doris_connector()
             test_result = await doris_connector.test_connection()
-            if test_result.get("errcode") != 0:
+            if test_result.get("code") != 0:
                 logger.warning("Doris 连接预检查失败: %s", test_result)
         else:
             logger.warning(

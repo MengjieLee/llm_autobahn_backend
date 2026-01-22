@@ -265,6 +265,10 @@ class LocalFileSystemAdapter(FileSystemAdapter):
     def getsize(self, uri: str) -> int:
         path = _normalize_local_path(uri)
         return os.path.getsize(path)
+    
+    def s3_generate_presigned_url(self, uri: str, expiration: int = 3600 * 24 * 2) -> str:
+        _validate_s3_uri(uri)
+        return s3_generate_presigned_url(uri, expiration, self._client())
 
 
 class S3FileSystemAdapter(FileSystemAdapter):
@@ -322,10 +326,6 @@ class S3FileSystemAdapter(FileSystemAdapter):
         # todo: 支持目录判断
         return s3_file_exists(uri, self._client())
 
-    def s3_generate_presigned_url(self, uri: str, expiration: int = 3600 * 24 * 2) -> str:
-        _validate_s3_uri(uri)
-        return s3_generate_presigned_url(uri, expiration, self._client())
-
     def listdir(self, uri: str) -> List[ListEntry]:
         _validate_s3_uri(uri)
         client = self._client()
@@ -352,6 +352,10 @@ class S3FileSystemAdapter(FileSystemAdapter):
         size = s3_head_file(uri, self._client())["ContentLength"]
         assert isinstance(size, int)
         return size
+    
+    def s3_generate_presigned_url(self, uri: str, expiration: int = 3600 * 24 * 2) -> str:
+        _validate_s3_uri(uri)
+        return s3_generate_presigned_url(uri, expiration, self._client())
 
 
 def get_fs_cache_key(uri: str) -> str:

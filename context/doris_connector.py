@@ -149,10 +149,10 @@ class DorisConnectorPydoris:
             engine = await self._ensure_engine_async()
             # 再异步执行测试
             result = await asyncio.to_thread(self._sync_test_connection, engine)
-            return {"errcode": 0, "message": "ok", "data": result}
+            return {"code": 0, "message": "ok", "data": result}
         except Exception as exc:
             logger.exception("Doris 连接测试失败")
-            return {"errcode": 59001, "message": f"连接测试失败: {exc}", "data": None}
+            return {"code": 59001, "message": f"连接测试失败: {exc}", "data": None}
 
     def _sync_execute_sql(self, engine: Engine, sql: text) -> List[Dict[str, Any]]:
         """同步执行SQL"""
@@ -174,16 +174,16 @@ class DorisConnectorPydoris:
             
             logger.debug("查询表结构 SQL: %s", sql)
             columns = await asyncio.to_thread(self._sync_execute_sql, engine, sql)
-            return {"errcode": 0, "message": "ok", "data": columns}
+            return {"code": 0, "message": "ok", "data": columns}
         except Exception as exc:
             logger.exception("查询表列信息失败: table=%s", table)
-            return {"errcode": 59401, "message": f"查询表结构失败: {exc}", "data": []}
+            return {"code": 59401, "message": f"查询表结构失败: {exc}", "data": []}
 
     async def execute_custom_sql(
         self, sql: str, *, limit: int = 1000, allow_multi_stmt: bool = False
     ) -> Dict[str, Any]:
         """异步执行自定义SQL"""
-        result: Dict[str, Any] = {"errcode": 0, "message": "请求成功", "data": []}
+        result: Dict[str, Any] = {"code": 0, "message": "请求成功", "data": []}
 
         try:
             engine = await self._ensure_engine_async()
@@ -199,22 +199,22 @@ class DorisConnectorPydoris:
             if safe_sql.strip().upper().startswith(("SELECT", "SHOW", "DESCRIBE", "DESC")):
                 result["data"] = records
                 if not records:
-                    result["errcode"] = 59200
+                    result["code"] = 59200
                     result["message"] = "查询无结果"
             else:
                 result["message"] = "非查询语句执行成功"
 
         except SQLAlchemyError as exc:
             logger.exception("执行 SQLAlchemy 失败")
-            result["errcode"] = 59400
+            result["code"] = 59400
             result["message"] = f"执行SQL失败: {exc}"
         except ValueError as exc:
             logger.warning("SQL 校验失败: %s", exc)
-            result["errcode"] = 59101
+            result["code"] = 59101
             result["message"] = str(exc)
         except Exception as exc:
             logger.exception("执行 SQL 发生未知错误")
-            result["errcode"] = 59500
+            result["code"] = 59500
             result["message"] = f"执行SQL发生未知错误: {exc}"
 
         return result

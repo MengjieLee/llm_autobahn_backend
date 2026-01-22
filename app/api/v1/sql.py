@@ -21,9 +21,9 @@ class SQLQueryReqeust(BaseModel):
 async def sql_query(
     body: SQLQueryReqeust, doris_svc: DorisConnectorPydoris = Depends(get_doris_connector)
 ) -> StandardResponse[dict]:
-    logger.info(f"sql_query 开始: {body.sql}")
+    logger.info(f"sql_query 请求: {body.sql}")
     query_raw_dict = await doris_svc.execute_custom_sql(body.sql)
     logger.debug(f"query_raw_dict 原生结果: {query_raw_dict}")
     query_json = doris_data_2_json(query_raw_dict.get("data", []))
-    logger.info(f"sql_query 结果: {query_json}")
+    logger.debug(f"sql_query 结果: {query_json}")
     return StandardResponse(code=0, message="success", data={"result": query_json}, trace_id=None)

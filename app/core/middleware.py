@@ -78,6 +78,10 @@ async def auth_middleware(request: Request, call_next: Callable) -> Response:
     """
     path = request.url.path
     trace_id = getattr(request.state, "trace_id", None)
+
+    # OPTIONS请求直接放行，不做鉴权
+    if request.method == "OPTIONS":
+        return await call_next(request)
     
     # 检查是否为公开路径，不需要鉴权
     if path in PUBLIC_PATHS:
