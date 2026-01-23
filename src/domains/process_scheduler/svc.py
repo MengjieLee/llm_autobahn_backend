@@ -33,12 +33,17 @@ class ProcessSchedulerService:
         parameters: Optional[dict] = None,
     ) -> dict:
         try:
-            return self.client.start_job(
+            data = {}
+            response = self.client.start_job(
                 pipeline_id=pipeline_id,
                 queue=queue,
                 name=name,
                 parameters=parameters,
             )
+            data["code"] = response.pop("err_code")
+            data["message"] = response.pop("err_msg")
+            logger.debug(f"start_job 响应: {response}")
+            return data
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "启动任务")
 

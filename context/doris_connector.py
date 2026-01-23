@@ -7,7 +7,7 @@ import sqlparse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlparse.tokens import DML
+from sqlparse.tokens import DML, Comment, String
 from async_lru import alru_cache
 
 from app.conf.config import settings
@@ -15,14 +15,81 @@ from app.conf.config import settings
 
 logger = logging.getLogger(__name__)
 
-# --------------------------- 工具函数（保留不变） ---------------------------
 def has_limit_clause(parsed_sql) -> bool:
+    """检测SQL是否包含LIMIT子句（仅检测关键字，不解析数值）"""
     for token in parsed_sql.flatten():
-        if token.ttype in (sqlparse.tokens.Comment, sqlparse.tokens.String):
+        if token.ttype in (Comment, String):
             continue
         if token.value.upper() == "LIMIT":
             return True
     return False
+
+def parse_limit_value(parsed_sql) -> int:
+    """解析已有LIMIT子句的数值，解析失败返回-1"""
+    limit_token_found = False
+    for token in parsed_sql.flatten():
+        # 跳过注释和字符串
+        if token.ttype in (Comment, String):
+            continue
+        
+        # 找到LIMIT关键字后，取下一个有效数字
+        if limit_token_found:
+            # 过滤空白符
+            if token.value.strip() == "":
+                continue
+            # 尝试解析数字
+            try:
+                return int(token.value.strip())
+            except ValueError:
+                # 非数字（比如LIMIT ALL/变量等），返回-1
+                return -1
+        
+        # 标记找到LIMIT关键字
+        if token.value.upper() == "LIMIT":
+            limit_token_found = True
+    return -1
+
+def replace_limit_clause(sql_str: str, new_limit: int) -> str:
+    """替换SQL中已有的LIMIT数值为new_limit"""
+    parsed = sqlparse.parse(sql_str)[0]
+    limit_token_found = False
+    new_tokens = []
+    
+    for token in parsed.flatten():
+        # 跳过注释和字符串
+        if token.ttype in (Comment, String):
+            new_tokens.append(token.value)
+            continue
+        
+        # 找到LIMIT关键字后，替换下一个数值
+        if limit_token_found:
+            if token.value.strip() == "":
+                new_tokens.append(token.value)
+                continue
+            # 尝试解析原数值，替换为新数值
+            try:
+                int(token.value.strip())
+                new_tokens.append(str(new_limit))
+                limit_token_found = False
+            except ValueError:
+                # 非数字则保留原值
+                new_tokens.append(token.value)
+                limit_token_found = False
+            continue
+        
+        # 标记找到LIMIT关键字
+        if token.value.upper() == "LIMIT":
+            new_tokens.append(token.value)
+            limit_token_found = True
+        else:
+            new_tokens.append(token.value)
+    
+    # 拼接回SQL字符串并清理多余空格
+    new_sql = "".join(new_tokens).strip()
+    # 确保结尾有分号（保持原格式）
+    if not new_sql.endswith(';'):
+        new_sql += ';'
+    return new_sql
 
 def add_limit_safe(
     sql_input: str,
@@ -30,9 +97,11 @@ def add_limit_safe(
     allow_multi_stmt: bool = False,
     max_limit: int = 1000,
 ) -> str:
-    limit = min(int(limit), max_limit)
-    if limit < 1:
-        limit = 1
+    logger.debug(f"add_limit_safe 输入: {sql_input} | {limit} | {max_limit}")
+    # 确保limit不超过max_limit，且最小为1
+    target_limit = min(int(limit), max_limit)
+    if target_limit < 1:
+        target_limit = 1
 
     parsed_stmts = sqlparse.parse(sql_input)
     if len(parsed_stmts) > 1 and not allow_multi_stmt:
@@ -44,22 +113,34 @@ def add_limit_safe(
         if not stmt_str:
             continue
 
+        # 检测是否有LIMIT子句
         if has_limit_clause(stmt):
-            new_stmts.append(stmt_str)
+            # 解析已有LIMIT的数值
+            current_limit = parse_limit_value(stmt)
+            if current_limit > target_limit:
+                # 已有LIMIT超限，替换为target_limit
+                new_stmt = replace_limit_clause(stmt_str, target_limit)
+            else:
+                # 已有LIMIT未超限，保留原语句
+                new_stmt = stmt_str
+            new_stmts.append(new_stmt)
             continue
 
+        # 检测SQL类型（SELECT/UPDATE/DELETE）
         stmt_type = None
         for token in stmt.flatten():
             if token.ttype == DML:
                 stmt_type = token.value.upper()
                 break
 
-        if stmt_type == "SELECT":
-            stmt_clean = stmt_str.rstrip(";")
-            new_stmt = f"{stmt_clean} LIMIT {limit};"
-            new_stmts.append(new_stmt)
-        else:
+        if stmt_type not in ('SELECT', 'UPDATE', 'DELETE'):
             new_stmts.append(stmt_str)
+            continue
+        
+        # 无LIMIT子句，添加限制
+        stmt_clean = stmt_str.rstrip(';')
+        new_stmt = f"{stmt_clean} LIMIT {target_limit};"
+        new_stmts.append(new_stmt)
 
     return "\n".join(new_stmts)
 
@@ -156,68 +237,52 @@ class DorisConnectorPydoris:
 
     def _sync_execute_sql(self, engine: Engine, sql: text) -> List[Dict[str, Any]]:
         """同步执行SQL"""
+        res = {"code": 0, "message": "ok", "data": None}
         with engine.connect() as connection:
             if sql.text.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "ALTER")):
-                result_raw = connection.execute(sql)
-                connection.commit()
-                return [{"affected_rows": result_raw.rowcount}]
+                try:
+                    result_raw = connection.execute(sql)
+                    connection.commit()
+                    res["message"] = result_raw.rowcount
+                    return res
+                except Exception as exc:
+                    logger.exception(f"Doris 执行写入失败 | {str(exc)}")
+                    res["code"] = 59402
+                    res["message"] = str(exc)
+                    return res
             else:
-                result_raw = connection.execute(sql)
-                return [self._row_to_dict(row) for row in result_raw.fetchall()]
+                try:
+                    result_raw = connection.execute(sql)
+                    res["data"] = [self._row_to_dict(row) for row in result_raw.fetchall()]
+                    return res
+                except Exception as exc:
+                    logger.exception(f"Doris 执行查询失败 | {str(exc)}")
+                    res["code"] = 59403
+                    res["message"] = str(exc)
+                    return res
 
     async def show_table_columns(self, table: str) -> Dict[str, Any]:
         """异步查询表结构"""
-        try:
-            engine = await self._ensure_engine_async()
-            full_table_name = f"{self.catalog}.{self.database}.{table.replace('`', '')}"
-            sql = text(f"SHOW COLUMNS FROM `{full_table_name}`")
-            
-            logger.debug("查询表结构 SQL: %s", sql)
-            columns = await asyncio.to_thread(self._sync_execute_sql, engine, sql)
-            return {"code": 0, "message": "ok", "data": columns}
-        except Exception as exc:
-            logger.exception("查询表列信息失败: table=%s", table)
-            return {"code": 59401, "message": f"查询表结构失败: {exc}", "data": []}
+        engine = await self._ensure_engine_async()
+        full_table_name = f"{self.catalog}.{self.database}.{table.replace('`', '')}"
+        sql = text(f"SHOW COLUMNS FROM `{full_table_name}`")
+        
+        logger.debug("查询表结构 SQL: %s", sql)
+        return await asyncio.to_thread(self._sync_execute_sql, engine, sql)
 
     async def execute_custom_sql(
         self, sql: str, *, limit: int = 1000, allow_multi_stmt: bool = False
     ) -> Dict[str, Any]:
-        """异步执行自定义SQL"""
-        result: Dict[str, Any] = {"code": 0, "message": "请求成功", "data": []}
 
-        try:
-            engine = await self._ensure_engine_async()
-            safe_sql = add_limit_safe(
-                sql, limit=limit, allow_multi_stmt=allow_multi_stmt
-            )
-            logger.info("执行 safe SQL: %s", safe_sql)
-            
-            records = await asyncio.to_thread(
-                self._sync_execute_sql, engine, text(safe_sql)
-            )
-
-            if safe_sql.strip().upper().startswith(("SELECT", "SHOW", "DESCRIBE", "DESC")):
-                result["data"] = records
-                if not records:
-                    result["code"] = 59200
-                    result["message"] = "查询无结果"
-            else:
-                result["message"] = "非查询语句执行成功"
-
-        except SQLAlchemyError as exc:
-            logger.exception("执行 SQLAlchemy 失败")
-            result["code"] = 59400
-            result["message"] = f"执行SQL失败: {exc}"
-        except ValueError as exc:
-            logger.warning("SQL 校验失败: %s", exc)
-            result["code"] = 59101
-            result["message"] = str(exc)
-        except Exception as exc:
-            logger.exception("执行 SQL 发生未知错误")
-            result["code"] = 59500
-            result["message"] = f"执行SQL发生未知错误: {exc}"
-
-        return result
+        engine = await self._ensure_engine_async()
+        safe_sql = add_limit_safe(
+            sql, limit=limit, allow_multi_stmt=allow_multi_stmt
+        )
+        logger.info("执行 safe SQL: %s", safe_sql)
+        
+        return await asyncio.to_thread(
+            self._sync_execute_sql, engine, text(safe_sql)
+        )
 
     async def show_databases(self) -> Dict[str, Any]:
         return await self.execute_custom_sql("SHOW DATABASES")

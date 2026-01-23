@@ -39,7 +39,7 @@ async def list_jobs(
     request: Request, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
     params = dict(request.query_params)
-    data = service.list_jobs(params)
+    data = {"result": service.list_jobs(params).get("data")}
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -53,7 +53,7 @@ async def start_job(
         name=body.name,
         parameters=body.parameters,
     )
-    return StandardResponse(code=0, message="success", data=data, trace_id=None)
+    return StandardResponse(**data)
 
 
 @router.post("/jobs/{job_id}/stop", summary="停止任务")

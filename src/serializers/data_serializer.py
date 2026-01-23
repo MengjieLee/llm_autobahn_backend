@@ -67,7 +67,11 @@ def doris_data_2_json(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str,
     processed_data = []
 
     if not isinstance(raw_data, list):
-        logger.warning("输入数据必须是列表类型")
+        logger.warning("序列化输入数据必须是列表类型")
+        return processed_data
+
+    if not raw_data:
+        logger.warning("序列化输入数据为空")
         return processed_data
     
     exist_medium_fields = []
