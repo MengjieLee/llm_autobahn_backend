@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     TIME_FORMAT: str = "%Y-%m-%d: %H:%M:%S"
 
     # 账号白名单
-    CREDENTIAL_FILE_PATH: PosixPath = Path("./credentials.txt")
+    CREDENTIAL_FILE_PATH: PosixPath = Path("/mnt/cfs_bj_mt/workspace/chenjieting/iCodes/baidu/personal-code/data_management_app/credentials.txt")
 
     # 权限组列表
     DEFAULT_GROUPS: list[str] = []
