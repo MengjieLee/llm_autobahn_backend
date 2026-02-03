@@ -82,6 +82,34 @@ def _parse_user_file_line(line: str) -> list | None:
         return None
     return columns
 
+async def users_amount() -> int:
+    try:
+        file_exists = await asyncio.get_event_loop().run_in_executor(
+            THREAD_POOL_EXECUTOR,
+            _sync_file_exists,
+            settings.CREDENTIAL_FILE_PATH
+        )
+    except Exception as e:
+        logger.error(f"❌ 异步判断文件存在失败：{str(e)}")
+        return None, None
+    
+    if not file_exists:
+        logger.error(f"❌ 用户文件不存在：{settings.CREDENTIAL_FILE_PATH}")
+        return None, None
+    
+    # 异步读取文件所有行
+    try:
+        file_lines = await asyncio.get_event_loop().run_in_executor(
+            THREAD_POOL_EXECUTOR,
+            _sync_read_file_lines,
+            settings.CREDENTIAL_FILE_PATH
+        )
+    except Exception as e:
+        logger.error(f"❌ 异步读取用户文件失败：{str(e)}")
+        return None, None
+    
+    return len(file_lines)
+
 async def _find_user_by_token(target_token: str) -> tuple[list | None, list | None]:
     """
     异步：根据Token查找用户，返回用户列数据和所有文件行

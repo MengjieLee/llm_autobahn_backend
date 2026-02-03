@@ -125,6 +125,7 @@ async def auth_middleware(request: Request, call_next: Callable) -> Response:
     if user_info:
         request.state.user = user_info
         request.state.token = token
+        request.state.groups = user_info.get("groups") or []
         # 设置到上下文，供日志系统使用
         the_name = user_info.get("name") or user_info.get("username")
         ctx_set_username(the_name)

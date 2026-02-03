@@ -39,7 +39,8 @@ async def list_jobs(
     request: Request, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
     params = dict(request.query_params)
-    data = {"result": service.list_jobs(params).get("data")}
+    jobs = await service.list_jobs(params)
+    data = {"result": jobs.get("data")}
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -47,7 +48,7 @@ async def list_jobs(
 async def start_job(
     body: StartJobRequest, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
-    data = service.start_job(
+    data = await service.start_job(
         pipeline_id=body.pipeline_id,
         queue=body.queue,
         name=body.name,
@@ -62,7 +63,7 @@ async def stop_job(
 ) -> StandardResponse[dict]:
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id 不能为空")
-    data = service.stop_job(job_id)
+    data = await service.stop_job(job_id)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -72,7 +73,7 @@ async def delete_job(
 ) -> StandardResponse[dict]:
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id 不能为空")
-    data = service.delete_job(job_id)
+    data = await service.delete_job(job_id)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -80,7 +81,7 @@ async def delete_job(
 async def create_pipeline(
     body: CreatePipelineRequest, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
-    data = service.create_pipeline(
+    data = await service.create_pipeline(
         pipeline_name=body.pipeline_name,
         yaml_content=body.yaml_content,
         files=body.files,
@@ -93,7 +94,7 @@ async def list_pipelines(
     request: Request, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
     params = dict(request.query_params)
-    data = service.list_pipelines(params)
+    data = await service.list_pipelines(params)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -103,7 +104,7 @@ async def delete_pipeline(
 ) -> StandardResponse[dict]:
     if not pipeline_id:
         raise HTTPException(status_code=400, detail="pipeline_id 不能为空")
-    data = service.delete_pipeline(pipeline_id)
+    data = await service.delete_pipeline(pipeline_id)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -113,5 +114,5 @@ async def get_pipeline_detail(
 ) -> StandardResponse[dict]:
     if not pipeline_id:
         raise HTTPException(status_code=400, detail="pipeline_id 不能为空")
-    data = service.get_pipeline_detail(pipeline_id)
+    data = await service.get_pipeline_detail(pipeline_id)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)

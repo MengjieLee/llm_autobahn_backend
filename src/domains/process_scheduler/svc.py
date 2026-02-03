@@ -19,13 +19,13 @@ class ProcessSchedulerService:
     ):
         self.client = client or ProcessSchedulerClient(auth_token=auth_token)
 
-    def list_jobs(self, params: Optional[dict] = None) -> dict:
+    async def list_jobs(self, params: Optional[dict] = None) -> dict:
         try:
             return self.client.list_job(params or {})
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "查询任务列表")
+            self._handle_error(exc, "查询任务列表失败")
 
-    def start_job(
+    async def start_job(
         self,
         pipeline_id: str,
         queue: str,
@@ -45,21 +45,21 @@ class ProcessSchedulerService:
             logger.debug(f"start_job 响应: {response}")
             return data
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "启动任务")
+            self._handle_error(exc, "启动任务失败")
 
-    def stop_job(self, job_id: str) -> dict:
+    async def stop_job(self, job_id: str) -> dict:
         try:
             return self.client.stop_job(job_id)
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "停止任务")
+            self._handle_error(exc, "停止任务失败")
 
-    def delete_job(self, job_id: str) -> dict:
+    async def delete_job(self, job_id: str) -> dict:
         try:
             return self.client.delete_job(job_id)
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "删除任务")
+            self._handle_error(exc, "删除任务失败")
 
-    def create_pipeline(
+    async def create_pipeline(
         self,
         pipeline_name: str,
         yaml_content: str,
@@ -72,25 +72,25 @@ class ProcessSchedulerService:
                 files=files,
             )
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "创建 Pipeline")
+            self._handle_error(exc, "创建 Pipeline 失败")
 
-    def list_pipelines(self, params: Optional[dict] = None) -> dict:
+    async def list_pipelines(self, params: Optional[dict] = None) -> dict:
         try:
             return self.client.list_pipeline(params)
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "查询 Pipeline 列表")
+            self._handle_error(exc, "查询 Pipeline 列表失败")
 
-    def delete_pipeline(self, pipeline_id: str) -> dict:
+    async def delete_pipeline(self, pipeline_id: str) -> dict:
         try:
             return self.client.delete_pipeline(pipeline_id)
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "删除 Pipeline")
+            self._handle_error(exc, "删除 Pipeline 失败")
 
-    def get_pipeline_detail(self, pipeline_id: str) -> dict:
+    async def get_pipeline_detail(self, pipeline_id: str) -> dict:
         try:
             return self.client.get_pipeline_detail(pipeline_id)
         except Exception as exc:  # noqa: BLE001
-            self._handle_error(exc, "查询 Pipeline 详情")
+            self._handle_error(exc, "查询 Pipeline 详情失败")
 
     def _handle_error(self, exc: Exception, action: str) -> None:
         logger.exception("%s失败: %s", action, exc)
