@@ -14,6 +14,16 @@ META_DATA_HOST = os.getenv("META_DATA_HOST")
 logger = logging.getLogger(__name__)
 
 
+def _normalize_name(name):
+        """标准化名称，忽略大小写和'-'与'_'的区别"""
+        if name is None:
+            return ""
+        # 如果名称包含'/'，只取最后一部分
+        if '/' in name:
+            name = name.split('/')[-1]
+        return name.lower().replace('-', '_').replace(' ', '')
+
+
 # ----- 枚举类型定义 -----
 class StageEnum(str, Enum):
     sft = "SFT"
@@ -54,6 +64,7 @@ class DatasetList(BaseModel):
     tags: Optional[List[str]] = None
     tables: Optional[List[str]] = None
     groups: Optional[List[str]] = None
+    name: Optional[str] = None
 
     model_config = {"use_enum_values": True}
 
@@ -143,10 +154,20 @@ class DatasetsClient:
                 # "/datasets/list", json=filter.model_dump(exclude_none=True)
                 "/datasets/list", json=filter_dict
             )
+            resp.raise_for_status()
+            resp = resp.json()
+            if filter_dict.get("name", None):
+                filter_name = _normalize_name(filter_dict.get("name"))
+                resp = [
+                    dataset for dataset in resp
+                    if filter_name in _normalize_name(dataset["name"])
+                ]
+            
+            return resp
         else:
             resp = self.client.get("/datasets")
-        resp.raise_for_status()
-        return resp.json()
+            resp.raise_for_status()
+            return resp.json()
 
     
     
