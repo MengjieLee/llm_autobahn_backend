@@ -2,6 +2,7 @@ import ast
 import json
 import logging
 import os
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from app.conf.config import settings
@@ -144,6 +145,33 @@ def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str
     
     return processed_data
 
+def splits_serializer(paths):
+    splits = {}
+    for converted_preview_path in paths:
+        records = []
+        flag = True
+        depth = 0
+        while flag and depth < 5:
+            try:
+                file_reader = fs_manager.open_read_stream(converted_preview_path)
+                flag = False
+            except IsADirectoryError as e:
+                logger.warning(f"检测到目录:{converted_preview_path}, 选择第一个叶子文件处理")
+                converted_preview_path = fs_manager.listdir(converted_preview_path)[0].path
+                depth += 1
+        with file_reader as f:
+            idx = 0
+            while idx < 100:
+                line = f.readline().strip()
+                if not line:
+                     continue
+                record = json.loads(line)
+                records.append(record)
+                idx += 1
+        splits.update({
+            Path(converted_preview_path).stem: preview_serializer(records)
+        })
+    return splits
 
 if __name__ == "__main__":
     raw_data = {}

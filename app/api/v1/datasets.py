@@ -9,7 +9,7 @@ from app.core.api_schema import StandardResponse
 from context.file_system import fs_manager
 from src.domains.datasets.svc import DatasetsService
 from src.domains.datasets.impl import DatasetList
-from src.serializers.data_serializer import preview_serializer
+from src.serializers.data_serializer import preview_serializer, splits_serializer
 
 
 logger = logging.getLogger(__name__)
@@ -49,22 +49,7 @@ async def detail_dataset(
     if not the_dataset:
         raise HTTPException(status_code=500, detail="数据集不存在")
     
-    splits = {}
-    for converted_preview_path in the_dataset["converted_preview_paths"]:
-        records = []
-        with open(converted_preview_path, "r") as f:
-            idx = 0
-            while idx < 100:
-                line = f.readline().strip()
-                if not line:
-                     continue
-                record = json.loads(line)
-                records.append(record)
-                idx += 1
-        splits.update({
-            Path(converted_preview_path).stem: preview_serializer(records)
-        })
-
+    splits = splits_serializer(the_dataset["converted_preview_paths"])
     the_dataset["splits"] = splits
     
     return StandardResponse(code=0, message="success", data=the_dataset, trace_id=None)
@@ -90,22 +75,7 @@ async def preview_dataset(
             raise HTTPException(status_code=500, detail=f"数据路径 {path} 不存在")
         
     the_dataset = {}
-    splits = {}
-    for converted_preview_path in paths:
-        records = []
-        with fs_manager.open_read_stream(converted_preview_path) as f:
-            idx = 0
-            while idx < 100:
-                line = f.readline().strip()
-                if not line:
-                     continue
-                record = json.loads(line)
-                records.append(record)
-                idx += 1
-        splits.update({
-            Path(converted_preview_path).stem: preview_serializer(records)
-        })
-
+    splits = splits_serializer(paths)
     the_dataset["splits"] = splits
     
     return StandardResponse(code=0, message="success", data=the_dataset, trace_id=None)
