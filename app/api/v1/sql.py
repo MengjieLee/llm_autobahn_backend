@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.core.api_schema import StandardResponse
 from app.core.request_context import ctx_get_trace_id
 from context.doris_connector import DorisConnectorPydoris, get_doris_connector
-from src.serializers.data_serializer import doris_data_2_json
+from src.serializers.data_serializer import preview_serializer
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ async def sql_query(
     logger.info(f"sql_query 请求: {body.sql}")
     query_raw_dict = await doris_svc.execute_custom_sql(body.sql)
     logger.debug(f"query_raw_dict 原生结果: {query_raw_dict}")
-    query_json = doris_data_2_json(query_raw_dict.get("data", []))
+    query_json = preview_serializer(query_raw_dict.get("data", []))
     message = "success"
     trace_id = None
     if not query_json:

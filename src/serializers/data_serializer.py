@@ -51,7 +51,7 @@ def safe_json_loads(json_str: str) -> Any:
         logger.warning(f"终极解析方案失败: {e}, 原始字符串: {json_str[:100]}")
         return json_str
 
-def doris_data_2_json(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
     """
     处理 Doris 格式的数据，将字符串形式的 JSON 字段反序列化为 Python 对象
     
@@ -147,4 +147,4 @@ def doris_data_2_json(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str,
 
 if __name__ == "__main__":
     raw_data = {}
-    print(doris_data_2_json())
+    print(preview_serializer())
