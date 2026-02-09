@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
 
 from app.core.api_schema import StandardResponse
+from context.file_system import fs_manager
 from src.domains.datasets.svc import DatasetsService
 from src.domains.datasets.impl import DatasetList
 from src.serializers.data_serializer import preview_serializer
@@ -67,3 +68,45 @@ async def detail_dataset(
     the_dataset["splits"] = splits
     
     return StandardResponse(code=0, message="success", data=the_dataset, trace_id=None)
+
+
+@router.post("/preview", summary="查询数据集预览")
+async def preview_dataset(
+    request: Request,
+    body: dict,
+    service: DatasetsService = Depends(get_service)
+) -> StandardResponse[dict]:
+    
+    paths = body.get("paths")
+    # 按优先级从高到低 ,或者\n 切分 paths 字符串成列表
+    if "," in paths:
+        paths = [path for path in paths.split(",") if path.strip()]
+    elif "\n" in paths:
+        paths = [path for path in paths.split("\n") if path.strip()]
+
+    logger.info(f"preview_dataset: {paths}")
+    for path in paths:
+        if not fs_manager.exists(path):
+            raise HTTPException(status_code=500, detail=f"数据路径 {path} 不存在")
+        
+    the_dataset = {}
+    splits = {}
+    for converted_preview_path in paths:
+        records = []
+        with fs_manager.open_read_stream(converted_preview_path) as f:
+            idx = 0
+            while idx < 100:
+                line = f.readline().strip()
+                if not line:
+                     continue
+                record = json.loads(line)
+                records.append(record)
+                idx += 1
+        splits.update({
+            Path(converted_preview_path).stem: preview_serializer(records)
+        })
+
+    the_dataset["splits"] = splits
+    
+    return StandardResponse(code=0, message="success", data=the_dataset, trace_id=None)
+
