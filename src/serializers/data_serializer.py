@@ -52,7 +52,7 @@ def safe_json_loads(json_str: str) -> Any:
         logger.warning(f"终极解析方案失败: {e}, 原始字符串: {json_str[:100]}")
         return json_str
 
-def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+def preview_serializer(raw_data: List[Dict[str, Any]], media_root: str = "") -> Optional[List[Dict[str, Any]]]:
     """
     处理 Doris 格式的数据，将字符串形式的 JSON 字段反序列化为 Python 对象
     
@@ -76,7 +76,7 @@ def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str
         return processed_data
     
     exist_medium_fields = []
-    src_root_path = ""
+    src_root_field = ""
     backup_medium_field = ""
 
     raw_data_keys = raw_data[0].keys()
@@ -85,13 +85,13 @@ def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str
         if field in settings.medium_fields:
             exist_medium_fields.append(field)
             logger.debug(f"存在需要解析的媒体字段: {exist_medium_fields}")
-        if not src_root_path and field in settings.src_root_fields:
-            src_root_path = field
-            logger.debug(f"存在根路径字段: {src_root_path}")
+        if not src_root_field and field in settings.src_root_fields:
+            src_root_field = field
+            logger.debug(f"存在根路径字段: {src_root_field}")
         if not backup_medium_field and field in settings.backup_fields:
             backup_medium_field = field
             logger.debug(f"存在备用媒体路径字段: {backup_medium_field}")
-
+    
     for item in raw_data:
         try:
             if not isinstance(item, dict):
@@ -112,23 +112,32 @@ def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str
                     processed_medium_item = processed_item.get(medium_field).copy()
                     for abs_bos_url in processed_medium_item:
                         try:
-                            if not any(abs_bos_url.startswith(s3_prefix) for s3_prefix in settings.s3_prefixes) and src_root_path and processed_item[src_root_path]:
-                                abs_bos_url = os.path.join(processed_item[src_root_path], abs_bos_url)
+                            if not any(abs_bos_url.startswith(s3_prefix) for s3_prefix in settings.s3_prefixes) and media_root:
+                                abs_bos_url = os.path.join(media_root, abs_bos_url)
                             abs_bos_url_signed = fs_manager.generate_presigned_url(uri=abs_bos_url, expiration=2*24*60*60)
                         except ValueError:
-                            logger.debug(f"URL 生成预签名失败: {abs_bos_url}")
-                            continue
+                            try:
+                                if not any(abs_bos_url.startswith(s3_prefix) for s3_prefix in settings.s3_prefixes) and src_root_field and processed_item[src_root_field]:
+                                    abs_bos_url = os.path.join(processed_item[src_root_field], abs_bos_url)
+                                abs_bos_url_signed = fs_manager.generate_presigned_url(uri=abs_bos_url, expiration=2*24*60*60)
+                            except ValueError:
+                                logger.debug(f"URL 生成预签名失败: {abs_bos_url}")
+                                continue
                         if abs_bos_url_signed: presigned_urls.append(abs_bos_url_signed)
                     
                     if not presigned_urls:
                         if backup_medium_field and processed_item[backup_medium_field]:
-                            processed_medium_item = processed_item.get(backup_medium_field).copy()
-                            for abs_bos_url in processed_medium_item:
+                            backup_medium_item = processed_item.get(backup_medium_field).copy()
+                            for backup_url in backup_medium_item:
                                 try:
-                                    if not any(abs_bos_url.startswith(s3_prefix) for s3_prefix in settings.s3_prefixes): abs_bos_url = f"{settings.s3_default_prefix}{abs_bos_url}"
+                                    abs_bos_url = f"{settings.s3_default_prefix}{backup_url}"
+                                    if not any(backup_url.startswith(s3_prefix) for s3_prefix in settings.s3_prefixes):
+                                        is_exist = fs_manager.exists(abs_bos_url)
+                                        if not is_exist:
+                                            fs_manager.write_bytes(abs_bos_url, fs_manager.read_bytes(backup_url))
                                     abs_bos_url_signed = fs_manager.generate_presigned_url(uri=abs_bos_url, expiration=2*24*60*60)
-                                except ValueError:
-                                    logger.exception(f"备用 URL 生成预签名失败: {abs_bos_url}")
+                                except Exception as e:
+                                    logger.exception(f"备用 URL 生成预签名失败: {abs_bos_url}, detail: {e}")
                                     continue
                                 if abs_bos_url_signed: presigned_urls.append(abs_bos_url_signed)
 
@@ -145,7 +154,7 @@ def preview_serializer(raw_data: List[Dict[str, Any]]) -> Optional[List[Dict[str
     
     return processed_data
 
-def splits_serializer(paths):
+def splits_serializer(paths, media_root=""):
     splits = {}
     for converted_preview_path in paths:
         records = []
@@ -169,10 +178,13 @@ def splits_serializer(paths):
                 records.append(record)
                 idx += 1
         splits.update({
-            Path(converted_preview_path).stem: preview_serializer(records)
+            Path(converted_preview_path).stem: preview_serializer(records, media_root)
         })
     return splits
 
 if __name__ == "__main__":
-    raw_data = {}
-    print(preview_serializer())
+    # uri = "bos:/llm-data-process/mnt/cfs_bj_mt/workspace/zhangying64/data_etl/ocr/medieval_media/images/dev/L-Cas.C-14.S-Hyb.Paris__BnF__esp__33.H-ebbcb.Part-0/0.png"
+    # is_exist = fs_manager.exists(uri)
+    backup_url = "/mnt/cfs_bj_mt/workspace/zhangying64/data_etl/ocr/medieval_media/images/dev/L-Cas.C-14.S-Hyb.Paris__BnF__esp__33.H-ebbcb.Part-0/0.png"
+    abs_bos_url = f"bos:/llm-data-process{backup_url}"
+    fs_manager.write_bytes(abs_bos_url, fs_manager.read_bytes(backup_url))

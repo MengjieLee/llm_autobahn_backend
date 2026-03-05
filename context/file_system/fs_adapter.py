@@ -10,6 +10,7 @@ from typing import BinaryIO, Callable, List, Tuple
 import smart_open
 from botocore.client import BaseClient
 
+# 假设外部S3工具函数已存在（实际使用时需确保导入）
 from context.file_system.s3 import (
     s3_file_exists,
     s3_head_file,
@@ -33,8 +34,9 @@ SCHEME_BOS = "bos"
 _LOCAL_SCHEMES = (SCHEME_EMPTY, SCHEME_FILE)
 _S3_SCHEMES = (SCHEME_S3, SCHEME_BOS)
 
-# URI scheme separators
-URI_SCHEME_SEPARATOR = "://"
+# URI scheme separators - 支持两种分隔符
+URI_SCHEME_SEPARATOR = "://"  # 主分隔符
+URI_SCHEME_SEPARATOR_ALT = ":/"  # 备选分隔符
 URI_SCHEME_PREFIX = ":"
 URI_PATH_SEPARATOR = "/"
 
@@ -46,34 +48,46 @@ S3_LIST_DELIMITER = "/"
 
 
 def _starts_with_scheme(uri: str, scheme: str) -> bool:
-    return uri.lower().startswith(f"{scheme}{URI_SCHEME_SEPARATOR}")
+    """兼容://和:/两种分隔符的协议判断"""
+    lu = uri.lower()
+    # 检查是否以 scheme:// 或 scheme:/ 开头
+    return (lu.startswith(f"{scheme}{URI_SCHEME_SEPARATOR}") or 
+            lu.startswith(f"{scheme}{URI_SCHEME_SEPARATOR_ALT}"))
 
 
 def _extract_scheme(uri: str) -> str:
-    """Extract the scheme from a URI (e.g., 's3', 'bos', 'file'), or empty string if none."""
+    """Extract the scheme from a URI (e.g., 's3', 'bos', 'file'), or empty string if none.
+    兼容://和:/两种分隔符格式
+    """
     if not uri:
         return SCHEME_EMPTY
     lu = uri.lower()
-    if _starts_with_scheme(lu, SCHEME_S3):
-        return SCHEME_S3
-    elif _starts_with_scheme(lu, SCHEME_BOS):
-        return SCHEME_BOS
-    elif _starts_with_scheme(lu, SCHEME_FILE):
-        return SCHEME_FILE
-    elif lu.startswith(URI_PATH_SEPARATOR):
+    
+    # 依次检查各协议，兼容两种分隔符
+    for target_scheme in [SCHEME_S3, SCHEME_BOS, SCHEME_FILE]:
+        if _starts_with_scheme(lu, target_scheme):
+            return target_scheme
+    
+    # 无协议（如绝对路径 /tmp/file.txt）
+    if lu.startswith(URI_PATH_SEPARATOR):
         return SCHEME_EMPTY
+    
     raise ValueError(f"Unrecognized URI scheme in: {uri}")
 
 
 def _strip_scheme(uri: str) -> str:
-    """Remove scheme prefix from URI."""
+    """Remove scheme prefix from URI. 兼容://和:/两种分隔符"""
     scheme = _extract_scheme(uri)
     if not scheme:
         return uri
-    if scheme in (SCHEME_S3, SCHEME_BOS):
-        return uri[len(f"{scheme}{URI_SCHEME_SEPARATOR}") :]
-    if scheme == SCHEME_FILE:
-        return uri[len(f"{SCHEME_FILE}{URI_SCHEME_SEPARATOR}") :]
+    
+    lu = uri.lower()
+    # 移除 scheme:// 或 scheme:/ 前缀
+    if lu.startswith(f"{scheme}{URI_SCHEME_SEPARATOR}"):
+        return uri[len(f"{scheme}{URI_SCHEME_SEPARATOR}"):]
+    elif lu.startswith(f"{scheme}{URI_SCHEME_SEPARATOR_ALT}"):
+        return uri[len(f"{scheme}{URI_SCHEME_SEPARATOR_ALT}"):]
+    
     return uri
 
 
@@ -93,23 +107,24 @@ def _validate_s3_uri(uri: str) -> None:
 
 def _detect_fs_type(uri: str) -> str:
     """Identify filesystem type for given URI.
-
     Returns:
         FS_TYPE_LOCAL or FS_TYPE_S3
+    兼容://和:/两种分隔符
     """
     if not uri:
         raise ValueError("Cannot detect filesystem type for empty URI")
 
     lu = uri.lower()
 
+    # 兼容两种分隔符的S3/BOS判断
     if _starts_with_scheme(lu, SCHEME_S3) or _starts_with_scheme(lu, SCHEME_BOS):
         _validate_s3_uri(uri)
         return FS_TYPE_S3
 
-    if lu.startswith(f"{SCHEME_FILE}{URI_SCHEME_SEPARATOR}"):
-        if not lu.startswith(
-            f"{SCHEME_FILE}{URI_SCHEME_SEPARATOR}{URI_PATH_SEPARATOR}"
-        ):
+    # 兼容两种分隔符的file协议判断
+    if _starts_with_scheme(lu, SCHEME_FILE):
+        stripped = _strip_scheme(uri)
+        if not stripped.startswith(URI_PATH_SEPARATOR):
             raise ValueError(f"Unsupported filesystem URI: {uri}")
         return FS_TYPE_LOCAL
 
@@ -267,6 +282,7 @@ class LocalFileSystemAdapter(FileSystemAdapter):
         return os.path.getsize(path)
     
     def s3_generate_presigned_url(self, uri: str, expiration: int = 3600 * 24 * 2) -> str:
+        """注意：Local适配器不应该有S3相关方法，此处属于代码设计问题，建议移除"""
         _validate_s3_uri(uri)
         return s3_generate_presigned_url(uri, expiration, self._client())
 

@@ -49,7 +49,7 @@ async def detail_dataset(
     if not the_dataset:
         raise HTTPException(status_code=500, detail="数据集不存在")
     
-    splits = splits_serializer(the_dataset["converted_preview_paths"])
+    splits = splits_serializer(the_dataset["converted_preview_paths"], media_root=the_dataset.get("media_root_dir", ""))
     the_dataset["splits"] = splits
     
     return StandardResponse(code=0, message="success", data=the_dataset, trace_id=None)
