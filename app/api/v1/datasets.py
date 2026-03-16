@@ -33,6 +33,27 @@ async def list_datasets(
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
+@router.post("/name-map", summary="查询数据集名称 -> iceberg 表名的映射")
+async def name2table(
+    request: Request,
+    body: dict,
+    service: DatasetsService = Depends(get_service)
+) -> StandardResponse[dict]:
+    body["groups"] = getattr(request.state, "groups", []) or []
+    datasets = await service.list_datasets(DatasetList(**body))
+    # 映射规则： {'name_value': tables[0]} 前提是 tables 有值
+    # datasets = [
+    #     {'name': 'name_value', 'tables':[]},
+    #     {'name': 'name_value', 'tables':[]},
+    # ] 
+    data = {
+        dataset["name"].lower(): dataset["tables"][0]
+        for dataset in datasets 
+        if dataset.get("tables")
+    }
+    return StandardResponse(code=0, message="success", data=data, trace_id=None)
+
+
 @router.get("/detail", summary="查询数据集详情")
 async def detail_dataset(
     request: Request,
