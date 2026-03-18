@@ -82,10 +82,23 @@ async def users_metrics(
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
+# 需要忽略的无效值
+INVALID_VALUES = {"", "-", "unknown", "Unknown", "UNKNOWN", None}
+
+
+def _is_valid_value(value: Optional[str]) -> bool:
+    """检查值是否有效（非空、非 '-'、非 'unknown'）"""
+    if value is None:
+        return False
+    return value.strip() not in INVALID_VALUES
+
+
 def _parse_log_line(line: str) -> Optional[Dict[str, Any]]:
     """
     解析单行日志，返回结构化数据
     日志格式: {time_str} | {user_info} | {scenario} | {message}
+
+    注意：当 user_info 或 scenario 为空、'-' 或 'unknown' 时，返回 None（不纳入统计）
     """
     try:
         parts = line.strip().split(" | ", 3)
@@ -94,13 +107,17 @@ def _parse_log_line(line: str) -> Optional[Dict[str, Any]]:
 
         time_str, user_info, scenario, message = parts
 
+        # 检查 user_info 和 scenario 是否有效，无效则跳过此条记录
+        if not _is_valid_value(user_info) or not _is_valid_value(scenario):
+            return None
+
         # 解析时间
         log_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
 
         return {
             "timestamp": log_time,
-            "user": user_info if user_info != "-" else None,
-            "scenario": scenario if scenario != "-" else None,
+            "user": user_info.strip(),
+            "scenario": scenario.strip(),
             "action": message
         }
     except (ValueError, IndexError):
