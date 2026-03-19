@@ -124,7 +124,11 @@ def _parse_log_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _read_log_entries(log_path: str, start_date: Optional[datetime] = None) -> List[Dict[str, Any]]:
+def _read_log_entries(
+    log_path: str,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
     """读取并解析日志文件"""
     entries = []
 
@@ -137,7 +141,8 @@ def _read_log_entries(log_path: str, start_date: Optional[datetime] = None) -> L
             for line in f:
                 parsed = _parse_log_line(line)
                 if parsed:
-                    if start_date is None or parsed["timestamp"] >= start_date:
+                    if (start_date is None or parsed["timestamp"] >= start_date) and \
+                       (end_date is None or parsed["timestamp"] <= end_date):
                         entries.append(parsed)
     except Exception as e:
         logger.error(f"Error reading log file: {e}")
@@ -145,28 +150,91 @@ def _read_log_entries(log_path: str, start_date: Optional[datetime] = None) -> L
     return entries
 
 
+def _generate_date_keys(
+    granularity: str,
+    query_start: Optional[datetime],
+    query_end: Optional[datetime]
+) -> List[str]:
+    """根据聚合粒度和日期范围，生成完整的日期 key 列表（用于补零）"""
+    if not query_start or not query_end:
+        return []
+
+    keys = []
+    if granularity == "day":
+        current = query_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_day = query_end.replace(hour=0, minute=0, second=0, microsecond=0)
+        while current <= end_day:
+            keys.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(days=1)
+    elif granularity == "week":
+        # 从 query_start 所在周的周一开始
+        current = query_start - timedelta(days=query_start.weekday())
+        current = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_day = query_end.replace(hour=0, minute=0, second=0, microsecond=0)
+        while current <= end_day:
+            keys.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(weeks=1)
+    else:  # month
+        current_year = query_start.year
+        current_month = query_start.month
+        end_year = query_end.year
+        end_month = query_end.month
+        while (current_year, current_month) <= (end_year, end_month):
+            keys.append(f"{current_year:04d}-{current_month:02d}")
+            current_month += 1
+            if current_month > 12:
+                current_month = 1
+                current_year += 1
+    return keys
+
+
 def _aggregate_by_period(
     entries: List[Dict[str, Any]],
-    period: Literal["day", "week", "month"]
+    period: str,
+    query_start: Optional[datetime] = None,
+    query_end: Optional[datetime] = None
 ) -> Dict[str, Any]:
-    """按时间周期聚合数据"""
+    """按时间周期聚合数据，聚合粒度根据日期跨度自动决定，缺失日期补零"""
+
+    # 对于 "all" period，从实际数据推导日期范围
+    if entries:
+        if not query_start:
+            query_start = min(e["timestamp"] for e in entries)
+        if not query_end:
+            query_end = max(e["timestamp"] for e in entries)
+
+    # 根据日期跨度自动决定聚合粒度
+    if query_start and query_end:
+        span_days = (query_end - query_start).days
+    else:
+        span_days = 0  # 无数据时默认按天
+
+    if span_days <= 31:
+        granularity = "day"
+    elif span_days <= 365:
+        granularity = "week"
+    else:
+        granularity = "month"
 
     if not entries:
+        # 即使没有数据也要生成完整的时间轴（全部补零）
+        all_date_keys = _generate_date_keys(granularity, query_start, query_end)
+        timeline = [{"date": k, "requests": 0, "unique_users": 0} for k in all_date_keys]
         return {
             "period": period,
             "total_requests": 0,
             "active_users": [],
             "scenario_distribution": [],
             "action_distribution": [],
-            "timeline": []
+            "timeline": timeline
         }
 
     # 按日期分组
     date_groups = defaultdict(list)
     for entry in entries:
-        if period == "day":
+        if granularity == "day":
             key = entry["timestamp"].strftime("%Y-%m-%d")
-        elif period == "week":
+        elif granularity == "week":
             # 按周一为起始
             week_start = entry["timestamp"] - timedelta(days=entry["timestamp"].weekday())
             key = week_start.strftime("%Y-%m-%d")
@@ -186,16 +254,24 @@ def _aggregate_by_period(
     actions = [e["action"] for e in entries if e["action"]]
     action_counts = Counter(actions)
 
-    # 时间线数据
+    # 生成完整时间轴并补零
+    all_date_keys = _generate_date_keys(granularity, query_start, query_end)
     timeline = []
-    for date_key in sorted(date_groups.keys()):
-        group_entries = date_groups[date_key]
-        group_users = set(e["user"] for e in group_entries if e["user"])
-        timeline.append({
-            "date": date_key,
-            "requests": len(group_entries),
-            "unique_users": len(group_users)
-        })
+    for date_key in all_date_keys:
+        if date_key in date_groups:
+            group_entries = date_groups[date_key]
+            group_users = set(e["user"] for e in group_entries if e["user"])
+            timeline.append({
+                "date": date_key,
+                "requests": len(group_entries),
+                "unique_users": len(group_users)
+            })
+        else:
+            timeline.append({
+                "date": date_key,
+                "requests": 0,
+                "unique_users": 0
+            })
 
     return {
         "period": period,
@@ -218,18 +294,29 @@ def _aggregate_by_period(
 
 @router.get("/usage/metrics", summary="查询平台使用情况统计")
 async def usage_metrics(
-    period: Literal["day", "week", "month"] = Query(
-        default="day",
-        description="统计周期: day(最近1天), week(最近7天), month(最近30天)"
+    period: Literal["week", "month", "year", "all"] = Query(
+        default="week",
+        description="统计周期: week(近7天), month(近1个月), year(近1年), all(所有)"
+    ),
+    start_date: Optional[str] = Query(
+        default=None,
+        description="自定义起始日期，格式 YYYY-MM-DD，优先级高于 period"
+    ),
+    end_date: Optional[str] = Query(
+        default=None,
+        description="自定义结束日期，格式 YYYY-MM-DD，优先级高于 period"
     ),
 ) -> StandardResponse[dict]:
     """
     获取平台使用情况统计数据
 
     - **period**: 统计周期
-      - day: 最近1天的数据
-      - week: 最近7天的数据
-      - month: 最近30天的数据
+      - week: 近7天的数据
+      - month: 近1个月的数据
+      - year: 近1年的数据
+      - all: 所有数据
+    - **start_date**: 自定义起始日期 (YYYY-MM-DD)，与 end_date 配合使用，优先级高于 period
+    - **end_date**: 自定义结束日期 (YYYY-MM-DD)，与 start_date 配合使用，优先级高于 period
 
     返回数据包括:
     - total_requests: 总请求数
@@ -240,29 +327,51 @@ async def usage_metrics(
     """
     # 计算起始时间
     now = datetime.now()
-    if period == "day":
-        start_date = now - timedelta(days=1)
-    elif period == "week":
-        start_date = now - timedelta(days=7)
-    else:  # month
-        start_date = now - timedelta(days=30)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if start_date and end_date:
+        try:
+            query_start = datetime.strptime(start_date, "%Y-%m-%d")
+            query_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
+    else:
+        query_end = today_end  # 统一使用当天结束时间，确保今天的数据完整
+        if period == "week":
+            query_start = today_start - timedelta(days=6)   # 今天 + 前6天 = 近7天
+        elif period == "month":
+            query_start = today_start - timedelta(days=29)  # 今天 + 前29天 = 近30天
+        elif period == "year":
+            query_start = today_start - timedelta(days=364) # 今天 + 前364天 = 近1年
+        else:  # all
+            query_start = None
 
     # 读取并解析日志
-    entries = _read_log_entries(LOG_FILE_PATH, start_date)
+    entries = _read_log_entries(LOG_FILE_PATH, query_start, query_end)
 
     # 聚合数据
-    data = _aggregate_by_period(entries, period)
-    data["start_date"] = start_date.strftime("%Y-%m-%d %H:%M:%S")
-    data["end_date"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    data = _aggregate_by_period(entries, period, query_start, query_end)
+    data["start_date"] = query_start.strftime("%Y-%m-%d %H:%M:%S") if query_start else ""
+    data["end_date"] = query_end.strftime("%Y-%m-%d %H:%M:%S") if query_end else now.strftime("%Y-%m-%d %H:%M:%S")
 
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
 @router.get("/usage/users", summary="查询用户活跃度详情")
 async def usage_users(
-    period: Literal["day", "week", "month"] = Query(
+    period: Literal["week", "month", "year", "all"] = Query(
         default="week",
-        description="统计周期"
+        description="统计周期: week(近7天), month(近1个月), year(近1年), all(所有)"
+    ),
+    start_date: Optional[str] = Query(
+        default=None,
+        description="自定义起始日期，格式 YYYY-MM-DD，优先级高于 period"
+    ),
+    end_date: Optional[str] = Query(
+        default=None,
+        description="自定义结束日期，格式 YYYY-MM-DD，优先级高于 period"
     ),
     limit: int = Query(default=50, ge=1, le=200, description="返回用户数量上限"),
 ) -> StandardResponse[dict]:
@@ -272,14 +381,28 @@ async def usage_users(
     返回每个用户的请求次数、最常用功能等信息
     """
     now = datetime.now()
-    if period == "day":
-        start_date = now - timedelta(days=1)
-    elif period == "week":
-        start_date = now - timedelta(days=7)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if start_date and end_date:
+        try:
+            query_start = datetime.strptime(start_date, "%Y-%m-%d")
+            query_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
     else:
-        start_date = now - timedelta(days=30)
+        query_end = today_end  # 统一使用当天结束时间
+        if period == "week":
+            query_start = today_start - timedelta(days=6)
+        elif period == "month":
+            query_start = today_start - timedelta(days=29)
+        elif period == "year":
+            query_start = today_start - timedelta(days=364)
+        else:  # all
+            query_start = None
 
-    entries = _read_log_entries(LOG_FILE_PATH, start_date)
+    entries = _read_log_entries(LOG_FILE_PATH, query_start, query_end)
 
     # 按用户分组统计
     user_stats = defaultdict(lambda: {
