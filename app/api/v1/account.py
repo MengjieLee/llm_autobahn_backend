@@ -60,7 +60,7 @@ async def login(
     logger.info(f"零信任网关验证开始.")
 
     # TODO
-    zt_authorization = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6InZfbGltZW5namllMDNAYmFpZHUuY29tIiwiaWF0IjoxNzY2OTk4MTMyLCJleHAiOjE3NjcwMDE3MzIsIm5hbWUiOiLmnY7moqbmnbAiLCJ1c2VybmFtZSI6InZfbGltZW5namllMDMiLCJpc3MiOiJ6dCJ9.TVDGfhZIBQMx-NEe2jciIERcBlCT6GeCbEOeN9SdO4M'
+    zt_authorization = ''
 
     if not zt_authorization:
         logger.error(f"JWT 校验失败: Header 中无有效的 X-Zt-Authorization")
