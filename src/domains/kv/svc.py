@@ -159,12 +159,9 @@ class ESIndexService:
             es = self._get_es_for_date(start_dt.strftime("%Y-%m-%d"))
             return await es.query_to_file(body, output_file, status_callback)
 
-        # 多窗口：逐段查询，拼接写入同一个文件
+        # 多窗口：逐段查询，拼接写入同一个文件 (JSONL)
         total_count = 0
         with open(output_file, 'w', encoding='utf-8') as f:
-            f.write('[\n')
-            first_record = True
-
             for win_idx, (win_start, win_end) in enumerate(windows):
                 win_start_str = win_start.strftime("%Y-%m-%d %H:%M:%S")
                 win_end_str = win_end.strftime("%Y-%m-%d %H:%M:%S")
@@ -177,13 +174,9 @@ class ESIndexService:
                 body = self._build_query_body(win_start, win_end)
                 es = self._get_es_for_date(win_start.strftime("%Y-%m-%d"))
                 window_count = await es.query_to_file_appender(
-                    body, f, first_record, status_callback, total_count
+                    body, f, status_callback, total_count
                 )
-                if window_count > 0:
-                    first_record = False
                 total_count += window_count
-
-            f.write('\n]')
 
         if status_callback:
             status_callback(total_count, f"查询完成，共 {total_count} 条记录")

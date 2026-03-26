@@ -114,9 +114,6 @@ class ESIndexClient:
 
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write('[\n')  # JSON 数组开始
-                first_record = True
-
                 # 首次查询
                 res = self.client.search(index=self.index, body=body, scroll=scroll_time, size=scroll_size)
                 scroll_id = res.get("_scroll_id")
@@ -129,10 +126,8 @@ class ESIndexClient:
                     for r in results:
                         parsed = parse_single_record(r)
                         if parsed:
-                            if not first_record:
-                                f.write(',\n')
-                            json.dump(parsed, f, ensure_ascii=False)
-                            first_record = False
+                            f.write(json.dumps(parsed, ensure_ascii=False))
+                            f.write('\n')
                             total_count += 1
 
                     if status_callback:
@@ -141,8 +136,6 @@ class ESIndexClient:
                     res = self.client.scroll(scroll_id=scroll_id, scroll=scroll_time)
                     scroll_id = res.get("_scroll_id")
                     results = res['hits']['hits']
-
-                f.write('\n]')  # JSON 数组结束
         except Exception as e:
             logger.error(f"[scroll_to_file] ERROR index={self.index} rounds={scroll_rounds} count={total_count} err={e}")
             raise
@@ -214,10 +207,10 @@ class ESIndexClient:
             status_callback
         )
 
-    def _sync_query_to_file_appender(self, body: dict, f, first_record: bool,
+    def _sync_query_to_file_appender(self, body: dict, f,
                                       status_callback: Callable, base_count: int) -> int:
         """
-        流式查询并追加写入到已打开的文件句柄（用于多窗口拼接）
+        流式查询并追加写入到已打开的文件句柄（用于多窗口拼接，JSONL 格式）
         """
         scroll_time = "10m"
         scroll_size = 10000
@@ -236,9 +229,8 @@ class ESIndexClient:
                 for r in results:
                     parsed = parse_single_record(r)
                     if parsed:
-                        if not first_record or window_count > 0:
-                            f.write(',\n')
-                        json.dump(parsed, f, ensure_ascii=False)
+                        f.write(json.dumps(parsed, ensure_ascii=False))
+                        f.write('\n')
                         window_count += 1
 
                 if status_callback:
@@ -261,14 +253,14 @@ class ESIndexClient:
 
         return window_count
 
-    async def query_to_file_appender(self, body: dict, f, first_record: bool,
+    async def query_to_file_appender(self, body: dict, f,
                                       status_callback: Callable = None, base_count: int = 0) -> int:
         """
-        异步流式查询并追加写入到文件句柄（用于多窗口拼接）
+        异步流式查询并追加写入到文件句柄（JSONL 格式，用于多窗口拼接）
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             _executor,
             self._sync_query_to_file_appender,
-            body, f, first_record, status_callback, base_count
+            body, f, status_callback, base_count
         )

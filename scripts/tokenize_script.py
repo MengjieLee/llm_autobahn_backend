@@ -352,18 +352,28 @@ def main():
 
     tokenizer_manager = TokenizerManager()
 
-    # 读取输入文件
+    # 读取输入文件（支持 JSONL 和 JSON 格式）
     print(f"[INFO] 正在读取输入文件...")
+    records = []
     with open(args.input, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    if isinstance(data, dict) and "data" in data:
-        records = data["data"]
-    elif isinstance(data, list):
-        records = data
-    else:
-        print(f"[ERROR] 无法识别的输入格式")
-        return 1
+        first_char = f.read(1)
+        f.seek(0)
+        if first_char == '[' or first_char == '{':
+            # JSON 格式（兼容旧文件）
+            data = json.load(f)
+            if isinstance(data, dict) and "data" in data:
+                records = data["data"]
+            elif isinstance(data, list):
+                records = data
+            else:
+                print(f"[ERROR] 无法识别的 JSON 输入格式")
+                return 1
+        else:
+            # JSONL 格式：每行一个 JSON 对象
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
     total_records = len(records)
     print(f"[INFO] 共 {total_records} 条记录")
 

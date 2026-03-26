@@ -209,7 +209,7 @@ async def _run_fetch_stage(task_id: str, start_datetime: str, end_datetime: str,
         h_end_str = h_end.strftime("%Y-%m-%d %H:%M:%S")
         h_start_tag = h_start.strftime("%Y%m%d_%H%M%S")
         h_end_tag = h_end.strftime("%Y%m%d_%H%M%S")
-        result_file = os.path.join(task_data_dir, f"kv_{h_start_tag}_{h_end_tag}.json")
+        result_file = os.path.join(task_data_dir, f"kv_{h_start_tag}_{h_end_tag}.jsonl")
 
         _update_stage(task_id, "fetch", {
             "status": "running",
@@ -319,8 +319,8 @@ async def _run_tokenize_stage(task_id: str):
     output_dir = os.path.join(task_data_dir, "tokenized")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 收集 fetch 产出的 json 文件
-    input_files = sorted(glob.glob(os.path.join(task_data_dir, "kv_*.json")))
+    # 收集 fetch 产出的 jsonl 文件
+    input_files = sorted(glob.glob(os.path.join(task_data_dir, "kv_*.jsonl")))
     if not input_files:
         _set_failed(task_id, "tokenize", "无输入文件")
         raise RuntimeError("No input files for tokenize")
