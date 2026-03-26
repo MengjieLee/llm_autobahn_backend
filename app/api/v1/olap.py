@@ -372,27 +372,36 @@ async def _run_streaming_fetch_tokenize(
     # ---- 更新 tokenize 阶段最终状态 ----
     success_files = [r for r in tokenize_results if r["status"] == "completed"]
     failed_files = [r for r in tokenize_results if r["status"] == "failed"]
-    success_outputs = [r["output"] for r in success_files]
+
+    # 按 model 聚合所有 txt 文件: model -> [txt_file, ...]
+    model_txt_files = {}
+    for r in success_files:
+        for model, txt_file in r.get("outputs", {}).items():
+            model_txt_files.setdefault(model, []).append(txt_file)
 
     if not success_files:
         _update_stage(task_id, "tokenize", {
             "status": "failed",
             "message": f"序列化全部失败，{len(failed_files)} 个文件",
             "files": tokenize_results,
-            "output_files": [],
+            "model_outputs": {},
             "total_lines": 0
         })
         _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
         raise RuntimeError("All tokenize files failed")
 
-    status_msg = f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，{tokenize_total_lines[0]} 条"
+    status_msg = (
+        f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，"
+        f"{tokenize_total_lines[0]} 条，{len(model_txt_files)} 个模型"
+    )
     _update_stage(task_id, "tokenize", {
         "status": "completed",
         "message": status_msg,
-        "output_files": success_outputs,
+        "model_outputs": {m: fs for m, fs in model_txt_files.items()},
         "total_lines": tokenize_total_lines[0],
         "success_count": len(success_files),
         "failed_count": len(failed_files),
+        "models": list(model_txt_files.keys()),
         "files": tokenize_results
     })
 
@@ -414,10 +423,9 @@ async def _run_streaming_fetch_tokenize(
 async def _run_tokenize_single_file(
     input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int
 ) -> dict:
-    """对单个 json 文件执行 tokenize + convert，返回结果 dict"""
+    """对单个 jsonl 文件执行 tokenize + convert (per-model 分桶)，返回结果 dict"""
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     short_name = os.path.basename(input_file)
-    cache_input_file = os.path.join(output_dir, f"{base_name}_input_ids.txt")
 
     cmd = [
         "python", os.path.join(SCRIPTS_DIR, "kv_pipeline.py"),
@@ -440,105 +448,226 @@ async def _run_tokenize_single_file(
             "file": short_name,
             "status": "failed",
             "error": output_text[-300:],
-            "output": None
+            "outputs": {}
         }
 
-    # 检查输出文件
-    if not os.path.exists(cache_input_file):
+    # 读取 pipeline_summary.json 获取 per-model 产出
+    summary_file = os.path.join(output_dir, "pipeline_summary.json")
+    model_outputs = {}  # model -> txt_file
+    total_lines = 0
+
+    if os.path.exists(summary_file):
+        with open(summary_file, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        # summary.files[0].model_files: {model: {json, txt, lines}}
+        for file_result in summary.get("files", []):
+            for model, mf in file_result.get("model_files", {}).items():
+                txt_file = mf.get("txt", "")
+                lines = mf.get("lines", 0)
+                if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
+                    model_outputs[model] = txt_file
+                    total_lines += lines
+    else:
+        # 兜底：扫描 per-model txt 文件
+        pattern = os.path.join(output_dir, f"{base_name}_*_input_ids.txt")
+        for txt_file in sorted(glob.glob(pattern)):
+            fname = os.path.basename(txt_file)
+            model = fname[len(base_name) + 1:].replace("_input_ids.txt", "")
+            if model and os.path.getsize(txt_file) > 0:
+                with open(txt_file, "r") as f:
+                    lines = sum(1 for _ in f)
+                model_outputs[model] = txt_file
+                total_lines += lines
+
+    if not model_outputs:
         return {
             "file": short_name,
             "status": "failed",
-            "error": "输出文件未生成",
-            "output": None
+            "error": "tokenize 无有效输出文件",
+            "outputs": {}
         }
-
-    # 统计行数
-    with open(cache_input_file, "r") as f:
-        line_count = sum(1 for _ in f)
 
     return {
         "file": short_name,
         "status": "completed",
-        "output": cache_input_file,
-        "lines": line_count,
+        "outputs": model_outputs,  # model -> txt_file
+        "lines": total_lines,
         "error": None
     }
 
 
 async def _run_simulate_stage(task_id: str):
-    """缓存模拟: 调用 cache_pipeline.py，只使用序列化成功的文件"""
+    """缓存模拟: 按 model 分组并行调用 cache_pipeline.py，汇总多 model 结果"""
     _update_stage(task_id, "simulate", {"status": "running", "message": "正在模拟缓存命中..."}, "simulate")
 
     task_data_dir = _task_dir(task_id)
     report_dir = os.path.join(task_data_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
 
-    # 从 tokenize 阶段的状态中获取成功的输出文件
+    # 从 tokenize 阶段获取 per-model 文件列表
     status = _read_status(task_id)
     tokenize_stage = status.get("pipeline", {}).get("stages", {}).get("tokenize", {})
-    txt_files = tokenize_stage.get("output_files", [])
+    model_outputs = tokenize_stage.get("model_outputs", {})
 
-    if not txt_files:
-        # 兜底: 扫描目录
+    if not model_outputs:
+        # 兜底: 扫描 tokenized 目录，按 model 分组
+        # 文件名格式: {slice_prefix}_{model}_input_ids.txt
+        # slice_prefix 格式: kv_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS
+        # model 提取: 去掉 _input_ids.txt 后缀，再去掉 kv_日期_日期 前缀
+        import re
         tokenized_dir = os.path.join(task_data_dir, "tokenized")
-        txt_files = sorted(glob.glob(os.path.join(tokenized_dir, "*_input_ids.txt")))
+        for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "*_input_ids.txt"))):
+            fname = os.path.basename(txt_file)
+            # 正则: kv_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_{model}_input_ids.txt
+            m = re.match(r'kv_\d{8}_\d{6}_\d{8}_\d{6}_(.+)_input_ids\.txt$', fname)
+            if m:
+                model = m.group(1)
+            else:
+                # 兜底：取 _input_ids.txt 前面最后一段非日期部分
+                model = fname.replace("_input_ids.txt", "").split("_")[-1]
+            if os.path.getsize(txt_file) > 0:
+                model_outputs.setdefault(model, []).append(txt_file)
 
-    # 过滤掉空文件（0 字节或只有空行）
-    non_empty_files = []
-    for f in txt_files:
-        if os.path.exists(f) and os.path.getsize(f) > 0:
-            non_empty_files.append(f)
-    txt_files = non_empty_files
+    # 过滤掉空文件
+    for model in list(model_outputs.keys()):
+        model_outputs[model] = [
+            f for f in model_outputs[model]
+            if os.path.exists(f) and os.path.getsize(f) > 0
+        ]
+        if not model_outputs[model]:
+            del model_outputs[model]
 
-    if not txt_files:
+    if not model_outputs:
         _set_failed(task_id, "simulate", "无有效 input_ids 文件（全部为空）")
         raise RuntimeError("No non-empty input_ids files for simulate")
 
-    cmd = [
-        "python", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
-        "-i", *txt_files,
-        "-o", report_dir,
-        "-s", str(CACHE_SIZE),
-        "-b", str(BLOCK_SIZE)
-    ]
+    _update_stage(task_id, "simulate", {
+        "status": "running",
+        "message": f"正在模拟 {len(model_outputs)} 个模型..."
+    })
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=BASE_DIR
-    )
-    stdout, _ = await proc.communicate()
-    output_text = stdout.decode("utf-8", errors="replace")
+    # 已完成的 model 计数（用于进度更新）
+    sim_done_count = [0]
 
-    if proc.returncode != 0:
-        _set_failed(task_id, "simulate", f"模拟失败 (rc={proc.returncode}): {output_text[-500:]}")
-        raise RuntimeError(f"Simulate failed: rc={proc.returncode}")
+    async def _simulate_single_model(model: str, txt_files: list) -> dict:
+        """对单个 model 的所有 txt 文件执行 cache 模拟，产出文件使用 .incomplete 状态机"""
+        model_report_dir = os.path.join(report_dir, model)
+        os.makedirs(model_report_dir, exist_ok=True)
 
-    # 读取报告
-    report_file = os.path.join(report_dir, "cache_report.json")
-    result = {}
-    if os.path.exists(report_file):
-        with open(report_file, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        # 提取核心指标（report 结构: results[], summary{})
-        results_list = report.get("results", [])
-        summary = report.get("summary", {})
-        if results_list:
-            cr = results_list[0]
-            result = {
-                "hit_rate": cr.get("hit_rate", 0),
-                "hit_rate_percent": cr.get("hit_rate_percent", 0),
-                "hit_count": cr.get("hit_count", 0),
-                "total_queries": cr.get("total_queries", 0),
-                "total_tokens": summary.get("total_tokens", 0),
-                "total_entries": summary.get("total_entries", 0),
-                "report_file": report_file
+        # 更新状态：该 model 开始模拟
+        _update_stage(task_id, "simulate", {
+            "status": "running",
+            "message": f"正在模拟 {len(model_outputs)} 个模型 ({sim_done_count[0]}/{len(model_outputs)} 完成)..."
+        })
+
+        # report 产出使用 .incomplete 标记
+        report_file_incomplete = os.path.join(model_report_dir, "cache_report.json.incomplete")
+        report_file_final = os.path.join(model_report_dir, "cache_report.json")
+
+        cmd = [
+            "python", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
+            "-i", *sorted(txt_files),
+            "-o", model_report_dir,
+            "-s", str(CACHE_SIZE),
+            "-b", str(BLOCK_SIZE)
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=BASE_DIR
+        )
+        stdout, _ = await proc.communicate()
+        output_text = stdout.decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            sim_done_count[0] += 1
+            return {
+                "model": model,
+                "status": "failed",
+                "error": f"模拟失败 (rc={proc.returncode}): {output_text[-300:]}"
             }
 
+        # 读取报告（cache_pipeline.py 直接产出 cache_report.json）
+        if not os.path.exists(report_file_final):
+            sim_done_count[0] += 1
+            return {
+                "model": model,
+                "status": "failed",
+                "error": "报告文件未生成"
+            }
+
+        with open(report_file_final, "r", encoding="utf-8") as f:
+            report = json.load(f)
+
+        results_list = report.get("results", [])
+        summary = report.get("summary", {})
+        cr = results_list[0] if results_list else {}
+
+        sim_done_count[0] += 1
+
+        # 更新进度
+        _update_stage(task_id, "simulate", {
+            "status": "running",
+            "message": f"正在模拟 {len(model_outputs)} 个模型 ({sim_done_count[0]}/{len(model_outputs)} 完成)..."
+        })
+
+        return {
+            "model": model,
+            "status": "completed",
+            "hit_rate": cr.get("hit_rate", 0),
+            "hit_rate_percent": cr.get("hit_rate_percent", 0),
+            "hit_count": cr.get("hit_count", 0),
+            "total_queries": cr.get("total_queries", 0),
+            "total_tokens": summary.get("total_tokens", 0),
+            "total_entries": summary.get("total_entries", 0),
+            "input_files_count": len(txt_files),
+            "report_file": report_file_final
+        }
+
+    # 并行执行所有 model 的 simulate
+    sim_tasks = [
+        _simulate_single_model(model, txt_files)
+        for model, txt_files in model_outputs.items()
+    ]
+    sim_results = await asyncio.gather(*sim_tasks)
+
+    # 汇总结果
+    result = {}
+    all_ok = True
+    for sr in sim_results:
+        model = sr["model"]
+        if sr["status"] == "completed":
+            result[model] = {
+                "hit_rate": sr["hit_rate"],
+                "hit_rate_percent": sr["hit_rate_percent"],
+                "hit_count": sr["hit_count"],
+                "total_queries": sr["total_queries"],
+                "total_tokens": sr["total_tokens"],
+                "total_entries": sr["total_entries"],
+                "input_files_count": sr["input_files_count"],
+            }
+        else:
+            all_ok = False
+            result[model] = {"status": "failed", "error": sr.get("error", "")}
+
+    if not any(sr["status"] == "completed" for sr in sim_results):
+        errors = "; ".join(f"{sr['model']}: {sr.get('error', '')[:100]}" for sr in sim_results)
+        _set_failed(task_id, "simulate", f"全部模型模拟失败: {errors}")
+        raise RuntimeError("All model simulations failed")
+
+    # 构建 message
+    completed_models = [sr for sr in sim_results if sr["status"] == "completed"]
+    msg_parts = []
+    for sr in completed_models:
+        msg_parts.append(f"{sr['model']} {sr['hit_rate'] * 100:.2f}%")
+    sim_msg = f"模拟完成 ({len(completed_models)}/{len(sim_results)} 模型): " + ", ".join(msg_parts)
+
     _update_stage(task_id, "simulate", {
-        "status": "completed",
-        "message": f"模拟完成，命中率 {result.get('hit_rate', 0) * 100:.2f}%"
+        "status": "completed" if all_ok else "partial",
+        "message": sim_msg,
+        "models": [sr["model"] for sr in sim_results],
     })
     _set_result(task_id, result)
 
@@ -583,7 +712,6 @@ def _is_official(user_info: dict) -> bool:
 @router.get("/kv/qpd", summary="查询当前用户 QPD 配额")
 async def kv_qpd(request: Request):
     """返回当前用户今日已用次数、配额上限、是否为 official"""
-    log_usage("kv_qpd", scenario="OLAP")
     user_info = getattr(request.state, "user", {}) or {}
     username = user_info.get("username", "unknown")
     official = _is_official(user_info)
@@ -610,7 +738,6 @@ async def kv_task_list(
     扫描 status/{username}/ 子目录，返回所有任务状态，按创建时间降序。
     支持按 username 精确过滤、按 task_name 模糊过滤。
     """
-    log_usage("kv_task_list", scenario="OLAP")
     tasks = []
     # 如果指定了 username，只扫描该用户目录；否则扫描全部
     if username:
@@ -782,7 +909,6 @@ async def es_fetch(
 
 @router.get("/kv/status/{task_id}", summary="查询任务状态")
 async def es_fetch_status(task_id: str):
-    log_usage("es_fetch_status", scenario="OLAP")
     status = _read_status(task_id)
     if not status:
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")

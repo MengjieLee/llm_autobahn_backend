@@ -3,34 +3,33 @@
 KV Cache Token 序列化流水线
 
 整合两个步骤：
-1. Token 序列化 (tokenize_script.py)
-2. 转换为 cache_calc 格式 (convert_to_cache_input.py)
+1. Token 序列化 (tokenize_script.py) — 按 model 分桶输出
+2. 转换为 cache_calc 格式 (convert_to_cache_input.py) — 每个 model 文件分别转换
 
 特性：
 - 支持多个输入文件
-- 按各自文件名流式保存到 output_dir
+- tokenize 按 model 自动分桶，每个切片产出 per-model 的 _input_ids.json
+- convert 对每个 per-model JSON 分别转 _input_ids.txt
 - 实时进度和状态更新
 
 用法:
-    python kv_pipeline.py -i file1.json file2.json -o /path/to/output_dir
+    python kv_pipeline.py -i file1.jsonl file2.jsonl -o /path/to/output_dir
 
 示例:
     python kv_pipeline.py \
-        -i olap_database/task_xxx/kv_20260323_180000_20260323_190000.json \
-           olap_database/task_xxx/kv_20260323_190000_20260323_200000.json \
-        -o olap_database/task_xxx/output
+        -i olap_database/data/user/task_xxx/kv_20260323_180000_20260323_190000.jsonl \
+        -o olap_database/data/user/task_xxx/tokenized
 """
 
 import json
 import os
 import re
+import glob
 import argparse
 import subprocess
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Dict, Any, Optional, List
-import uuid
+from typing import Dict, Any, List
 
 
 # ============================================================
@@ -53,29 +52,24 @@ def process_single_file(
     total_files: int = 1
 ) -> Dict[str, Any]:
     """
-    处理单个输入文件：tokenize -> convert
+    处理单个输入文件：tokenize (per-model 分桶) -> convert (每个 model 文件)
 
-    输出文件保存到 output_dir，文件名基于输入文件名：
-      input: kv_20260323_180000_20260323_190000.json
-      step1: kv_20260323_180000_20260323_190000_input_ids.json
-      step2: kv_20260323_180000_20260323_190000_input_ids.txt
-
-    Returns: 处理结果 dict
+    tokenize 产出:
+      {file_prefix}_{model}_input_ids.json (每个 model 一个)
+    convert 产出:
+      {file_prefix}_{model}_input_ids.txt  (每个 model 一个)
     """
     base_name = os.path.splitext(os.path.basename(input_file))[0]
-    tokenized_file = os.path.join(output_dir, f"{base_name}_input_ids.json")
-    cache_input_file = os.path.join(output_dir, f"{base_name}_input_ids.txt")
-
     file_tag = f"[{file_index}/{total_files}]"
+
     result = {
         "input_file": input_file,
-        "tokenized_file": tokenized_file,
-        "cache_input_file": cache_input_file,
         "status": "pending",
-        "steps": []
+        "steps": [],
+        "model_files": {},  # model -> {"json": ..., "txt": ..., "lines": ...}
     }
 
-    # ---- Step 1: Token 序列化 ----
+    # ---- Step 1: Token 序列化 (per-model 分桶) ----
     print(f"\n{file_tag} Step 1/2: Token 序列化 - {base_name}")
     step1_start = datetime.now()
 
@@ -83,7 +77,8 @@ def process_single_file(
         cmd = [
             "python", os.path.join(SCRIPTS_DIR, "tokenize_script.py"),
             "-i", input_file,
-            "-o", tokenized_file,
+            "-o", output_dir,
+            "-p", base_name,
             "-d", default_model
         ]
         if override_tokenizer:
@@ -101,6 +96,7 @@ def process_single_file(
 
         success_count = 0
         failed_count = 0
+        summary_json = None
 
         for line in process.stdout:
             line = line.strip()
@@ -113,22 +109,43 @@ def process_single_file(
                     success_count = int(match.group(1))
                     failed_count = int(match.group(2))
 
-        process.wait()
+            # 解析 [SUMMARY] 行
+            if line.startswith("[SUMMARY] "):
+                try:
+                    summary_json = json.loads(line[len("[SUMMARY] "):])
+                except json.JSONDecodeError:
+                    pass
 
+        process.wait()
         step1_duration = round((datetime.now() - step1_start).total_seconds(), 2)
 
         if process.returncode != 0:
             raise RuntimeError(f"tokenize_script.py 返回码: {process.returncode}")
 
+        # 从 summary 中提取各 model 的 JSON 文件
+        model_json_files = {}
+        if summary_json and "models" in summary_json:
+            for model, info in summary_json["models"].items():
+                model_json_files[model] = info["file"]
+        else:
+            # 兜底：扫描产出文件
+            pattern = os.path.join(output_dir, f"{base_name}_*_input_ids.json")
+            for f in sorted(glob.glob(pattern)):
+                # 从文件名提取 model: {base_name}_{model}_input_ids.json
+                fname = os.path.basename(f)
+                model = fname[len(base_name) + 1:].replace("_input_ids.json", "")
+                if model:
+                    model_json_files[model] = f
+
         result["steps"].append({
             "name": "tokenize",
             "status": "completed",
             "duration_seconds": step1_duration,
-            "output_file": tokenized_file,
             "success_count": success_count,
-            "failed_count": failed_count
+            "failed_count": failed_count,
+            "models": list(model_json_files.keys()),
         })
-        print(f"{file_tag} Step 1/2 完成 ({step1_duration}s) -> {tokenized_file}")
+        print(f"{file_tag} Step 1/2 完成 ({step1_duration}s), 模型: {list(model_json_files.keys())}")
 
     except Exception as e:
         result["steps"].append({
@@ -141,56 +158,59 @@ def process_single_file(
         print(f"{file_tag} Step 1/2 失败: {e}")
         return result
 
-    # ---- Step 2: 格式转换 ----
-    print(f"\n{file_tag} Step 2/2: 格式转换 - {base_name}")
+    # ---- Step 2: 格式转换 (每个 model 文件分别转换) ----
+    print(f"\n{file_tag} Step 2/2: 格式转换 - {len(model_json_files)} 个模型文件")
     step2_start = datetime.now()
+    convert_errors = []
 
-    try:
-        cmd = [
-            "python", os.path.join(SCRIPTS_DIR, "convert_to_cache_input.py"),
-            "-i", tokenized_file,
-            "-o", cache_input_file
-        ]
+    for model, json_file in model_json_files.items():
+        txt_file = json_file.replace("_input_ids.json", "_input_ids.txt")
+        incomplete_txt = txt_file + ".incomplete"
+        try:
+            cmd = [
+                "python", os.path.join(SCRIPTS_DIR, "convert_to_cache_input.py"),
+                "-i", json_file,
+                "-o", incomplete_txt
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.stdout:
+                for line in proc.stdout.strip().split('\n'):
+                    print(f"  [{model}] {line}")
 
-        print(f"  执行: {' '.join(cmd)}")
+            if proc.returncode != 0:
+                raise RuntimeError(f"convert 失败: {proc.stderr}")
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.stdout:
-            for line in proc.stdout.strip().split('\n'):
-                print(f"  {line}")
+            # 成功: rename .incomplete → .txt
+            os.rename(incomplete_txt, txt_file)
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"convert_to_cache_input.py 失败: {proc.stderr}")
+            line_count = 0
+            if os.path.exists(txt_file):
+                with open(txt_file, 'r') as f:
+                    line_count = sum(1 for _ in f)
 
-        # 统计输出行数
-        line_count = 0
-        if os.path.exists(cache_input_file):
-            with open(cache_input_file, 'r') as f:
-                line_count = sum(1 for _ in f)
+            result["model_files"][model] = {
+                "json": json_file,
+                "txt": txt_file,
+                "lines": line_count
+            }
+            print(f"  [{model}] -> {txt_file} ({line_count} 行)")
 
-        step2_duration = round((datetime.now() - step2_start).total_seconds(), 2)
+        except Exception as e:
+            convert_errors.append({"model": model, "error": str(e)})
+            print(f"  [{model}] 转换失败: {e}")
 
-        result["steps"].append({
-            "name": "convert",
-            "status": "completed",
-            "duration_seconds": step2_duration,
-            "output_file": cache_input_file,
-            "output_lines": line_count
-        })
-        print(f"{file_tag} Step 2/2 完成 ({step2_duration}s) -> {cache_input_file}")
+    step2_duration = round((datetime.now() - step2_start).total_seconds(), 2)
 
-    except Exception as e:
-        result["steps"].append({
-            "name": "convert",
-            "status": "failed",
-            "error": str(e)
-        })
-        result["status"] = "failed"
-        result["error"] = str(e)
-        print(f"{file_tag} Step 2/2 失败: {e}")
-        return result
+    result["steps"].append({
+        "name": "convert",
+        "status": "completed" if not convert_errors else "partial",
+        "duration_seconds": step2_duration,
+        "models_converted": len(result["model_files"]),
+        "errors": convert_errors if convert_errors else None
+    })
+    print(f"{file_tag} Step 2/2 完成 ({step2_duration}s)")
 
-    result["status"] = "completed"
+    result["status"] = "completed" if not convert_errors else "partial"
     return result
 
 
@@ -200,25 +220,25 @@ def process_single_file(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KV Cache Token 序列化流水线 (tokenize + convert)",
+        description="KV Cache Token 序列化流水线 (tokenize per-model + convert)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
     # 单文件
-    python kv_pipeline.py -i input.json -o output_dir/
+    python kv_pipeline.py -i input.jsonl -o output_dir/
 
     # 多文件
-    python kv_pipeline.py -i file1.json file2.json file3.json -o output_dir/
+    python kv_pipeline.py -i file1.jsonl file2.jsonl -o output_dir/
 
     # 指定模型
-    python kv_pipeline.py -i input.json -o output_dir/ -d glm-5
+    python kv_pipeline.py -i input.jsonl -o output_dir/ -d glm-5
         """
     )
 
     parser.add_argument("--input", "-i", nargs="+", required=True,
                         help="输入文件路径，支持多个文件")
     parser.add_argument("--output-dir", "-o", required=True,
-                        help="输出目录，各文件按原文件名保存")
+                        help="输出目录")
     parser.add_argument("--default-model", "-d", default="glm-5",
                         help="默认模型 (默认: glm-5)")
     parser.add_argument("--override-tokenizer", "-t", default=None,
@@ -245,7 +265,7 @@ def main():
     pipeline_start = datetime.now()
 
     print(f"\n{'='*60}")
-    print(f"KV Cache Token 序列化流水线")
+    print(f"KV Cache Token 序列化流水线 (per-model)")
     print(f"{'='*60}")
     print(f"输入文件: {total_files} 个")
     for f in input_files:
@@ -288,12 +308,18 @@ def main():
                     "error": str(e)
                 }
             all_results[idx] = result
-            if result["status"] == "completed":
+            if result["status"] in ("completed", "partial"):
                 success_files += 1
             else:
                 failed_files += 1
 
-    # 汇总
+    # 汇总：按 model 聚合所有 txt 文件
+    model_outputs = {}  # model -> [txt_file, ...]
+    for r in all_results:
+        if r and "model_files" in r:
+            for model, files in r["model_files"].items():
+                model_outputs.setdefault(model, []).append(files["txt"])
+
     total_duration = round((datetime.now() - pipeline_start).total_seconds(), 2)
 
     print(f"\n{'='*60}")
@@ -301,16 +327,13 @@ def main():
     print(f"{'='*60}")
     print(f"总耗时: {total_duration}s")
     print(f"文件: {success_files} 成功, {failed_files} 失败 / 共 {total_files} 个")
+    print(f"模型: {list(model_outputs.keys())}")
     print(f"{'='*60}")
-    print(f"输出文件:")
-    for r in all_results:
-        status_icon = "ok" if r["status"] == "completed" else "FAIL"
-        print(f"  [{status_icon}] {os.path.basename(r['input_file'])}")
-        if r["status"] == "completed":
-            print(f"        -> {r['tokenized_file']}")
-            print(f"        -> {r['cache_input_file']}")
-        else:
-            print(f"        Error: {r.get('error', 'unknown')}")
+    print(f"输出文件 (按模型):")
+    for model, txt_files in sorted(model_outputs.items()):
+        print(f"  [{model}] {len(txt_files)} 个文件:")
+        for tf in txt_files:
+            print(f"    -> {tf}")
     print(f"{'='*60}")
 
     # 保存汇总状态
@@ -325,6 +348,7 @@ def main():
         "failed_files": failed_files,
         "default_model": args.default_model,
         "override_tokenizer": args.override_tokenizer,
+        "model_outputs": {m: fs for m, fs in model_outputs.items()},
         "files": all_results
     }
     with open(summary_file, 'w', encoding='utf-8') as f:

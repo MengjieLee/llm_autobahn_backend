@@ -311,9 +311,11 @@ def convert_record(
 # main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="将 ES 查询结果转换为 input_ids (自动选择 tokenizer)")
-    parser.add_argument("--input", "-i", required=True, help="输入文件路径 (ES 查询结果 JSON)")
-    parser.add_argument("--output", "-o", required=True, help="输出文件路径")
+    parser = argparse.ArgumentParser(description="将 ES 查询结果转换为 input_ids (自动选择 tokenizer，按 model 分桶输出)")
+    parser.add_argument("--input", "-i", required=True, help="输入文件路径 (JSONL)")
+    parser.add_argument("--output-dir", "-o", required=True, help="输出目录，按 model 生成多个文件")
+    parser.add_argument("--file-prefix", "-p", default="",
+                        help="输出文件名前缀 (如 kv_20260325_000000_20260325_010000)")
     parser.add_argument("--override-tokenizer", "-t", default=None,
                         help="强制使用指定 tokenizer (覆盖自动选择)")
     parser.add_argument("--default-model", "-d", default="glm-5",
@@ -337,13 +339,18 @@ def main():
         print(f"[ERROR] 输入文件不存在: {args.input}")
         return 1
 
-    output_dir = os.path.dirname(args.output)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 从输入文件名推导前缀（如未指定）
+    file_prefix = args.file_prefix
+    if not file_prefix:
+        file_prefix = os.path.splitext(os.path.basename(args.input))[0]
 
     print(f"[INFO] 开始处理...")
     print(f"[INFO] 输入文件: {args.input}")
-    print(f"[INFO] 输出文件: {args.output}")
+    print(f"[INFO] 输出目录: {output_dir}")
+    print(f"[INFO] 文件前缀: {file_prefix}")
     if args.override_tokenizer:
         print(f"[INFO] 强制 Tokenizer: {args.override_tokenizer}")
     else:
@@ -374,61 +381,72 @@ def main():
     failed_count = 0
     start_time = datetime.now()
 
-    results = []
+    # 按 model 分桶收集结果
+    model_results = {}  # model -> [result, ...]
 
-    with open(args.output, 'w', encoding='utf-8') as f_out:
-        f_out.write('[\n')
-        first_record = True
+    for i, record in enumerate(records):
+        result = convert_record(
+            record, tokenizer_manager, args.override_tokenizer,
+            args.default_model, args.verbose
+        )
 
-        for i, record in enumerate(records):
-            result = convert_record(
-                record, tokenizer_manager, args.override_tokenizer,
-                args.default_model, args.verbose
-            )
+        if result:
+            success_count += 1
+            model = result.get("model_used", "unknown")
+            model_stats[model] = model_stats.get(model, 0) + 1
+            tokenizer_used = result.get("tokenizer_used", "unknown")
+            tokenizer_stats[tokenizer_used] = tokenizer_stats.get(tokenizer_used, 0) + 1
+            model_results.setdefault(model, []).append(result)
+        else:
+            failed_count += 1
 
-            if result:
-                results.append(result)
-                success_count += 1
+        if (i + 1) % 10000 == 0:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            speed = (i + 1) / elapsed if elapsed > 0 else 0
+            print(f"[INFO] 进度: {i + 1}/{len(records)} ({(i + 1) / len(records) * 100:.1f}%), "
+                  f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
 
-                model = result.get("model_used", "unknown")
-                model_stats[model] = model_stats.get(model, 0) + 1
-                tokenizer_used = result.get("tokenizer_used", "unknown")
-                tokenizer_stats[tokenizer_used] = tokenizer_stats.get(tokenizer_used, 0) + 1
-            else:
-                failed_count += 1
-
-            if (i + 1) % 10000 == 0:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                speed = (i + 1) / elapsed if elapsed > 0 else 0
-                print(f"[INFO] 进度: {i + 1}/{len(records)} ({(i + 1) / len(records) * 100:.1f}%), "
-                      f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
-
-        # 按 timestamp 排序
+    # 按 model 分别写入文件（每个 model 按 timestamp 排序）
+    # 写入 .json.incomplete → rename 为 .json（状态机）
+    output_files = {}  # model -> output_file_path
+    for model, results in model_results.items():
         results.sort(key=lambda x: x.get("timestamp", ""))
-        print(f"[INFO] 已按 timestamp 升序排序 ({len(results)} 条)")
-
-        for result in results:
-            if not first_record:
-                f_out.write(',\n')
-            json.dump(result, f_out, ensure_ascii=False)
-            first_record = False
-
-        f_out.write('\n]')
+        final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.json")
+        incomplete_file = final_file + ".incomplete"
+        with open(incomplete_file, 'w', encoding='utf-8') as f_out:
+            f_out.write('[\n')
+            for idx, result in enumerate(results):
+                if idx > 0:
+                    f_out.write(',\n')
+                json.dump(result, f_out, ensure_ascii=False)
+            f_out.write('\n]')
+        os.rename(incomplete_file, final_file)
+        output_files[model] = final_file
+        print(f"[INFO] 模型 {model}: {len(results)} 条 -> {final_file}")
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
     print(f"\n[INFO] ========== 处理完成 ==========")
     print(f"[INFO] 总记录: {len(records)}, 成功: {success_count}, 失败: {failed_count}")
+    print(f"[INFO] 模型数: {len(model_results)}")
     print(f"[INFO] 耗时: {elapsed:.1f} 秒")
-    print(f"[INFO] 输出文件: {args.output}")
 
     print(f"\n[INFO] ========== 模型分布 ==========")
     for model, count in sorted(model_stats.items(), key=lambda x: -x[1]):
-        print(f"  {model}: {count} 条 ({count / success_count * 100:.1f}%)")
+        pct = count / success_count * 100 if success_count > 0 else 0
+        print(f"  {model}: {count} 条 ({pct:.1f}%)")
 
     print(f"\n[INFO] ========== Tokenizer 使用 ==========")
     for tok, count in sorted(tokenizer_stats.items(), key=lambda x: -x[1]):
         print(f"  {tok}: {count} 条")
+
+    # 输出 JSON 汇总供上层脚本解析
+    summary = {
+        "models": {m: {"count": len(r), "file": output_files[m]} for m, r in model_results.items()},
+        "success_count": success_count,
+        "failed_count": failed_count,
+    }
+    print(f"\n[SUMMARY] {json.dumps(summary, ensure_ascii=False)}")
 
     return 0
 
