@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
 
 from app.core.api_schema import StandardResponse
+from app.core.request_context import log_usage
 from context.file_system import fs_manager
 from src.domains.datasets.svc import DatasetsService
 from src.domains.datasets.impl import DatasetList
@@ -28,6 +29,7 @@ async def list_datasets(
     body: dict,
     service: DatasetsService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("list_datasets")
     body["groups"] = getattr(request.state, "groups", []) or []
     data = {"result": await service.list_datasets(DatasetList(**body))}
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
@@ -39,6 +41,7 @@ async def name2table(
     body: dict,
     service: DatasetsService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("name2table")
     body["groups"] = getattr(request.state, "groups", []) or []
     datasets = await service.list_datasets(DatasetList(**body))
     # 映射规则： {'name_value': tables[0]} 前提是 tables 有值
@@ -59,7 +62,8 @@ async def detail_dataset(
     request: Request,
     service: DatasetsService = Depends(get_service)
 ) -> StandardResponse[dict]:
-    
+    log_usage("detail_dataset")
+
     filter_dict = {
         "groups": getattr(request.state, "groups", []) or [],
         "name": request.query_params.get("name"),
@@ -82,7 +86,8 @@ async def preview_dataset(
     body: dict,
     service: DatasetsService = Depends(get_service)
 ) -> StandardResponse[dict]:
-    
+    log_usage("preview_dataset")
+
     paths = body.get("paths")
     # 按优先级从高到低 ,或者\n 切分 paths 字符串成列表
     if "," in paths:

@@ -19,7 +19,7 @@
   ```bash
   docker stop data_autobahn_backend && docker rm data_autobahn_backend
 
-  docker run --name=data_autobahn_backend --privileged \
+  docker run --name=data_autobahn_backend --privileged  \
     --hostname=localhost --network host \
     --shm-size 40G \
     --ulimit memlock=-1 --ulimit nofile=65536:65536 \

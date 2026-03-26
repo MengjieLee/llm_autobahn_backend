@@ -69,3 +69,49 @@ def setup_logging() -> None:
             root_logger.removeHandler(h)
 
     root_logger.addHandler(file_handler)
+
+    # ---- ES 查询专用日志 ----
+    os.makedirs(settings.es_log_dir, exist_ok=True)
+    es_log_file = os.path.join(
+        settings.es_log_dir,
+        f"{date_prefix}_{settings.es_log_file_name}",
+    )
+    es_logger = logging.getLogger("es_query")
+    es_logger.setLevel(logging.DEBUG)
+    es_logger.propagate = False          # 不向 root 冒泡，避免重复写入 app.log
+
+    es_file_handler = RotatingFileHandler(
+        es_log_file,
+        maxBytes=settings.es_log_max_bytes,
+        backupCount=settings.es_log_backup_count,
+        encoding="utf-8",
+    )
+    es_file_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
+
+    # 清理旧 handler
+    for h in list(es_logger.handlers):
+        es_logger.removeHandler(h)
+    es_logger.addHandler(es_file_handler)
+
+    # ---- 使用统计日志 (格式兼容 legacy: {time} | {user} | {scenario} | {action}) ----
+    os.makedirs(settings.usage_log_dir, exist_ok=True)
+    usage_log_file = os.path.join(
+        settings.usage_log_dir,
+        settings.usage_log_file_name,      # 不带日期前缀，长期追加便于 dashboard 读取
+    )
+    usage_logger = logging.getLogger("usage")
+    usage_logger.setLevel(logging.INFO)
+    usage_logger.propagate = False
+
+    usage_handler = RotatingFileHandler(
+        usage_log_file,
+        maxBytes=settings.usage_log_max_bytes,
+        backupCount=settings.usage_log_backup_count,
+        encoding="utf-8",
+    )
+    # 纯消息格式，不带 level/module 等前缀；时间 + 内容由调用方拼装
+    usage_handler.setFormatter(logging.Formatter("%(message)s"))
+
+    for h in list(usage_logger.handlers):
+        usage_logger.removeHandler(h)
+    usage_logger.addHandler(usage_handler)

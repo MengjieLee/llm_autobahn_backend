@@ -1,6 +1,8 @@
 # biz
 credentials.txt
 .workspace_logs
+logs/
+es_logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -209,3 +211,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Tmp Data
+olap_database
+local_workspace
+.claude
+
+# 编译产物
+src/domains/kv/cache_hit_rate/cache_calc
+# 大体积 tokenizer 词表文件
+src/domains/kv/cache_hit_rate/tokenizer_*.json

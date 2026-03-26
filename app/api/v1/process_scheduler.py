@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.core.api_schema import StandardResponse
+from app.core.request_context import log_usage
 from src.domains.process_scheduler.svc import ProcessSchedulerService
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class CreatePipelineRequest(BaseModel):
 async def list_jobs(
     request: Request, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("list_jobs")
     params = dict(request.query_params)
     jobs = await service.list_jobs(params)
     data = {"result": jobs.get("data")}
@@ -48,6 +50,7 @@ async def list_jobs(
 async def start_job(
     body: StartJobRequest, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("start_job")
     data = await service.start_job(
         pipeline_id=body.pipeline_id,
         queue=body.queue,
@@ -61,6 +64,7 @@ async def start_job(
 async def stop_job(
     job_id: str, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("stop_job")
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id 不能为空")
     data = await service.stop_job(job_id)
@@ -71,6 +75,7 @@ async def stop_job(
 async def delete_job(
     job_id: str, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("delete_job")
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id 不能为空")
     data = await service.delete_job(job_id)
@@ -81,6 +86,7 @@ async def delete_job(
 async def create_pipeline(
     body: CreatePipelineRequest, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("create_pipeline")
     data = await service.create_pipeline(
         pipeline_name=body.pipeline_name,
         yaml_content=body.yaml_content,
@@ -93,6 +99,7 @@ async def create_pipeline(
 async def list_pipelines(
     request: Request, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("list_pipelines")
     params = dict(request.query_params)
     data = await service.list_pipelines(params)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
@@ -102,6 +109,7 @@ async def list_pipelines(
 async def delete_pipeline(
     pipeline_id: str, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("delete_pipeline")
     if not pipeline_id:
         raise HTTPException(status_code=400, detail="pipeline_id 不能为空")
     data = await service.delete_pipeline(pipeline_id)
@@ -112,6 +120,7 @@ async def delete_pipeline(
 async def get_pipeline_detail(
     pipeline_id: str, service: ProcessSchedulerService = Depends(get_service)
 ) -> StandardResponse[dict]:
+    log_usage("get_pipeline_detail")
     if not pipeline_id:
         raise HTTPException(status_code=400, detail="pipeline_id 不能为空")
     data = await service.get_pipeline_detail(pipeline_id)

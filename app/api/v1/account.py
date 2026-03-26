@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.conf.config import settings
 from app.core.api_schema import StandardResponse, ErrorResponse
+from app.core.request_context import log_usage
 from context.auth_client import add_or_update_user
 
 
@@ -53,14 +54,12 @@ async def login(
     request: Request,
     zt_authorization: ZtAuthorizationHeader = None
 ) -> StandardResponse[AccountResponseData]:
+    log_usage("login", scenario="AUTH")
     # 调试：打印收到的 headers
     logger.info(f"收到的所有 Headers: {dict(request.headers)}")
     logger.info(f"X-Zt-Authorization: {zt_authorization}")
 
     logger.info(f"零信任网关验证开始.")
-
-    # TODO
-    zt_authorization = ''
 
     if not zt_authorization:
         logger.error(f"JWT 校验失败: Header 中无有效的 X-Zt-Authorization")

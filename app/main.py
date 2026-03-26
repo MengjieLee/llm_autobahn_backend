@@ -65,7 +65,7 @@ def create_app() -> FastAPI:
     # 中间件（注意执行顺序：从外到内）
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # 放行「所有」前端域名（开发环境推荐）
+        allow_origins=["https://vortex.n.baidu-int.com"],  # 放行「所有」前端域名（开发环境推荐）
         allow_credentials=True,  # 允许前端携带Cookie/认证信息（必须开启，适配你的Bearer Token）
         allow_methods=["*"],  # 放行「所有」请求方法：GET/POST/PUT/DELETE/OPTIONS等
         allow_headers=["*"],  # 放行「所有」请求头：Authorization/Content-Type等

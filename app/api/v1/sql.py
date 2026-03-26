@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.core.api_schema import StandardResponse
-from app.core.request_context import ctx_get_trace_id
+from app.core.request_context import ctx_get_trace_id, log_usage
 from context.doris_connector import DorisConnectorPydoris, get_doris_connector
 from src.serializers.data_serializer import preview_serializer
 
@@ -22,6 +22,7 @@ class SQLQueryReqeust(BaseModel):
 async def sql_query(
     body: SQLQueryReqeust, doris_svc: DorisConnectorPydoris = Depends(get_doris_connector)
 ) -> StandardResponse[dict]:
+    log_usage("sql_query")
     logger.info(f"sql_query 请求: {body.sql}")
     query_raw_dict = await doris_svc.execute_custom_sql(body.sql)
     logger.debug(f"query_raw_dict 原生结果: {query_raw_dict}")

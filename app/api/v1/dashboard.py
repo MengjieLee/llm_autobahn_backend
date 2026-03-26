@@ -1,5 +1,6 @@
 import logging
 import os
+import glob
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
@@ -8,16 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.core.api_schema import StandardResponse
+from app.conf.config import settings
 from context.auth_client import users_amount
 from src.domains.datasets.svc import DatasetsService
 from src.domains.datasets.impl import DatasetList
 
 
-# 日志文件路径配置
-LOG_FILE_PATH = os.environ.get(
+# Legacy 日志路径（老系统 Streamlit 写入）
+LEGACY_LOG_FILE = os.environ.get(
     "USAGE_LOG_PATH",
     "/mnt/cfs_bj_mt/workspace/chenjieting/iCodes/baidu/personal-code/data_management_app/logs/app.log"
 )
+
+# 新系统使用统计日志目录（由 logging_config 中 usage logger 写入）
+USAGE_LOG_DIR = settings.usage_log_dir
+USAGE_LOG_NAME = settings.usage_log_file_name
 
 
 logger = logging.getLogger(__name__)
@@ -129,7 +135,7 @@ def _read_log_entries(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None
 ) -> List[Dict[str, Any]]:
-    """读取并解析日志文件"""
+    """读取并解析单个日志文件"""
     entries = []
 
     if not os.path.exists(log_path):
@@ -148,6 +154,36 @@ def _read_log_entries(
         logger.error(f"Error reading log file: {e}")
 
     return entries
+
+
+def _read_all_usage_logs(
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """
+    合并读取 legacy + 新系统的使用统计日志。
+    - Legacy: 单个文件 LEGACY_LOG_FILE
+    - 新系统: USAGE_LOG_DIR/usage.log + usage.log.1, usage.log.2 ... (RotatingFileHandler 滚动)
+    """
+    all_entries = []
+
+    # 1. Legacy 日志
+    all_entries.extend(_read_log_entries(LEGACY_LOG_FILE, start_date, end_date))
+
+    # 2. 新系统 usage 日志（主文件 + 滚动备份文件）
+    usage_main = os.path.join(USAGE_LOG_DIR, USAGE_LOG_NAME)
+    usage_files = [usage_main]
+    # RotatingFileHandler 生成 usage.log.1, usage.log.2, ...
+    usage_files.extend(sorted(glob.glob(f"{usage_main}.*")))
+
+    for uf in usage_files:
+        if uf == LEGACY_LOG_FILE:
+            continue  # 避免重复读取
+        all_entries.extend(_read_log_entries(uf, start_date, end_date))
+
+    # 按时间排序
+    all_entries.sort(key=lambda e: e["timestamp"])
+    return all_entries
 
 
 def _generate_date_keys(
@@ -348,8 +384,8 @@ async def usage_metrics(
         else:  # all
             query_start = None
 
-    # 读取并解析日志
-    entries = _read_log_entries(LOG_FILE_PATH, query_start, query_end)
+    # 读取并解析日志（合并 legacy + 新系统）
+    entries = _read_all_usage_logs(query_start, query_end)
 
     # 聚合数据
     data = _aggregate_by_period(entries, period, query_start, query_end)
@@ -402,7 +438,7 @@ async def usage_users(
         else:  # all
             query_start = None
 
-    entries = _read_log_entries(LOG_FILE_PATH, query_start, query_end)
+    entries = _read_all_usage_logs(query_start, query_end)
 
     # 按用户分组统计
     user_stats = defaultdict(lambda: {
