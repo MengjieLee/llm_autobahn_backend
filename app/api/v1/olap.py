@@ -35,6 +35,7 @@ DEFAULT_MODEL = settings.PIPELINE_DEFAULT_MODEL
 BLOCK_SIZE = settings.PIPELINE_BLOCK_SIZE
 CACHE_SIZE = settings.PIPELINE_CACHE_SIZE
 TOKENIZE_CONCURRENCY = settings.PIPELINE_TOKENIZE_CONCURRENCY
+FETCH_CONCURRENCY = settings.PIPELINE_FETCH_CONCURRENCY
 QPD_LIMIT = settings.OLAP_QPD_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,7 @@ def _set_failed(task_id: str, stage: str, error_msg: str):
 # Pipeline 后台任务
 # ============================================================
 async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = "", scheduled_at: str = ""):
-    """全自动 pipeline: (scheduled wait →) fetch → tokenize → simulate"""
+    """全自动流水线: (scheduled wait →) fetch+tokenize (streaming) → simulate"""
     try:
         # ---- 定时等待 ----
         if scheduled_at:
@@ -151,11 +152,8 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
                 }, "scheduled")
                 await asyncio.sleep(delay)
 
-        # ---- Stage 1: fetch ----
-        await _run_fetch_stage(task_id, start_datetime, end_datetime, app_id, path)
-
-        # ---- Stage 2: tokenize ----
-        await _run_tokenize_stage(task_id)
+        # ---- Stage 1+2: fetch → tokenize (streaming pipeline) ----
+        await _run_streaming_fetch_tokenize(task_id, start_datetime, end_datetime, app_id, path)
 
         # ---- Stage 3: simulate ----
         await _run_simulate_stage(task_id)
@@ -173,23 +171,34 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
             status["pipeline"]["current_stage"] = "cancelled"
             status["is_deleted"] = True
             _write_status(status)
-        # 不再 re-raise，让 done_callback 正常清理
 
     except Exception as e:
         logger.exception(f"Pipeline failed for {task_id}")
         status = _read_status(task_id)
-        if status and status["pipeline"]["current_stage"] != "failed":
+        if status and status["pipeline"]["current_stage"] not in ("done", "failed"):
             _set_failed(task_id, status["pipeline"]["current_stage"], str(e))
 
 
-async def _run_fetch_stage(task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""):
-    """ES 数据拉取"""
+async def _run_streaming_fetch_tokenize(
+    task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
+):
+    """
+    流水线并行：fetch 切片并行拉取，每个切片完成后立即触发 tokenize。
+    fetch 和 tokenize 重叠执行，总时长 ≈ max(fetch_total, tokenize_total)。
+
+    文件状态：
+      - 拉取中 / 失败: kv_xxx.jsonl.incomplete
+      - 拉取成功: kv_xxx.jsonl (rename)
+      - tokenize 只消费 .jsonl
+    """
     _update_stage(task_id, "fetch", {"status": "running", "message": "正在查询 ES 数据..."}, "fetch")
+    _update_stage(task_id, "tokenize", {"status": "pending", "message": "等待数据..."})
 
     start_dt = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M:%S")
     end_dt = datetime.strptime(end_datetime, "%Y-%m-%d %H:%M:%S")
-    es = ESIndexService(start_dt.strftime("%Y-%m-%d"), app_id=app_id, path=path)
     task_data_dir = _task_dir(task_id)
+    output_dir = os.path.join(task_data_dir, "tokenized")
+    os.makedirs(output_dir, exist_ok=True)
 
     # 按小时拆分
     hours = []
@@ -201,43 +210,139 @@ async def _run_fetch_stage(task_id: str, start_datetime: str, end_datetime: str,
         hours.append((current, hour_end))
         current = hour_end
 
-    total_count = 0
-    result_files = []
+    total_slices = len(hours)
 
-    for idx, (h_start, h_end) in enumerate(hours):
+    # 共享状态（线程安全：asyncio 单线程，无需锁）
+    fetch_results = []        # {"file": ..., "hour": ..., "count": ...}
+    fetch_incomplete = []     # {"file": ..., "hour": ..., "error": ...}
+    tokenize_results = []     # {"file": ..., "status": ..., ...}
+    fetch_total_count = [0]
+    fetch_done_count = [0]
+    tokenize_done_count = [0]
+    tokenize_total_lines = [0]
+
+    fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+    tokenize_sem = asyncio.Semaphore(TOKENIZE_CONCURRENCY)
+    tokenize_tasks = []  # 收集所有 tokenize 协程
+
+    def _update_fetch_progress():
+        msg_parts = [f"拉取进度 {fetch_done_count[0]}/{total_slices}，已获取 {fetch_total_count[0]} 条"]
+        if fetch_incomplete:
+            msg_parts.append(f"，{len(fetch_incomplete)} 个失败")
+        _update_stage(task_id, "fetch", {
+            "status": "running",
+            "message": "".join(msg_parts),
+            "processed_count": fetch_total_count[0],
+            "progress": f"{fetch_done_count[0]}/{total_slices}",
+        })
+
+    def _update_tokenize_progress():
+        if tokenize_done_count[0] == 0:
+            return
+        _update_stage(task_id, "tokenize", {
+            "status": "running",
+            "message": f"序列化进度 {tokenize_done_count[0]}/{len(fetch_results)}",
+            "progress": f"{tokenize_done_count[0]}/{len(fetch_results)}",
+            "total_lines": tokenize_total_lines[0],
+        })
+
+    async def _fetch_slice(idx: int, h_start: datetime, h_end: datetime):
+        """拉取单个切片，成功 rename 为 .jsonl，失败保留 .incomplete"""
         h_start_str = h_start.strftime("%Y-%m-%d %H:%M:%S")
         h_end_str = h_end.strftime("%Y-%m-%d %H:%M:%S")
         h_start_tag = h_start.strftime("%Y%m%d_%H%M%S")
         h_end_tag = h_end.strftime("%Y%m%d_%H%M%S")
-        result_file = os.path.join(task_data_dir, f"kv_{h_start_tag}_{h_end_tag}.jsonl")
+        base_name = f"kv_{h_start_tag}_{h_end_tag}"
+        incomplete_file = os.path.join(task_data_dir, f"{base_name}.jsonl.incomplete")
+        final_file = os.path.join(task_data_dir, f"{base_name}.jsonl")
 
-        _update_stage(task_id, "fetch", {
-            "status": "running",
-            "message": f"正在查询 {h_start_str}~{h_end_str} ({idx + 1}/{len(hours)})",
-            "processed_count": total_count,
-            "progress": f"{idx + 1}/{len(hours)}"
-        })
+        es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
 
-        def _cb(count, msg, _tid=task_id, _base=total_count):
-            _update_stage(_tid, "fetch", {
-                "status": "running",
-                "message": msg,
-                "processed_count": _base + count
-            })
+        async with fetch_sem:
+            _update_fetch_progress()
 
-        hour_count = await es.query_to_file(h_start_str, h_end_str, result_file, status_callback=_cb)
-        total_count += hour_count
-        result_files.append({"file": result_file, "hour": f"{h_start_str}~{h_end_str}", "count": hour_count})
+            def _cb(count, msg, _tid=task_id):
+                _update_stage(_tid, "fetch", {
+                    "status": "running",
+                    "message": f"[{idx + 1}/{total_slices}] {msg}",
+                    "processed_count": fetch_total_count[0] + count
+                })
 
-    _update_stage(task_id, "fetch", {
+            try:
+                hour_count = await es.query_to_file(
+                    h_start_str, h_end_str, incomplete_file, status_callback=_cb
+                )
+                # 成功: rename .incomplete → .jsonl
+                os.rename(incomplete_file, final_file)
+                fetch_total_count[0] += hour_count
+                fetch_done_count[0] += 1
+                fetch_results.append({
+                    "file": final_file,
+                    "hour": f"{h_start_str}~{h_end_str}",
+                    "count": hour_count
+                })
+                _update_fetch_progress()
+
+                # 立即触发 tokenize（钩子）
+                if hour_count > 0:
+                    t = asyncio.create_task(
+                        _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                    )
+                    tokenize_tasks.append(t)
+
+            except Exception as e:
+                # 失败: 保留 .incomplete
+                if not os.path.exists(incomplete_file):
+                    with open(incomplete_file, 'w') as _f:
+                        pass
+                fetch_done_count[0] += 1
+                fetch_incomplete.append({
+                    "file": f"{base_name}.jsonl.incomplete",
+                    "hour": f"{h_start_str}~{h_end_str}",
+                    "error": str(e)[:200]
+                })
+                logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
+                _update_fetch_progress()
+
+    async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
+        """带信号量和进度追踪的 tokenize 单文件"""
+        async with tokenize_sem:
+            _update_tokenize_progress()
+            result = await _run_tokenize_single_file(
+                input_file, out_dir, tid, 0, 0
+            )
+            tokenize_results.append(result)
+            tokenize_done_count[0] += 1
+            if result["status"] == "completed":
+                tokenize_total_lines[0] += result.get("lines", 0)
+            _update_tokenize_progress()
+
+    # ---- 启动所有 fetch 任务（并行，受信号量控制） ----
+    fetch_tasks = [
+        asyncio.create_task(_fetch_slice(idx, h_start, h_end))
+        for idx, (h_start, h_end) in enumerate(hours)
+    ]
+    # 等待所有 fetch 完成
+    await asyncio.gather(*fetch_tasks)
+
+    # ---- 更新 fetch 阶段最终状态 ----
+    fetch_status = {
         "status": "completed",
-        "message": f"查询完成，共 {total_count} 条",
-        "total_count": total_count,
-        "result_files": result_files
-    })
+        "message": f"查询完成，共 {fetch_total_count[0]} 条",
+        "total_count": fetch_total_count[0],
+        "result_files": fetch_results,
+    }
+    if fetch_incomplete:
+        fetch_status["incomplete_count"] = len(fetch_incomplete)
+        fetch_status["incomplete_files"] = fetch_incomplete
+        fetch_status["message"] = (
+            f"查询完成，共 {fetch_total_count[0]} 条，"
+            f"{len(fetch_incomplete)} 个切片失败"
+        )
+    _update_stage(task_id, "fetch", fetch_status)
 
-    # 空数据校验：fetch 0 条直接终止 pipeline
-    if total_count == 0:
+    # 空数据校验
+    if fetch_total_count[0] == 0:
         _update_stage(task_id, "tokenize", {"status": "skipped", "message": "无数据，跳过"})
         _update_stage(task_id, "simulate", {"status": "skipped", "message": "无数据，跳过"})
         status = _read_status(task_id)
@@ -247,10 +352,63 @@ async def _run_fetch_stage(task_id: str, start_datetime: str, end_datetime: str,
                 "hit_rate": 0, "hit_rate_percent": 0,
                 "hit_count": 0, "total_queries": 0,
                 "total_tokens": 0, "total_entries": 0,
-                "message": "数据提取阶段无匹配数据，请检查查询条件（时间范围、App ID、场景路径）"
+                "message": "数据提取阶段无匹配数据"
             }
+            if fetch_incomplete:
+                status["result"]["incomplete_count"] = len(fetch_incomplete)
+                status["result"]["incomplete_files"] = fetch_incomplete
             _write_status(status)
         raise RuntimeError("Fetch returned 0 records, pipeline stopped")
+
+    # ---- 等待所有 tokenize 完成 ----
+    _update_stage(task_id, "tokenize", {
+        "status": "running",
+        "message": f"等待序列化完成 ({tokenize_done_count[0]}/{len(fetch_results)})"
+    }, "tokenize")
+
+    if tokenize_tasks:
+        await asyncio.gather(*tokenize_tasks)
+
+    # ---- 更新 tokenize 阶段最终状态 ----
+    success_files = [r for r in tokenize_results if r["status"] == "completed"]
+    failed_files = [r for r in tokenize_results if r["status"] == "failed"]
+    success_outputs = [r["output"] for r in success_files]
+
+    if not success_files:
+        _update_stage(task_id, "tokenize", {
+            "status": "failed",
+            "message": f"序列化全部失败，{len(failed_files)} 个文件",
+            "files": tokenize_results,
+            "output_files": [],
+            "total_lines": 0
+        })
+        _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
+        raise RuntimeError("All tokenize files failed")
+
+    status_msg = f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，{tokenize_total_lines[0]} 条"
+    _update_stage(task_id, "tokenize", {
+        "status": "completed",
+        "message": status_msg,
+        "output_files": success_outputs,
+        "total_lines": tokenize_total_lines[0],
+        "success_count": len(success_files),
+        "failed_count": len(failed_files),
+        "files": tokenize_results
+    })
+
+    if tokenize_total_lines[0] == 0:
+        _update_stage(task_id, "simulate", {"status": "skipped", "message": "序列化结果为空，跳过模拟"})
+        status = _read_status(task_id)
+        if status:
+            status["pipeline"]["current_stage"] = "done"
+            status["result"] = {
+                "hit_rate": 0, "hit_rate_percent": 0,
+                "hit_count": 0, "total_queries": 0,
+                "total_tokens": 0, "total_entries": 0,
+                "message": "序列化阶段无有效数据"
+            }
+            _write_status(status)
+        raise RuntimeError("Tokenize produced 0 lines, pipeline stopped")
 
 
 async def _run_tokenize_single_file(
@@ -305,129 +463,6 @@ async def _run_tokenize_single_file(
         "lines": line_count,
         "error": None
     }
-
-
-async def _run_tokenize_stage(task_id: str):
-    """Token 序列化: 并行处理每个文件，支持部分失败"""
-    _update_stage(task_id, "tokenize", {
-        "status": "running",
-        "message": "正在序列化...",
-        "files": []
-    }, "tokenize")
-
-    task_data_dir = _task_dir(task_id)
-    output_dir = os.path.join(task_data_dir, "tokenized")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 收集 fetch 产出的 jsonl 文件
-    input_files = sorted(glob.glob(os.path.join(task_data_dir, "kv_*.jsonl")))
-    if not input_files:
-        _set_failed(task_id, "tokenize", "无输入文件")
-        raise RuntimeError("No input files for tokenize")
-
-    total_files = len(input_files)
-    max_concurrent = min(TOKENIZE_CONCURRENCY, total_files)
-
-    # 初始化每个文件的状态
-    files_status = [
-        {"file": os.path.basename(f), "status": "pending"}
-        for f in input_files
-    ]
-    _update_stage(task_id, "tokenize", {
-        "status": "running",
-        "message": f"正在序列化，共 {total_files} 个文件",
-        "progress": f"0/{total_files}",
-        "files": files_status
-    })
-
-    # 并行执行，使用信号量控制并发度
-    sem = asyncio.Semaphore(max_concurrent)
-    results = [None] * total_files
-
-    async def _run_with_sem(idx, input_file):
-        async with sem:
-            # 标记文件为 running
-            files_status[idx]["status"] = "running"
-            _update_stage(task_id, "tokenize", {
-                "status": "running",
-                "message": f"正在序列化 [{completed_count[0] + running_count()}/{total_files}]",
-                "progress": f"{completed_count[0]}/{total_files}",
-                "files": files_status
-            })
-
-            result = await _run_tokenize_single_file(
-                input_file, output_dir, task_id, idx + 1, total_files
-            )
-            results[idx] = result
-
-            # 更新该文件状态
-            files_status[idx] = result
-            completed_count[0] += 1
-
-            _update_stage(task_id, "tokenize", {
-                "status": "running",
-                "message": f"序列化进度 {completed_count[0]}/{total_files}",
-                "progress": f"{completed_count[0]}/{total_files}",
-                "files": files_status
-            })
-
-    completed_count = [0]  # mutable counter
-
-    def running_count():
-        return sum(1 for f in files_status if f.get("status") == "running")
-
-    tasks = [
-        asyncio.create_task(_run_with_sem(idx, f))
-        for idx, f in enumerate(input_files)
-    ]
-    await asyncio.gather(*tasks)
-
-    # 汇总
-    success_files = [r for r in results if r and r["status"] == "completed"]
-    failed_files = [r for r in results if r and r["status"] == "failed"]
-    success_outputs = [r["output"] for r in success_files]
-    total_lines = sum(r.get("lines", 0) for r in success_files)
-
-    if not success_files:
-        _update_stage(task_id, "tokenize", {
-            "status": "failed",
-            "message": f"序列化全部失败，{len(failed_files)} 个文件",
-            "files": files_status,
-            "output_files": [],
-            "total_lines": 0
-        })
-        _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
-        raise RuntimeError("All tokenize files failed")
-
-    status_msg = f"序列化完成，{len(success_files)}/{total_files} 成功，{total_lines} 条"
-    final_status = "completed"
-    if failed_files:
-        status_msg = f"序列化部分完成，{len(success_files)} 成功 / {len(failed_files)} 失败，{total_lines} 条"
-
-    _update_stage(task_id, "tokenize", {
-        "status": final_status,
-        "message": status_msg,
-        "output_files": success_outputs,
-        "total_lines": total_lines,
-        "success_count": len(success_files),
-        "failed_count": len(failed_files),
-        "files": files_status
-    })
-
-    # 空数据校验：序列化成功但总行数为 0，跳过模拟
-    if total_lines == 0:
-        _update_stage(task_id, "simulate", {"status": "skipped", "message": "序列化结果为空，跳过模拟"})
-        status = _read_status(task_id)
-        if status:
-            status["pipeline"]["current_stage"] = "done"
-            status["result"] = {
-                "hit_rate": 0, "hit_rate_percent": 0,
-                "hit_count": 0, "total_queries": 0,
-                "total_tokens": 0, "total_entries": 0,
-                "message": "序列化阶段无有效数据，无法进行缓存模拟"
-            }
-            _write_status(status)
-        raise RuntimeError("Tokenize produced 0 lines, pipeline stopped")
 
 
 async def _run_simulate_stage(task_id: str):

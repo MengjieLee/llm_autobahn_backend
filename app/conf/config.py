@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     PIPELINE_BLOCK_SIZE: int = 16
     PIPELINE_CACHE_SIZE: int = 200000000
     PIPELINE_TOKENIZE_CONCURRENCY: int = 4          # tokenize 阶段最大并发数
+    PIPELINE_FETCH_CONCURRENCY: int = 3              # fetch 切片最大并发数
     PIPELINE_DEFAULT_PATH: str = "/v2/coding/chat/completions"
 
     # QPD（每人每天请求限额）

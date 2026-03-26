@@ -7,8 +7,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Callable
 
-# 创建线程池，避免阻塞事件循环
-_executor = ThreadPoolExecutor(max_workers=4)
+# 线程池供 ES scroll 使用（需支持多个并行 fetch 切片）
+_executor = ThreadPoolExecutor(max_workers=8)
 
 # ES 专用日志（写入 es_logs/ 目录）
 logger = logging.getLogger("es_query")
