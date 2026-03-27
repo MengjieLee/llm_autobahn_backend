@@ -240,6 +240,7 @@ async def _run_streaming_fetch_tokenize(
     fetch_done_count = [0]
     tokenize_done_count = [0]
     tokenize_total_lines = [0]
+    tokenize_total_seconds = [0.0]  # 累计各切片 tokenize 实际耗时（秒），用于计算速度
 
     # _cb 在线程池中被调用（run_in_executor），不能做文件 I/O
     # 只写内存，由 _progress_flusher 定期刷盘
@@ -264,12 +265,25 @@ async def _run_streaming_fetch_tokenize(
     async def _update_tokenize_progress():
         if tokenize_done_count[0] == 0:
             return
-        await _update_stage(task_id, "tokenize", {
+        # 计算基于记录数的序列化速度和剩余记录
+        stage_data = {
             "status": "running",
             "message": f"序列化进度 {tokenize_done_count[0]}/{len(fetch_results)}",
             "progress": f"{tokenize_done_count[0]}/{len(fetch_results)}",
             "total_lines": tokenize_total_lines[0],
-        })
+        }
+        if tokenize_total_seconds[0] > 0 and tokenize_total_lines[0] > 0:
+            speed = tokenize_total_lines[0] / tokenize_total_seconds[0]  # 记录/秒
+            # 已完成 tokenize 的切片文件集合
+            done_files = {r["file"] for r in tokenize_results if r.get("status") == "completed"}
+            # 从 fetch_results 中累加未完成切片的记录数
+            remaining_records = sum(
+                fr["count"] for fr in fetch_results
+                if os.path.basename(fr["file"]) not in done_files
+            )
+            stage_data["tokenize_speed"] = round(speed, 2)
+            stage_data["remaining_records"] = remaining_records
+        await _update_stage(task_id, "tokenize", stage_data)
 
     async def _progress_flusher():
         """每 2 秒将 _cb 线程回调写入的内存进度刷到 status 文件"""
@@ -355,6 +369,7 @@ async def _run_streaming_fetch_tokenize(
             tokenize_done_count[0] += 1
             if result["status"] == "completed":
                 tokenize_total_lines[0] += result.get("lines", 0)
+                tokenize_total_seconds[0] += result.get("duration_seconds", 0.0)
             await _update_tokenize_progress()
 
     # ---- 启动所有 fetch 任务（并行，受信号量控制） ----
@@ -557,10 +572,12 @@ async def _run_tokenize_single_file(
     summary_file = os.path.join(slice_output_dir, "pipeline_summary.json")
     model_outputs = {}  # model -> txt_file
     total_lines = 0
+    duration_seconds = 0.0
 
     if os.path.exists(summary_file):
         with open(summary_file, "r", encoding="utf-8") as f:
             summary = json.load(f)
+        duration_seconds = summary.get("duration_seconds", 0.0)
         # summary.files[0].model_files: {model: {json, txt, lines}}
         for file_result in summary.get("files", []):
             for model, mf in file_result.get("model_files", {}).items():
@@ -594,6 +611,7 @@ async def _run_tokenize_single_file(
         "status": "completed",
         "outputs": model_outputs,  # model -> txt_file
         "lines": total_lines,
+        "duration_seconds": duration_seconds,
         "error": None
     }
 
