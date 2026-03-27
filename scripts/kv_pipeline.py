@@ -49,7 +49,8 @@ def process_single_file(
     default_model: str = "glm-5",
     override_tokenizer: str = None,
     file_index: int = 1,
-    total_files: int = 1
+    total_files: int = 1,
+    model_filter: set = None
 ) -> Dict[str, Any]:
     """
     处理单个输入文件：tokenize (per-model 分桶) -> convert (每个 model 文件)
@@ -75,7 +76,7 @@ def process_single_file(
 
     try:
         cmd = [
-            "python", os.path.join(SCRIPTS_DIR, "tokenize_script.py"),
+            "python", "-u", os.path.join(SCRIPTS_DIR, "tokenize_script.py"),
             "-i", input_file,
             "-o", output_dir,
             "-p", base_name,
@@ -101,7 +102,7 @@ def process_single_file(
         for line in process.stdout:
             line = line.strip()
             if line:
-                print(f"  {line}")
+                print(f"  {line}", flush=True)
 
             if "成功:" in line and "失败:" in line:
                 match = re.search(r'成功:\s*(\d+).*失败:\s*(\d+)', line)
@@ -159,16 +160,25 @@ def process_single_file(
         return result
 
     # ---- Step 2: 格式转换 (每个 model 文件分别转换) ----
-    print(f"\n{file_tag} Step 2/2: 格式转换 - {len(model_json_files)} 个模型文件")
+    # 如果指定了模型过滤，只转换选中的模型
+    if model_filter:
+        convert_models = {m: f for m, f in model_json_files.items() if m in model_filter}
+        skipped = set(model_json_files.keys()) - set(convert_models.keys())
+        if skipped:
+            print(f"{file_tag} 模型过滤: 跳过 {sorted(skipped)}，仅转换 {sorted(convert_models.keys())}")
+    else:
+        convert_models = model_json_files
+
+    print(f"\n{file_tag} Step 2/2: 格式转换 - {len(convert_models)} 个模型文件")
     step2_start = datetime.now()
     convert_errors = []
 
-    for model, json_file in model_json_files.items():
+    for model, json_file in convert_models.items():
         txt_file = json_file.replace("_input_ids.json", "_input_ids.txt")
         incomplete_txt = txt_file + ".incomplete"
         try:
             cmd = [
-                "python", os.path.join(SCRIPTS_DIR, "convert_to_cache_input.py"),
+                "python", "-u", os.path.join(SCRIPTS_DIR, "convert_to_cache_input.py"),
                 "-i", json_file,
                 "-o", incomplete_txt
             ]
@@ -245,8 +255,15 @@ def main():
                         help="强制使用指定 tokenizer")
     parser.add_argument("--workers", "-w", type=int, default=4,
                         help="并发处理文件数 (默认: 4)")
+    parser.add_argument("--models", "-m", default=None,
+                        help="模型过滤，逗号分隔（如 glm-5,deepseek-v3.2），仅对指定模型执行 convert")
 
     args = parser.parse_args()
+
+    # 解析模型过滤列表
+    model_filter = set()
+    if args.models:
+        model_filter = {m.strip() for m in args.models.split(",") if m.strip()}
 
     # 校验输入文件
     input_files = []
@@ -276,6 +293,8 @@ def main():
         print(f"强制 Tokenizer: {args.override_tokenizer}")
     workers = min(args.workers, total_files)
     print(f"并发度: {workers}")
+    if model_filter:
+        print(f"模型过滤: {sorted(model_filter)}")
     print(f"{'='*60}")
 
     # 并发处理文件
@@ -293,7 +312,8 @@ def main():
                 default_model=args.default_model,
                 override_tokenizer=args.override_tokenizer,
                 file_index=idx + 1,
-                total_files=total_files
+                total_files=total_files,
+                model_filter=model_filter or None
             )
             future_to_idx[future] = idx
 

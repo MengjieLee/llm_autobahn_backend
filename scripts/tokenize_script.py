@@ -359,76 +359,84 @@ def main():
 
     tokenizer_manager = TokenizerManager()
 
-    # 读取输入文件（JSONL 格式：每行一个 JSON 对象）
-    print(f"[INFO] 正在读取输入文件...")
-    records = []
-    with open(args.input, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    total_records = len(records)
-    print(f"[INFO] 共 {total_records} 条记录")
-
-    if args.limit > 0:
-        records = records[:args.limit]
-        print(f"[INFO] 限制处理前 {args.limit} 条")
-
     # 统计信息
     model_stats = {}
     tokenizer_stats = {}
     success_count = 0
     failed_count = 0
+    total_records = 0
     start_time = datetime.now()
 
-    # 按 model 分桶收集结果
-    model_results = {}  # model -> [result, ...]
+    # 流式处理：逐行读 JSONL → 转换 → 按 model 实时写入文件
+    # 不在内存中攒 records 或 model_results，避免大文件 OOM
+    model_files = {}       # model -> {"fh": file_handle, "incomplete": path, "final": path, "count": int}
+    output_files = {}      # model -> final_file_path
+    model_counts = {}      # model -> count
 
-    for i, record in enumerate(records):
-        result = convert_record(
-            record, tokenizer_manager, args.override_tokenizer,
-            args.default_model, args.verbose
-        )
+    print(f"[INFO] 流式处理中...")
+    with open(args.input, 'r', encoding='utf-8') as fin:
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
 
-        if result:
-            success_count += 1
-            model = result.get("model_used", "unknown")
-            model_stats[model] = model_stats.get(model, 0) + 1
-            tokenizer_used = result.get("tokenizer_used", "unknown")
-            tokenizer_stats[tokenizer_used] = tokenizer_stats.get(tokenizer_used, 0) + 1
-            model_results.setdefault(model, []).append(result)
-        else:
-            failed_count += 1
+            total_records += 1
+            if args.limit > 0 and total_records > args.limit:
+                break
 
-        if (i + 1) % 10000 == 0:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            speed = (i + 1) / elapsed if elapsed > 0 else 0
-            print(f"[INFO] 进度: {i + 1}/{len(records)} ({(i + 1) / len(records) * 100:.1f}%), "
-                  f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
+            record = json.loads(line)
+            result = convert_record(
+                record, tokenizer_manager, args.override_tokenizer,
+                args.default_model, args.verbose
+            )
 
-    # 按 model 分别写入文件（每个 model 按 timestamp 排序）
-    # 写入 .json.incomplete → rename 为 .json（状态机）
-    output_files = {}  # model -> output_file_path
-    for model, results in model_results.items():
-        results.sort(key=lambda x: x.get("timestamp", ""))
-        final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.json")
-        incomplete_file = final_file + ".incomplete"
-        with open(incomplete_file, 'w', encoding='utf-8') as f_out:
-            f_out.write('[\n')
-            for idx, result in enumerate(results):
-                if idx > 0:
-                    f_out.write(',\n')
-                json.dump(result, f_out, ensure_ascii=False)
-            f_out.write('\n]')
-        os.rename(incomplete_file, final_file)
-        output_files[model] = final_file
-        print(f"[INFO] 模型 {model}: {len(results)} 条 -> {final_file}")
+            if result:
+                success_count += 1
+                model = result.get("model_used", "unknown")
+                model_stats[model] = model_stats.get(model, 0) + 1
+                tokenizer_used = result.get("tokenizer_used", "unknown")
+                tokenizer_stats[tokenizer_used] = tokenizer_stats.get(tokenizer_used, 0) + 1
+
+                # 按需打开 model 文件句柄（懒初始化）
+                if model not in model_files:
+                    final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.json")
+                    incomplete_file = final_file + ".incomplete"
+                    fh = open(incomplete_file, 'w', encoding='utf-8')
+                    fh.write('[\n')
+                    model_files[model] = {
+                        "fh": fh, "incomplete": incomplete_file,
+                        "final": final_file, "count": 0
+                    }
+
+                mf = model_files[model]
+                if mf["count"] > 0:
+                    mf["fh"].write(',\n')
+                json.dump(result, mf["fh"], ensure_ascii=False)
+                mf["count"] += 1
+                model_counts[model] = mf["count"]
+            else:
+                failed_count += 1
+
+            processed = success_count + failed_count
+            if processed % 10000 == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                speed = processed / elapsed if elapsed > 0 else 0
+                print(f"[INFO] 进度: {processed}/{total_records}+, "
+                      f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
+
+    # 关闭所有文件句柄，完成 .incomplete → .json rename
+    for model, mf in model_files.items():
+        mf["fh"].write('\n]')
+        mf["fh"].close()
+        os.rename(mf["incomplete"], mf["final"])
+        output_files[model] = mf["final"]
+        print(f"[INFO] 模型 {model}: {mf['count']} 条 -> {mf['final']}")
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
     print(f"\n[INFO] ========== 处理完成 ==========")
-    print(f"[INFO] 总记录: {len(records)}, 成功: {success_count}, 失败: {failed_count}")
-    print(f"[INFO] 模型数: {len(model_results)}")
+    print(f"[INFO] 总记录: {total_records}, 成功: {success_count}, 失败: {failed_count}")
+    print(f"[INFO] 模型数: {len(model_files)}")
     print(f"[INFO] 耗时: {elapsed:.1f} 秒")
 
     print(f"\n[INFO] ========== 模型分布 ==========")
@@ -442,7 +450,7 @@ def main():
 
     # 输出 JSON 汇总供上层脚本解析
     summary = {
-        "models": {m: {"count": len(r), "file": output_files[m]} for m, r in model_results.items()},
+        "models": {m: {"count": model_counts.get(m, 0), "file": output_files[m]} for m in output_files},
         "success_count": success_count,
         "failed_count": failed_count,
     }

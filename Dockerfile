@@ -1,12 +1,14 @@
 ARG TARGET_PLATFORM=linux/amd64
 
-# 构建阶段：安装编译依赖
+# ============================================================
+# 构建阶段：安装编译依赖 + Python 包
+# ============================================================
 FROM --platform=${TARGET_PLATFORM} python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /workspace
+WORKDIR /build
 
 # 安装编译依赖（仅构建阶段需要）
 RUN apt-get update \
@@ -17,13 +19,16 @@ RUN apt-get update \
     libmariadb-dev \
   && rm -rf /var/lib/apt/lists/*
 
-# 创建虚拟环境并安装 Python 依赖
-COPY requirements.txt /workspace/requirements.txt
+# 先单独 COPY requirements.txt，利用 Docker 层缓存
+# 只要 requirements.txt 不变，以下 pip install 不会重跑
+COPY requirements.txt .
 RUN python -m venv /opt/venv \
   && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-  && /opt/venv/bin/pip install --no-cache-dir -r /workspace/requirements.txt
+  && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# 运行阶段：只保留运行时文件
+# ============================================================
+# 运行阶段：精简镜像
+# ============================================================
 FROM --platform=${TARGET_PLATFORM} python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -32,19 +37,27 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /workspace
 
-# 只安装运行时必需的系统依赖
+# 运行时系统依赖
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    libmariadb3 procps \
+    libmariadb3 \
+    procps \
     ca-certificates \
-  && rm -rf /var/lib/apt/lists/* \
-  && apt-get clean
+  && rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制虚拟环境
 COPY --from=builder /opt/venv /opt/venv
 
-# 拷贝业务代码
-COPY . /workspace
+# 先拷贝不常变的基础设施代码（利用缓存分层）
+COPY src/ /workspace/src/
+COPY scripts/ /workspace/scripts/
+COPY context/ /workspace/context/
+
+# 再拷贝频繁变动的应用代码
+COPY app/ /workspace/app/
+
+# 运行时数据目录（容器内创建，生产环境挂载外部卷）
+RUN mkdir -p /workspace/olap_database /workspace/logs /workspace/es_logs
 
 EXPOSE 8739
 

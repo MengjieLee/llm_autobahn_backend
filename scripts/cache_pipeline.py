@@ -139,10 +139,10 @@ def main():
                         help="input_ids.txt 文件路径，支持多个文件")
     parser.add_argument("--output-dir", "-o", required=True,
                         help="输出目录")
-    parser.add_argument("--cache-sizes", "-s", default="16",
-                        help="缓存大小列表，逗号分隔 (默认: 16)")
-    parser.add_argument("--block-size", "-b", type=int, default=200000000,
-                        help="Block 大小 (token 数，默认: 200000000)")
+    parser.add_argument("--cache-sizes", "-s", default="200000000",
+                        help="缓存大小列表，逗号分隔 (默认: 200000000)")
+    parser.add_argument("--block-size", "-b", type=int, default=16,
+                        help="Block 大小 (token 数，默认: 16)")
     parser.add_argument("--cache-calc", default=CACHE_CALC_PATH,
                         help="cache_calc 可执行文件路径")
 

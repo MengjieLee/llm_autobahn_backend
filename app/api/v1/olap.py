@@ -2,6 +2,7 @@ import asyncio
 import glob
 import json
 import logging
+import threading
 import uuid
 import os
 
@@ -29,6 +30,7 @@ KV_RESULTS_DIR = os.path.join(BASE_DIR, settings.OLAP_DATABASE_DIR)
 KV_DATA_DIR = os.path.join(KV_RESULTS_DIR, "data")
 KV_STATUS_DIR = os.path.join(KV_RESULTS_DIR, "status")
 SCRIPTS_DIR = os.path.join(BASE_DIR, settings.OLAP_SCRIPTS_DIR)
+MODELS_JSON = os.path.join(BASE_DIR, "app", "conf", "models.json")
 
 # Pipeline 参数
 DEFAULT_MODEL = settings.PIPELINE_DEFAULT_MODEL
@@ -36,7 +38,17 @@ BLOCK_SIZE = settings.PIPELINE_BLOCK_SIZE
 CACHE_SIZE = settings.PIPELINE_CACHE_SIZE
 TOKENIZE_CONCURRENCY = settings.PIPELINE_TOKENIZE_CONCURRENCY
 FETCH_CONCURRENCY = settings.PIPELINE_FETCH_CONCURRENCY
+KV_WORKERS = settings.PIPELINE_KV_WORKERS
 QPD_LIMIT = settings.OLAP_QPD_LIMIT
+
+# Per-task 写入锁，防止并发 read-modify-write 竞态
+_status_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_status_lock(task_id: str) -> asyncio.Lock:
+    if task_id not in _status_locks:
+        _status_locks[task_id] = asyncio.Lock()
+    return _status_locks[task_id]
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -87,51 +99,59 @@ def _read_status(task_id: str) -> Optional[dict]:
 def _write_status(data: dict):
     data["updated_at"] = _now_bjt()
     path = _status_file(data["task_id"])
-    with open(path, "w", encoding="utf-8") as f:
+    # 原子写入：唯一临时文件 + rename，防止并发写入导致文件损坏
+    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
-def _update_stage(task_id: str, stage: str, stage_data: dict, current_stage: str = None):
+async def _update_stage(task_id: str, stage: str, stage_data: dict, current_stage: str = None):
     """更新某个阶段的状态，自动管理 started_at / completed_at"""
-    status = _read_status(task_id)
-    if not status:
-        return
-    if current_stage:
-        status["pipeline"]["current_stage"] = current_stage
+    async with _get_status_lock(task_id):
+        status = _read_status(task_id)
+        if not status:
+            return
+        if current_stage:
+            status["pipeline"]["current_stage"] = current_stage
 
-    now = _now_bjt()
+        now = _now_bjt()
 
-    # 保留已有的 started_at，首次 running 时写入
-    existing = status["pipeline"]["stages"].get(stage, {})
-    if stage_data.get("status") == "running" and "started_at" not in existing:
-        stage_data["started_at"] = now
-    elif "started_at" in existing:
-        stage_data.setdefault("started_at", existing["started_at"])
+        # 保留已有的 started_at，首次 running 时写入
+        existing = status["pipeline"]["stages"].get(stage, {})
+        if stage_data.get("status") == "running" and "started_at" not in existing:
+            stage_data["started_at"] = now
+        elif "started_at" in existing:
+            stage_data.setdefault("started_at", existing["started_at"])
 
-    # completed / failed 时记录 completed_at
-    if stage_data.get("status") in ("completed", "failed"):
-        stage_data["completed_at"] = now
+        # completed / failed 时记录 completed_at
+        if stage_data.get("status") in ("completed", "failed"):
+            stage_data["completed_at"] = now
 
-    status["pipeline"]["stages"][stage] = stage_data
-    _write_status(status)
-
-
-def _set_result(task_id: str, result: dict):
-    status = _read_status(task_id)
-    if not status:
-        return
-    status["pipeline"]["current_stage"] = "done"
-    status["result"] = result
-    _write_status(status)
+        status["pipeline"]["stages"][stage] = stage_data
+        _write_status(status)
 
 
-def _set_failed(task_id: str, stage: str, error_msg: str):
-    status = _read_status(task_id)
-    if not status:
-        return
-    status["pipeline"]["current_stage"] = "failed"
-    status["pipeline"]["stages"][stage] = {"status": "failed", "message": error_msg}
-    _write_status(status)
+async def _set_result(task_id: str, result: dict):
+    async with _get_status_lock(task_id):
+        status = _read_status(task_id)
+        if not status:
+            return
+        status["pipeline"]["current_stage"] = "done"
+        status["result"] = result
+        _write_status(status)
+
+
+async def _set_failed(task_id: str, stage: str, error_msg: str):
+    async with _get_status_lock(task_id):
+        status = _read_status(task_id)
+        if not status:
+            return
+        status["pipeline"]["current_stage"] = "failed"
+        status["pipeline"]["stages"][stage] = {"status": "failed", "message": error_msg}
+        _write_status(status)
 
 
 # ============================================================
@@ -145,7 +165,7 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
             target = datetime.strptime(scheduled_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BJT)
             delay = (target - datetime.now(BJT)).total_seconds()
             if delay > 0:
-                _update_stage(task_id, "scheduled", {
+                await _update_stage(task_id, "scheduled", {
                     "status": "waiting",
                     "message": f"等待定时启动 {scheduled_at}",
                     "scheduled_at": scheduled_at
@@ -176,7 +196,7 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
         logger.exception(f"Pipeline failed for {task_id}")
         status = _read_status(task_id)
         if status and status["pipeline"]["current_stage"] not in ("done", "failed"):
-            _set_failed(task_id, status["pipeline"]["current_stage"], str(e))
+            await _set_failed(task_id, status["pipeline"]["current_stage"], str(e))
 
 
 async def _run_streaming_fetch_tokenize(
@@ -191,8 +211,8 @@ async def _run_streaming_fetch_tokenize(
       - 拉取成功: kv_xxx.jsonl (rename)
       - tokenize 只消费 .jsonl
     """
-    _update_stage(task_id, "fetch", {"status": "running", "message": "正在查询 ES 数据..."}, "fetch")
-    _update_stage(task_id, "tokenize", {"status": "pending", "message": "等待数据..."})
+    await _update_stage(task_id, "fetch", {"status": "running", "message": "正在查询 ES 数据..."}, "fetch")
+    await _update_stage(task_id, "tokenize", {"status": "pending", "message": "等待数据..."})
 
     start_dt = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M:%S")
     end_dt = datetime.strptime(end_datetime, "%Y-%m-%d %H:%M:%S")
@@ -212,7 +232,7 @@ async def _run_streaming_fetch_tokenize(
 
     total_slices = len(hours)
 
-    # 共享状态（线程安全：asyncio 单线程，无需锁）
+    # 共享状态
     fetch_results = []        # {"file": ..., "hour": ..., "count": ...}
     fetch_incomplete = []     # {"file": ..., "hour": ..., "error": ...}
     tokenize_results = []     # {"file": ..., "status": ..., ...}
@@ -221,30 +241,49 @@ async def _run_streaming_fetch_tokenize(
     tokenize_done_count = [0]
     tokenize_total_lines = [0]
 
+    # _cb 在线程池中被调用（run_in_executor），不能做文件 I/O
+    # 只写内存，由 _progress_flusher 定期刷盘
+    _cb_msg = [None]          # 最新的 _cb 消息（线程安全：单次赋值）
+    _progress_dirty = [False] # 标记是否有新进度需要刷盘
+
     fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
     tokenize_sem = asyncio.Semaphore(TOKENIZE_CONCURRENCY)
     tokenize_tasks = []  # 收集所有 tokenize 协程
 
-    def _update_fetch_progress():
+    async def _update_fetch_progress():
         msg_parts = [f"拉取进度 {fetch_done_count[0]}/{total_slices}，已获取 {fetch_total_count[0]} 条"]
         if fetch_incomplete:
             msg_parts.append(f"，{len(fetch_incomplete)} 个失败")
-        _update_stage(task_id, "fetch", {
+        await _update_stage(task_id, "fetch", {
             "status": "running",
             "message": "".join(msg_parts),
             "processed_count": fetch_total_count[0],
             "progress": f"{fetch_done_count[0]}/{total_slices}",
         })
 
-    def _update_tokenize_progress():
+    async def _update_tokenize_progress():
         if tokenize_done_count[0] == 0:
             return
-        _update_stage(task_id, "tokenize", {
+        await _update_stage(task_id, "tokenize", {
             "status": "running",
             "message": f"序列化进度 {tokenize_done_count[0]}/{len(fetch_results)}",
             "progress": f"{tokenize_done_count[0]}/{len(fetch_results)}",
             "total_lines": tokenize_total_lines[0],
         })
+
+    async def _progress_flusher():
+        """每 2 秒将 _cb 线程回调写入的内存进度刷到 status 文件"""
+        while True:
+            await asyncio.sleep(2)
+            if _progress_dirty[0] and _cb_msg[0]:
+                _progress_dirty[0] = False
+                await _update_stage(task_id, "fetch", {
+                    "status": "running",
+                    "message": _cb_msg[0],
+                    "processed_count": fetch_total_count[0],
+                })
+
+    flusher_task = asyncio.create_task(_progress_flusher())
 
     async def _fetch_slice(idx: int, h_start: datetime, h_end: datetime):
         """拉取单个切片，成功 rename 为 .jsonl，失败保留 .incomplete"""
@@ -259,14 +298,12 @@ async def _run_streaming_fetch_tokenize(
         es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
 
         async with fetch_sem:
-            _update_fetch_progress()
+            await _update_fetch_progress()
 
-            def _cb(count, msg, _tid=task_id):
-                _update_stage(_tid, "fetch", {
-                    "status": "running",
-                    "message": f"[{idx + 1}/{total_slices}] {msg}",
-                    "processed_count": fetch_total_count[0] + count
-                })
+            def _cb(count, msg):
+                # 在线程池中被调用，只更新内存，不做文件 I/O
+                _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
+                _progress_dirty[0] = True
 
             try:
                 hour_count = await es.query_to_file(
@@ -281,7 +318,7 @@ async def _run_streaming_fetch_tokenize(
                     "hour": f"{h_start_str}~{h_end_str}",
                     "count": hour_count
                 })
-                _update_fetch_progress()
+                await _update_fetch_progress()
 
                 # 立即触发 tokenize（钩子）
                 if hour_count > 0:
@@ -302,28 +339,35 @@ async def _run_streaming_fetch_tokenize(
                     "error": str(e)[:200]
                 })
                 logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
-                _update_fetch_progress()
+                await _update_fetch_progress()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         """带信号量和进度追踪的 tokenize 单文件"""
+        # 读取用户选择的模型过滤列表
+        _status = _read_status(tid)
+        _selected = _status.get("query", {}).get("models", []) if _status else []
         async with tokenize_sem:
-            _update_tokenize_progress()
+            await _update_tokenize_progress()
             result = await _run_tokenize_single_file(
-                input_file, out_dir, tid, 0, 0
+                input_file, out_dir, tid, 0, 0, models=_selected
             )
             tokenize_results.append(result)
             tokenize_done_count[0] += 1
             if result["status"] == "completed":
                 tokenize_total_lines[0] += result.get("lines", 0)
-            _update_tokenize_progress()
+            await _update_tokenize_progress()
 
     # ---- 启动所有 fetch 任务（并行，受信号量控制） ----
     fetch_tasks = [
         asyncio.create_task(_fetch_slice(idx, h_start, h_end))
         for idx, (h_start, h_end) in enumerate(hours)
     ]
-    # 等待所有 fetch 完成
-    await asyncio.gather(*fetch_tasks)
+    try:
+        # 等待所有 fetch 完成
+        await asyncio.gather(*fetch_tasks)
+    finally:
+        # 确保 flusher 在任何退出路径（完成/cancel/异常）下都被清理
+        flusher_task.cancel()
 
     # ---- 更新 fetch 阶段最终状态 ----
     fetch_status = {
@@ -339,12 +383,12 @@ async def _run_streaming_fetch_tokenize(
             f"查询完成，共 {fetch_total_count[0]} 条，"
             f"{len(fetch_incomplete)} 个切片失败"
         )
-    _update_stage(task_id, "fetch", fetch_status)
+    await _update_stage(task_id, "fetch", fetch_status)
 
     # 空数据校验
     if fetch_total_count[0] == 0:
-        _update_stage(task_id, "tokenize", {"status": "skipped", "message": "无数据，跳过"})
-        _update_stage(task_id, "simulate", {"status": "skipped", "message": "无数据，跳过"})
+        await _update_stage(task_id, "tokenize", {"status": "skipped", "message": "无数据，跳过"})
+        await _update_stage(task_id, "simulate", {"status": "skipped", "message": "无数据，跳过"})
         status = _read_status(task_id)
         if status:
             status["pipeline"]["current_stage"] = "done"
@@ -361,7 +405,7 @@ async def _run_streaming_fetch_tokenize(
         raise RuntimeError("Fetch returned 0 records, pipeline stopped")
 
     # ---- 等待所有 tokenize 完成 ----
-    _update_stage(task_id, "tokenize", {
+    await _update_stage(task_id, "tokenize", {
         "status": "running",
         "message": f"等待序列化完成 ({tokenize_done_count[0]}/{len(fetch_results)})"
     }, "tokenize")
@@ -379,22 +423,34 @@ async def _run_streaming_fetch_tokenize(
         for model, txt_file in r.get("outputs", {}).items():
             model_txt_files.setdefault(model, []).append(txt_file)
 
+    # 按用户选择的模型过滤（不选则保留全部）
+    status = _read_status(task_id)
+    selected_models = status.get("query", {}).get("models", []) if status else []
+    all_detected_models = list(model_txt_files.keys())
+    if selected_models:
+        skipped_models = [m for m in model_txt_files if m not in selected_models]
+        model_txt_files = {m: fs for m, fs in model_txt_files.items() if m in selected_models}
+        if skipped_models:
+            logger.info(f"[tokenize] 按模型过滤: 保留 {list(model_txt_files.keys())}，跳过 {skipped_models}")
+
     if not success_files:
-        _update_stage(task_id, "tokenize", {
+        await _update_stage(task_id, "tokenize", {
             "status": "failed",
             "message": f"序列化全部失败，{len(failed_files)} 个文件",
             "files": tokenize_results,
             "model_outputs": {},
             "total_lines": 0
         })
-        _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
+        await _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
         raise RuntimeError("All tokenize files failed")
 
     status_msg = (
         f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，"
         f"{tokenize_total_lines[0]} 条，{len(model_txt_files)} 个模型"
     )
-    _update_stage(task_id, "tokenize", {
+    if selected_models:
+        status_msg += f"（已过滤，检测到 {len(all_detected_models)} 个模型）"
+    await _update_stage(task_id, "tokenize", {
         "status": "completed",
         "message": status_msg,
         "model_outputs": {m: fs for m, fs in model_txt_files.items()},
@@ -402,11 +458,12 @@ async def _run_streaming_fetch_tokenize(
         "success_count": len(success_files),
         "failed_count": len(failed_files),
         "models": list(model_txt_files.keys()),
+        "all_detected_models": all_detected_models,
         "files": tokenize_results
     })
 
     if tokenize_total_lines[0] == 0:
-        _update_stage(task_id, "simulate", {"status": "skipped", "message": "序列化结果为空，跳过模拟"})
+        await _update_stage(task_id, "simulate", {"status": "skipped", "message": "序列化结果为空，跳过模拟"})
         status = _read_status(task_id)
         if status:
             status["pipeline"]["current_stage"] = "done"
@@ -421,18 +478,27 @@ async def _run_streaming_fetch_tokenize(
 
 
 async def _run_tokenize_single_file(
-    input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int
+    input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int,
+    models: list = None
 ) -> dict:
-    """对单个 jsonl 文件执行 tokenize + convert (per-model 分桶)，返回结果 dict"""
+    """对单个 jsonl 文件执行 tokenize + convert (per-model 分桶)，实时上报进度"""
+    import re as _re
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     short_name = os.path.basename(input_file)
 
+    # 每个切片使用独立子目录，避免并行时 pipeline_summary.json 互相覆盖
+    slice_output_dir = os.path.join(output_dir, base_name)
+    os.makedirs(slice_output_dir, exist_ok=True)
+
     cmd = [
-        "python", os.path.join(SCRIPTS_DIR, "kv_pipeline.py"),
+        "python", "-u", os.path.join(SCRIPTS_DIR, "kv_pipeline.py"),
         "-i", input_file,
-        "-o", output_dir,
+        "-o", slice_output_dir,
         "-d", DEFAULT_MODEL,
+        "-w", str(KV_WORKERS),
     ]
+    if models:
+        cmd.extend(["-m", ",".join(models)])
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -440,8 +506,44 @@ async def _run_tokenize_single_file(
         stderr=asyncio.subprocess.STDOUT,
         cwd=BASE_DIR
     )
-    stdout, _ = await proc.communicate()
-    output_text = stdout.decode("utf-8", errors="replace")
+
+    # 逐行读取子进程 stdout，实时解析进度并更新 status
+    output_lines = []
+    last_progress_update = 0  # 上次更新 status 的时间戳，节流 2s
+    async for raw_line in proc.stdout:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        output_lines.append(line)
+
+        # 解析 kv_pipeline.py / tokenize_script.py 的进度行
+        # 格式: "[INFO] 进度: 10000/298+, 成功: 9800, 失败: 200, 速度: 1234 条/秒"
+        # 或:   "  [INFO] 进度: ..."（带缩进，来自 kv_pipeline 转发）
+        # 或:   "Step 1/2" / "Step 2/2" 阶段切换
+        now = asyncio.get_event_loop().time()
+        if now - last_progress_update >= 2:
+            progress_msg = None
+            # 提取最新的 [INFO] 进度行
+            m = _re.search(r'\[INFO\]\s*进度:\s*(\d+)/(\d+)\S*.*成功:\s*(\d+).*失败:\s*(\d+).*速度:\s*([\d.]+)', line)
+            if m:
+                done, total = int(m.group(1)), int(m.group(2))
+                ok, fail = int(m.group(3)), int(m.group(4))
+                speed = m.group(5)
+                progress_msg = f"{short_name}: {done}/{total} 条 (成功 {ok}, 失败 {fail}, {speed} 条/秒)"
+            elif "Step 1/2" in line:
+                progress_msg = f"{short_name}: Step 1/2 序列化中..."
+            elif "Step 2/2" in line:
+                progress_msg = f"{short_name}: Step 2/2 格式转换中..."
+            elif "[INFO] 流式处理中" in line:
+                progress_msg = f"{short_name}: 流式序列化中..."
+
+            if progress_msg:
+                last_progress_update = now
+                await _update_stage(task_id, "tokenize", {
+                    "status": "running",
+                    "message": progress_msg,
+                })
+
+    await proc.wait()
+    output_text = "\n".join(output_lines)
 
     if proc.returncode != 0:
         return {
@@ -452,7 +554,7 @@ async def _run_tokenize_single_file(
         }
 
     # 读取 pipeline_summary.json 获取 per-model 产出
-    summary_file = os.path.join(output_dir, "pipeline_summary.json")
+    summary_file = os.path.join(slice_output_dir, "pipeline_summary.json")
     model_outputs = {}  # model -> txt_file
     total_lines = 0
 
@@ -469,7 +571,7 @@ async def _run_tokenize_single_file(
                     total_lines += lines
     else:
         # 兜底：扫描 per-model txt 文件
-        pattern = os.path.join(output_dir, f"{base_name}_*_input_ids.txt")
+        pattern = os.path.join(slice_output_dir, f"{base_name}_*_input_ids.txt")
         for txt_file in sorted(glob.glob(pattern)):
             fname = os.path.basename(txt_file)
             model = fname[len(base_name) + 1:].replace("_input_ids.txt", "")
@@ -498,7 +600,7 @@ async def _run_tokenize_single_file(
 
 async def _run_simulate_stage(task_id: str):
     """缓存模拟: 按 model 分组并行调用 cache_pipeline.py，汇总多 model 结果"""
-    _update_stage(task_id, "simulate", {"status": "running", "message": "正在模拟缓存命中..."}, "simulate")
+    await _update_stage(task_id, "simulate", {"status": "running", "message": "正在模拟缓存命中..."}, "simulate")
 
     task_data_dir = _task_dir(task_id)
     report_dir = os.path.join(task_data_dir, "report")
@@ -510,13 +612,11 @@ async def _run_simulate_stage(task_id: str):
     model_outputs = tokenize_stage.get("model_outputs", {})
 
     if not model_outputs:
-        # 兜底: 扫描 tokenized 目录，按 model 分组
-        # 文件名格式: {slice_prefix}_{model}_input_ids.txt
-        # slice_prefix 格式: kv_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS
-        # model 提取: 去掉 _input_ids.txt 后缀，再去掉 kv_日期_日期 前缀
+        # 兜底: 扫描 tokenized 子目录，按 model 分组
+        # 文件路径: tokenized/{slice_name}/{slice_name}_{model}_input_ids.txt
         import re
         tokenized_dir = os.path.join(task_data_dir, "tokenized")
-        for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "*_input_ids.txt"))):
+        for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "**", "*_input_ids.txt"), recursive=True)):
             fname = os.path.basename(txt_file)
             # 正则: kv_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_{model}_input_ids.txt
             m = re.match(r'kv_\d{8}_\d{6}_\d{8}_\d{6}_(.+)_input_ids\.txt$', fname)
@@ -538,10 +638,10 @@ async def _run_simulate_stage(task_id: str):
             del model_outputs[model]
 
     if not model_outputs:
-        _set_failed(task_id, "simulate", "无有效 input_ids 文件（全部为空）")
+        await _set_failed(task_id, "simulate", "无有效 input_ids 文件（全部为空）")
         raise RuntimeError("No non-empty input_ids files for simulate")
 
-    _update_stage(task_id, "simulate", {
+    await _update_stage(task_id, "simulate", {
         "status": "running",
         "message": f"正在模拟 {len(model_outputs)} 个模型..."
     })
@@ -550,22 +650,20 @@ async def _run_simulate_stage(task_id: str):
     sim_done_count = [0]
 
     async def _simulate_single_model(model: str, txt_files: list) -> dict:
-        """对单个 model 的所有 txt 文件执行 cache 模拟，产出文件使用 .incomplete 状态机"""
+        """对单个 model 的所有 txt 文件执行 cache 模拟，实时上报 stdout 进度"""
         model_report_dir = os.path.join(report_dir, model)
         os.makedirs(model_report_dir, exist_ok=True)
 
         # 更新状态：该 model 开始模拟
-        _update_stage(task_id, "simulate", {
+        await _update_stage(task_id, "simulate", {
             "status": "running",
-            "message": f"正在模拟 {len(model_outputs)} 个模型 ({sim_done_count[0]}/{len(model_outputs)} 完成)..."
+            "message": f"[{model}] 正在准备模拟 ({sim_done_count[0]}/{len(model_outputs)} 已完成)..."
         })
 
-        # report 产出使用 .incomplete 标记
-        report_file_incomplete = os.path.join(model_report_dir, "cache_report.json.incomplete")
         report_file_final = os.path.join(model_report_dir, "cache_report.json")
 
         cmd = [
-            "python", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
+            "python", "-u", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
             "-i", *sorted(txt_files),
             "-o", model_report_dir,
             "-s", str(CACHE_SIZE),
@@ -578,8 +676,34 @@ async def _run_simulate_stage(task_id: str):
             stderr=asyncio.subprocess.STDOUT,
             cwd=BASE_DIR
         )
-        stdout, _ = await proc.communicate()
-        output_text = stdout.decode("utf-8", errors="replace")
+
+        # 逐行读取 stdout，实时解析进度
+        output_lines = []
+        last_progress_update = 0
+        async for raw_line in proc.stdout:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            output_lines.append(line)
+
+            now = asyncio.get_event_loop().time()
+            if now - last_progress_update >= 2:
+                progress_msg = None
+                if "合并" in line and "个文件" in line:
+                    progress_msg = f"[{model}] 合并文件中..."
+                elif "Step" in line and "缓存模拟" in line:
+                    progress_msg = f"[{model}] 缓存模拟计算中..."
+                elif "执行命令" in line or "cache_calc" in line:
+                    progress_msg = f"[{model}] 执行 cache_calc..."
+                elif "流水线执行完成" in line:
+                    progress_msg = f"[{model}] 模拟完成，生成报告中..."
+                if progress_msg:
+                    last_progress_update = now
+                    await _update_stage(task_id, "simulate", {
+                        "status": "running",
+                        "message": progress_msg,
+                    })
+
+        await proc.wait()
+        output_text = "\n".join(output_lines)
 
         if proc.returncode != 0:
             sim_done_count[0] += 1
@@ -608,9 +732,9 @@ async def _run_simulate_stage(task_id: str):
         sim_done_count[0] += 1
 
         # 更新进度
-        _update_stage(task_id, "simulate", {
+        await _update_stage(task_id, "simulate", {
             "status": "running",
-            "message": f"正在模拟 {len(model_outputs)} 个模型 ({sim_done_count[0]}/{len(model_outputs)} 完成)..."
+            "message": f"模拟进度 {sim_done_count[0]}/{len(model_outputs)} 模型完成"
         })
 
         return {
@@ -654,7 +778,7 @@ async def _run_simulate_stage(task_id: str):
 
     if not any(sr["status"] == "completed" for sr in sim_results):
         errors = "; ".join(f"{sr['model']}: {sr.get('error', '')[:100]}" for sr in sim_results)
-        _set_failed(task_id, "simulate", f"全部模型模拟失败: {errors}")
+        await _set_failed(task_id, "simulate", f"全部模型模拟失败: {errors}")
         raise RuntimeError("All model simulations failed")
 
     # 构建 message
@@ -664,12 +788,12 @@ async def _run_simulate_stage(task_id: str):
         msg_parts.append(f"{sr['model']} {sr['hit_rate'] * 100:.2f}%")
     sim_msg = f"模拟完成 ({len(completed_models)}/{len(sim_results)} 模型): " + ", ".join(msg_parts)
 
-    _update_stage(task_id, "simulate", {
+    await _update_stage(task_id, "simulate", {
         "status": "completed" if all_ok else "partial",
         "message": sim_msg,
         "models": [sr["model"] for sr in sim_results],
     })
-    _set_result(task_id, result)
+    await _set_result(task_id, result)
 
 
 # ============================================================
@@ -706,9 +830,25 @@ def _is_official(user_info: dict) -> bool:
     return "official" in groups
 
 
+def _load_model_list() -> list:
+    """热加载模型列表（每次读文件，修改即生效无需重启）"""
+    try:
+        with open(MODELS_JSON, "r", encoding="utf-8") as f:
+            return json.load(f).get("models", [])
+    except Exception:
+        return []
+
+
 # ============================================================
 # API 端点
 # ============================================================
+@router.get("/kv/models", summary="获取可用模型列表（热加载）")
+async def kv_models():
+    """读取 app/conf/models.json，修改文件即时生效，无需重启服务"""
+    models = _load_model_list()
+    return StandardResponse(code=0, message="success", data=models, trace_id=None)
+
+
 @router.get("/kv/qpd", summary="查询当前用户 QPD 配额")
 async def kv_qpd(request: Request):
     """返回当前用户今日已用次数、配额上限、是否为 official"""
@@ -807,6 +947,10 @@ async def es_fetch(
     scheduled_at: Optional[str] = Query(
         default=None,
         description="定时启动时间（北京时间），格式 YYYY-MM-DD HH:MM:SS，为空则立即执行",
+    ),
+    models: Optional[str] = Query(
+        default=None,
+        description="模型过滤，逗号分隔（如 glm-5,deepseek-v3.2），为空则分析所有检测到的模型",
     )
 ):
     """
@@ -861,6 +1005,9 @@ async def es_fetch(
     # 场景标签映射
     scenario_label = "coding plan" if path else "all"
 
+    # 解析模型过滤列表
+    selected_models = [m.strip() for m in models.split(",") if m.strip()] if models else []
+
     # 初始化状态文件
     status_data = {
         "task_id": task_id,
@@ -874,7 +1021,8 @@ async def es_fetch(
         "query": {
             "start_datetime": start_datetime,
             "end_datetime": end_datetime,
-            "app_id": app_id
+            "app_id": app_id,
+            "models": selected_models
         },
         "scenario": {
             "path": path or "",

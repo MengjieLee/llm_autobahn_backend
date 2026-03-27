@@ -36,6 +36,25 @@ class ContextFormatter(logging.Formatter):
         return super().format(record)
 
 
+class _ScrollFilter(logging.Filter):
+    """屏蔽 elasticsearch scroll 相关日志"""
+
+    def filter(self, record):
+        if record.name.startswith("elasticsearch"):
+            return "_search/scroll" not in record.getMessage()
+        return True
+
+
+class _PollingFilter(logging.Filter):
+    """屏蔽前端高频轮询的 access log（/kv/status/）"""
+
+    def filter(self, record):
+        msg = record.getMessage()
+        if "/kv/status/" in msg or "/kv/qpd" in msg:
+            return False
+        return True
+
+
 def setup_logging() -> None:
     """配置日志，单个日志文件不超过 5MB，滚动备份，文件名带日期时间戳。"""
     os.makedirs(settings.log_dir, exist_ok=True)
@@ -62,6 +81,7 @@ def setup_logging() -> None:
         encoding="utf-8",
     )
     file_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
+    file_handler.addFilter(_ScrollFilter())  # scroll 日志不写 app.log
 
     # 清理旧 handler，避免重复
     if root_logger.handlers:
@@ -93,6 +113,18 @@ def setup_logging() -> None:
         es_logger.removeHandler(h)
     es_logger.addHandler(es_file_handler)
 
+    # elasticsearch 库日志：scroll 日志直接丢弃（_ScrollFilter），其余写入 es_logs + app.log
+    es_lib_logger = logging.getLogger("elasticsearch")
+    es_lib_handler = RotatingFileHandler(
+        es_log_file,
+        maxBytes=settings.es_log_max_bytes,
+        backupCount=settings.es_log_backup_count,
+        encoding="utf-8",
+    )
+    es_lib_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
+    es_lib_handler.addFilter(_ScrollFilter())  # scroll 日志也不写 es_logs
+    es_lib_logger.addHandler(es_lib_handler)
+
     # ---- 使用统计日志 (格式兼容 legacy: {time} | {user} | {scenario} | {action}) ----
     os.makedirs(settings.usage_log_dir, exist_ok=True)
     usage_log_file = os.path.join(
@@ -115,3 +147,6 @@ def setup_logging() -> None:
     for h in list(usage_logger.handlers):
         usage_logger.removeHandler(h)
     usage_logger.addHandler(usage_handler)
+
+    # ---- 屏蔽轮询 access log ----
+    logging.getLogger("uvicorn.access").addFilter(_PollingFilter())

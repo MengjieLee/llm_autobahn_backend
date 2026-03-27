@@ -108,8 +108,10 @@ class Settings(BaseSettings):
     PIPELINE_DEFAULT_MODEL: str = "glm-5"
     PIPELINE_BLOCK_SIZE: int = 16
     PIPELINE_CACHE_SIZE: int = 200000000
-    PIPELINE_TOKENIZE_CONCURRENCY: int = 4          # tokenize 阶段最大并发数
-    PIPELINE_FETCH_CONCURRENCY: int = 3              # fetch 切片最大并发数
+    PIPELINE_TOKENIZE_CONCURRENCY: int = 2          # tokenize 阶段最大并发数
+    PIPELINE_FETCH_CONCURRENCY: int = 2              # fetch 切片最大并发数
+    PIPELINE_ES_SCROLL_WORKERS: int = 2              # ES scroll 线程池大小
+    PIPELINE_KV_WORKERS: int = 2                    # kv_pipeline.py 并发处理文件数
     PIPELINE_DEFAULT_PATH: str = "/v2/coding/chat/completions"
 
     # QPD（每人每天请求限额）
