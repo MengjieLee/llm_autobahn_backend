@@ -25,7 +25,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
+from io import BytesIO
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -50,17 +52,35 @@ def merge_input_files(input_files: List[str], merged_file: str) -> int:
     """
     # 按文件名排序，确保时间顺序（文件名含时间戳）
     sorted_files = sorted(input_files, key=lambda f: os.path.basename(f))
-
     total_lines = 0
-    with open(merged_file, 'w', encoding='utf-8') as f_out:
+    # shutil 推荐的默认缓冲区大小（16MB，兼顾速度与内存）
+    BUFFER_SIZE = 16 * 1024 * 1024
+
+    # 二进制模式打开输出文件（无编码开销，极速读写）
+    with open(merged_file, 'wb') as f_out:
         for input_file in sorted_files:
-            print(f"  合并: {os.path.basename(input_file)}")
-            with open(input_file, 'r', encoding='utf-8') as f_in:
-                for line in f_in:
-                    line = line.rstrip('\n')
-                    if line:
-                        f_out.write(line + '\n')
-                        total_lines += 1
+            file_basename = os.path.basename(input_file)
+            print(f"  合并: {file_basename}")
+
+            # 二进制打开输入文件
+            with open(input_file, 'rb') as f_in:
+                while True:
+                    # 逐行读取（二进制模式，支持任意超大单行，不占内存）
+                    line = f_in.readline()
+                    if not line:
+                        break  # 文件读取完毕
+
+                    # 原逻辑：去除行尾换行符 + 跳过空行
+                    stripped_line = line.rstrip(b'\n')
+                    if not stripped_line:
+                        continue
+
+                    # 核心：用 BytesIO 封装行，通过 shutil.copyfileobj 写入
+                    # 利用底层缓冲，比直接 write 更快
+                    with BytesIO(stripped_line + b'\n') as line_buffer:
+                        shutil.copyfileobj(line_buffer, f_out, length=BUFFER_SIZE)
+                    
+                    total_lines += 1
 
     return total_lines
 

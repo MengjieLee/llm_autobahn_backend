@@ -97,9 +97,9 @@ python scripts/kv_pipeline.py \
     -w 4
 
 # Stage 3: 缓存模拟
-python scripts/cache_pipeline.py \
-    -i olap_database/data/{username}/{task_id}/tokenized/*_input_ids.txt \
-    -o olap_database/data/{username}/{task_id}/report \
+python /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend/scripts/cache_pipeline.py \
+    -i /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend/olap_database/data/v_limengjie03/v_limengjie03-kv_20260328_000000_20260329_000000_a4144e05/tokenized/kv_20260328_*/kv_20260328_*_input_ids.txt \
+    -o /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend/olap_database/data/v_limengjie03/v_limengjie03-kv_20260328_000000_20260329_000000_a4144e05/report/new \
     -s 200000000 \
     -b 16
 ```
