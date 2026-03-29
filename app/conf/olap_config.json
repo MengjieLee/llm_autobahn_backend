@@ -5,7 +5,7 @@
   "pipeline_tokenize_concurrency": 6,
   "pipeline_fetch_concurrency": 12,
   "pipeline_es_scroll_workers": 60,
-  "pipeline_tokenize_workers": 12,
+  "pipeline_tokenize_workers": 8,
   "pipeline_tokenize_batch_size": 200,
   "pipeline_default_path": "/v2/coding/chat/completions",
   "olap_qpd_limit": 1,
