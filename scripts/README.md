@@ -8,7 +8,7 @@
 ES 日志
   │
   ▼  Stage 1: 数据采集 (API 自动触发)
-olap_database/data/{username}/{task_id}/kv_*.json   ← 原始 ES 记录（按小时分片）
+olap_database/data/{username}/{task_id}/kv_*.jsonl   ← 原始 ES 记录（按小时分片）
   │
   ▼  Stage 2: Token 序列化 (kv_pipeline.py → tokenize_script.py + convert_to_cache_input.py)
 olap_database/data/{username}/{task_id}/tokenized/*_input_ids.txt
@@ -91,7 +91,7 @@ GET /api/v1/olap/kv/status/{task_id}
 ```bash
 # Stage 2: tokenize + convert（多文件并发）
 python scripts/kv_pipeline.py \
-    -i olap_database/data/{username}/{task_id}/kv_*.json \
+    -i olap_database/data/{username}/{task_id}/kv_*.jsonl \
     -o olap_database/data/{username}/{task_id}/tokenized \
     -d glm-5 \
     -w 4

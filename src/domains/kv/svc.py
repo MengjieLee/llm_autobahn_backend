@@ -39,6 +39,14 @@ class ESIndexService:
             ES_HOST, ES_AUTH,
             f"{ES_INDEX_PREFIX}{self.date}"
         )
+        self._extra_clients = []  # 跨日期创建的额外客户端
+
+    def close(self):
+        """关闭所有 ES 连接，释放连接池内存"""
+        self.es.close()
+        for c in self._extra_clients:
+            c.close()
+        self._extra_clients.clear()
 
     def _parse_datetime(self, time_str: str) -> datetime:
         """
@@ -59,10 +67,12 @@ class ESIndexService:
         """获取指定日期的 ES 客户端，跨日期时按需创建"""
         if date_str == self.date:
             return self.es
-        return ESIndexClient(
+        client = ESIndexClient(
             ES_HOST, ES_AUTH,
             f"{ES_INDEX_PREFIX}{date_str}"
         )
+        self._extra_clients.append(client)
+        return client
 
     def _split_time_windows(self, start_dt: datetime, end_dt: datetime,
                             window_seconds: int = None) -> list:

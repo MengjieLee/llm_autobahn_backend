@@ -104,18 +104,7 @@ class Settings(BaseSettings):
     ES_WINDOW_MINUTES: int = 1                      # 单次 scroll 查询的时间窗口（分钟）
     ES_DEFAULT_APP_ID: str = "app-3Lut8O2E"
 
-    # Pipeline 默认参数
-    PIPELINE_DEFAULT_MODEL: str = "glm-5"
-    PIPELINE_BLOCK_SIZE: int = 16
-    PIPELINE_CACHE_SIZE: int = 200000000
-    PIPELINE_TOKENIZE_CONCURRENCY: int = 2          # tokenize 阶段最大并发数
-    PIPELINE_FETCH_CONCURRENCY: int = 2              # fetch 切片最大并发数
-    PIPELINE_ES_SCROLL_WORKERS: int = 2              # ES scroll 线程池大小
-    PIPELINE_KV_WORKERS: int = 2                    # kv_pipeline.py 并发处理文件数
-    PIPELINE_DEFAULT_PATH: str = "/v2/coding/chat/completions"
-
-    # QPD（每人每天请求限额）
-    OLAP_QPD_LIMIT: int = 3
+    # Pipeline / QPD 参数已迁移至 app/conf/olap_config.json（热更新，无需重启）
 
     # HuggingFace
     HF_TOKEN: str = Field(default="")

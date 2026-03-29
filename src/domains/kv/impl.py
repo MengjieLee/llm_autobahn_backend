@@ -9,8 +9,17 @@ from typing import List, Dict, Any, Optional, Callable
 
 from app.conf.config import settings
 
-# 线程池供 ES scroll 使用
-_executor = ThreadPoolExecutor(max_workers=settings.PIPELINE_ES_SCROLL_WORKERS)
+# 线程池供 ES scroll 使用（从热配置读取，进程启动时固定）
+def _get_scroll_workers() -> int:
+    import os, json as _json
+    cfg_path = os.path.join(settings.OLAP_BASE_DIR, "app", "conf", "olap_config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return _json.load(f).get("pipeline_es_scroll_workers", 60)
+    except Exception:
+        return 60
+
+_executor = ThreadPoolExecutor(max_workers=_get_scroll_workers())
 
 # ES 专用日志（写入 es_logs/ 目录）
 logger = logging.getLogger("es_query")
@@ -96,6 +105,13 @@ class ESIndexClient:
         """创建索引连接"""
         self.index = index
         self.client = Elasticsearch(hosts, http_auth=http_auth, timeout=60)
+
+    def close(self):
+        """关闭底层连接池，释放内存"""
+        try:
+            self.client.transport.close()
+        except Exception:
+            pass
 
     def _sync_query_to_file(self, body: dict, output_file: str, status_callback: Callable = None) -> int:
         """

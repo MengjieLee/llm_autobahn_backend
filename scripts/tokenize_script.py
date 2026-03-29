@@ -6,15 +6,18 @@
 - 根据请求中的 model 自动选择对应的 HuggingFace tokenizer
 - 使用 tokenizer 自带的 chat_template，支持 tools calling
 - 对 messages 进行深度清洗 (tool_calls/arguments 字符串化修复)
+- 多进程并行 tokenize（CPU 密集部分）
+- 直接输出 cache_calc 需要的 txt 格式，无需中间 JSON
 
 用法:
-    python tokenize_script.py --input /path/to/input.json --output /path/to/output.json
+    python tokenize_script.py --input /path/to/input.jsonl --output-dir /path/to/output/
 """
 
 import json
 import re
 import os
 import argparse
+from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -122,6 +125,7 @@ class TokenizerManager:
         import warnings
         warnings.filterwarnings("ignore", message=".*rope_parameters.*")
         warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
+        warnings.filterwarnings("ignore", message=".*is not supported and can yield errors.*")
 
         from transformers import AutoTokenizer
         return AutoTokenizer.from_pretrained(config, trust_remote_code=True)
@@ -163,16 +167,22 @@ def apply_chat_template(tokenizer, messages: List[Dict], tools: Optional[List]) 
     # 尝试带 tools 的 apply_chat_template
     if tools:
         try:
-            raw_ret = tokenizer.apply_chat_template(
-                conversation=messages,
-                tools=tools,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors=None,
-            )
+            import io, sys as _sys
+            _backup = _sys.stderr
+            _sys.stderr = io.StringIO()  # 屏蔽 "Failed to convert tools" 噪音
+            try:
+                raw_ret = tokenizer.apply_chat_template(
+                    conversation=messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_tensors=None,
+                )
+            finally:
+                _sys.stderr = _backup
             return _extract_input_ids(raw_ret)
-        except TypeError:
-            # 某些 tokenizer 不支持 tools 参数
+        except (TypeError, ValueError, KeyError, Exception):
+            # tools 转换失败（不支持 tools / JSON Schema 不完整等），回退到不带 tools
             pass
 
     # 不带 tools
@@ -217,7 +227,7 @@ def _extract_input_ids(raw_ret) -> List[int]:
 
 
 # ============================================================
-# 单条记录转换
+# 单条记录转换（纯函数，用于多进程）
 # ============================================================
 def convert_record(
     record: Dict,
@@ -308,6 +318,51 @@ def convert_record(
 
 
 # ============================================================
+# 多进程 worker
+# ============================================================
+_worker_tm = None   # 每个 worker 进程内的 TokenizerManager
+_worker_override = None
+_worker_default = None
+_worker_verbose = False
+
+
+def _worker_init(override_tokenizer, default_model, verbose):
+    """多进程 worker 初始化：每个子进程创建自己的 TokenizerManager"""
+    global _worker_tm, _worker_override, _worker_default, _worker_verbose
+    _worker_tm = TokenizerManager()
+    _worker_override = override_tokenizer
+    _worker_default = default_model
+    _worker_verbose = verbose
+
+
+def _worker_process_batch(batch):
+    """
+    处理一个 batch 的记录。
+    batch: list of (line_idx, json_line_str)
+    返回: list of (line_idx, model, txt_line) 或 (line_idx, None, None) 表示失败
+    """
+    results = []
+    for line_idx, json_str in batch:
+        try:
+            record = json.loads(json_str)
+        except json.JSONDecodeError:
+            results.append((line_idx, None, None))
+            continue
+
+        result = convert_record(
+            record, _worker_tm, _worker_override, _worker_default, _worker_verbose
+        )
+        if result:
+            model = result["model_used"]
+            ids_str = ", ".join(str(tid) for tid in result["input_ids"])
+            txt_line = f"'input_ids': [{ids_str}]"
+            results.append((line_idx, model, txt_line))
+        else:
+            results.append((line_idx, None, None))
+    return results
+
+
+# ============================================================
 # main
 # ============================================================
 def main():
@@ -326,6 +381,10 @@ def main():
                         help="显示详细错误信息")
     parser.add_argument("--show-mapping", action="store_true",
                         help="显示模型到 tokenizer 的映射配置")
+    parser.add_argument("--workers", "-W", type=int, default=0,
+                        help="tokenize 并行 worker 数 (0=自动，基于 CPU 核数)")
+    parser.add_argument("--batch-size", "-B", type=int, default=200,
+                        help="每个 batch 提交给 worker 的记录数 (默认 200)")
 
     args = parser.parse_args()
 
@@ -347,6 +406,10 @@ def main():
     if not file_prefix:
         file_prefix = os.path.splitext(os.path.basename(args.input))[0]
 
+    # worker 数量
+    num_workers = args.workers if args.workers > 0 else max(1, min(cpu_count() - 1, 8))
+    batch_size = args.batch_size
+
     print(f"[INFO] 开始处理...")
     print(f"[INFO] 输入文件: {args.input}")
     print(f"[INFO] 输出目录: {output_dir}")
@@ -356,8 +419,7 @@ def main():
     else:
         print(f"[INFO] Tokenizer: 自动选择 (优先 qianfan_model, 其次 body.model)")
     print(f"[INFO] 默认模型: {args.default_model}")
-
-    tokenizer_manager = TokenizerManager()
+    print(f"[INFO] 并行 workers: {num_workers}, batch_size: {batch_size}")
 
     # 统计信息
     model_stats = {}
@@ -367,66 +429,101 @@ def main():
     total_records = 0
     start_time = datetime.now()
 
-    # 流式处理：逐行读 JSONL → 转换 → 按 model 实时写入文件
-    # 不在内存中攒 records 或 model_results，避免大文件 OOM
-    model_files = {}       # model -> {"fh": file_handle, "incomplete": path, "final": path, "count": int}
-    output_files = {}      # model -> final_file_path
-    model_counts = {}      # model -> count
+    # 输出文件句柄：model -> {fh, incomplete, final, count}
+    # 直接输出 txt 格式（方案 B：消除中间 JSON）
+    model_files = {}
+    output_files = {}
+    model_counts = {}
 
     print(f"[INFO] 流式处理中...")
-    with open(args.input, 'r', encoding='utf-8') as fin:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
 
-            total_records += 1
-            if args.limit > 0 and total_records > args.limit:
-                break
+    # ---- 方案 A+B：多进程并行 + 直接输出 txt ----
+    # 主进程读 JSONL 攒 batch → worker pool 并行 tokenize
+    # → 主进程按原始行号排序写出（保持时间序）
+    pool = Pool(
+        processes=num_workers,
+        initializer=_worker_init,
+        initargs=(args.override_tokenizer, args.default_model, args.verbose),
+    )
 
-            record = json.loads(line)
-            result = convert_record(
-                record, tokenizer_manager, args.override_tokenizer,
-                args.default_model, args.verbose
-            )
+    pending_futures = []    # (future, batch_start_idx, batch_size)
+    current_batch = []      # [(line_idx, json_line_str), ...]
+    line_idx = 0
 
-            if result:
-                success_count += 1
-                model = result.get("model_used", "unknown")
-                model_stats[model] = model_stats.get(model, 0) + 1
-                tokenizer_used = result.get("tokenizer_used", "unknown")
-                tokenizer_stats[tokenizer_used] = tokenizer_stats.get(tokenizer_used, 0) + 1
+    def _flush_results():
+        """收集所有已完成的 futures 并写出结果"""
+        nonlocal success_count, failed_count
+        for future in pending_futures:
+            batch_results = future.get()
+            # batch_results 已经按提交顺序返回（同一 batch 内有序）
+            for idx, model, txt_line in batch_results:
+                if model is not None:
+                    success_count += 1
+                    model_stats[model] = model_stats.get(model, 0) + 1
 
-                # 按需打开 model 文件句柄（懒初始化）
-                if model not in model_files:
-                    final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.json")
-                    incomplete_file = final_file + ".incomplete"
-                    fh = open(incomplete_file, 'w', encoding='utf-8')
-                    fh.write('[\n')
-                    model_files[model] = {
-                        "fh": fh, "incomplete": incomplete_file,
-                        "final": final_file, "count": 0
-                    }
+                    # 懒初始化 model 文件
+                    if model not in model_files:
+                        final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.txt")
+                        incomplete_file = final_file + ".incomplete"
+                        fh = open(incomplete_file, 'w', encoding='utf-8')
+                        model_files[model] = {
+                            "fh": fh, "incomplete": incomplete_file,
+                            "final": final_file, "count": 0
+                        }
 
-                mf = model_files[model]
-                if mf["count"] > 0:
-                    mf["fh"].write(',\n')
-                json.dump(result, mf["fh"], ensure_ascii=False)
-                mf["count"] += 1
-                model_counts[model] = mf["count"]
-            else:
-                failed_count += 1
+                    mf = model_files[model]
+                    mf["fh"].write(txt_line + '\n')
+                    mf["count"] += 1
+                    model_counts[model] = mf["count"]
+                else:
+                    failed_count += 1
+        pending_futures.clear()
 
-            processed = success_count + failed_count
-            if processed % 10000 == 0:
-                elapsed = (datetime.now() - start_time).total_seconds()
-                speed = processed / elapsed if elapsed > 0 else 0
-                print(f"[INFO] 进度: {processed}/{total_records}+, "
-                      f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
+    try:
+        with open(args.input, 'r', encoding='utf-8') as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
 
-    # 关闭所有文件句柄，完成 .incomplete → .json rename
+                total_records += 1
+                if args.limit > 0 and total_records > args.limit:
+                    break
+
+                current_batch.append((line_idx, line))
+                line_idx += 1
+
+                if len(current_batch) >= batch_size:
+                    future = pool.apply_async(_worker_process_batch, (current_batch,))
+                    pending_futures.append(future)
+                    current_batch = []
+
+                    # 每积累一定量 future 就 flush，避免内存无限增长
+                    # 同时保持流式写出
+                    if len(pending_futures) >= num_workers * 2:
+                        _flush_results()
+
+                        processed = success_count + failed_count
+                        if processed > 0 and processed % 10000 < batch_size:
+                            elapsed = (datetime.now() - start_time).total_seconds()
+                            speed = processed / elapsed if elapsed > 0 else 0
+                            print(f"[INFO] 进度: {processed}/{total_records}+, "
+                                  f"成功: {success_count}, 失败: {failed_count}, 速度: {speed:.0f} 条/秒")
+
+        # 提交最后一个不完整的 batch
+        if current_batch:
+            future = pool.apply_async(_worker_process_batch, (current_batch,))
+            pending_futures.append(future)
+
+        # flush 所有剩余结果
+        _flush_results()
+
+    finally:
+        pool.close()
+        pool.join()
+
+    # 关闭所有文件句柄，完成 .incomplete → .txt rename
     for model, mf in model_files.items():
-        mf["fh"].write('\n]')
         mf["fh"].close()
         os.rename(mf["incomplete"], mf["final"])
         output_files[model] = mf["final"]
@@ -438,15 +535,12 @@ def main():
     print(f"[INFO] 总记录: {total_records}, 成功: {success_count}, 失败: {failed_count}")
     print(f"[INFO] 模型数: {len(model_files)}")
     print(f"[INFO] 耗时: {elapsed:.1f} 秒")
+    print(f"[INFO] Workers: {num_workers}, Batch: {batch_size}")
 
     print(f"\n[INFO] ========== 模型分布 ==========")
     for model, count in sorted(model_stats.items(), key=lambda x: -x[1]):
         pct = count / success_count * 100 if success_count > 0 else 0
         print(f"  {model}: {count} 条 ({pct:.1f}%)")
-
-    print(f"\n[INFO] ========== Tokenizer 使用 ==========")
-    for tok, count in sorted(tokenizer_stats.items(), key=lambda x: -x[1]):
-        print(f"  {tok}: {count} 条")
 
     # 输出 JSON 汇总供上层脚本解析
     summary = {

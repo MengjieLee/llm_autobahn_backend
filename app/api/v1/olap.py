@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import glob
 import json
 import logging
@@ -6,6 +7,7 @@ import threading
 import uuid
 import os
 
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -30,16 +32,35 @@ KV_RESULTS_DIR = os.path.join(BASE_DIR, settings.OLAP_DATABASE_DIR)
 KV_DATA_DIR = os.path.join(KV_RESULTS_DIR, "data")
 KV_STATUS_DIR = os.path.join(KV_RESULTS_DIR, "status")
 SCRIPTS_DIR = os.path.join(BASE_DIR, settings.OLAP_SCRIPTS_DIR)
-MODELS_JSON = os.path.join(BASE_DIR, "app", "conf", "models.json")
+OLAP_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "olap_config.json")
 
-# Pipeline 参数
-DEFAULT_MODEL = settings.PIPELINE_DEFAULT_MODEL
-BLOCK_SIZE = settings.PIPELINE_BLOCK_SIZE
-CACHE_SIZE = settings.PIPELINE_CACHE_SIZE
-TOKENIZE_CONCURRENCY = settings.PIPELINE_TOKENIZE_CONCURRENCY
-FETCH_CONCURRENCY = settings.PIPELINE_FETCH_CONCURRENCY
-KV_WORKERS = settings.PIPELINE_KV_WORKERS
-QPD_LIMIT = settings.OLAP_QPD_LIMIT
+# OLAP 热配置默认值（JSON 读取失败时的兜底）
+_OLAP_DEFAULTS = {
+    "pipeline_default_model": "glm-5",
+    "pipeline_block_size": 16,
+    "pipeline_cache_size": 200000000,
+    "pipeline_tokenize_concurrency": 4,
+    "pipeline_fetch_concurrency": 12,
+    "pipeline_es_scroll_workers": 60,
+    "pipeline_tokenize_workers": 4,
+    "pipeline_tokenize_batch_size": 200,
+    "pipeline_default_path": "/v2/coding/chat/completions",
+    "olap_qpd_limit": 1,
+    "models": [],
+}
+
+
+def _load_olap_config() -> dict:
+    """热加载 OLAP 配置（每次读文件，修改即生效无需重启）"""
+    try:
+        with open(OLAP_CONFIG_JSON, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # 用默认值填充缺失字段
+        for k, v in _OLAP_DEFAULTS.items():
+            cfg.setdefault(k, v)
+        return cfg
+    except Exception:
+        return dict(_OLAP_DEFAULTS)
 
 # Per-task 写入锁，防止并发 read-modify-write 竞态
 _status_locks: Dict[str, asyncio.Lock] = {}
@@ -49,6 +70,13 @@ def _get_status_lock(task_id: str) -> asyncio.Lock:
     if task_id not in _status_locks:
         _status_locks[task_id] = asyncio.Lock()
     return _status_locks[task_id]
+
+
+def _cleanup_task_resources(task_id: str):
+    """Pipeline 结束后清理该 task 占用的内存资源"""
+    _status_locks.pop(task_id, None)
+    _running_tasks.pop(task_id, None)
+    gc.collect()
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -198,6 +226,9 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
         if status and status["pipeline"]["current_stage"] not in ("done", "failed"):
             await _set_failed(task_id, status["pipeline"]["current_stage"], str(e))
 
+    finally:
+        _cleanup_task_resources(task_id)
+
 
 async def _run_streaming_fetch_tokenize(
     task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
@@ -247,8 +278,9 @@ async def _run_streaming_fetch_tokenize(
     _cb_msg = [None]          # 最新的 _cb 消息（线程安全：单次赋值）
     _progress_dirty = [False] # 标记是否有新进度需要刷盘
 
-    fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-    tokenize_sem = asyncio.Semaphore(TOKENIZE_CONCURRENCY)
+    cfg = _load_olap_config()
+    fetch_sem = asyncio.Semaphore(cfg["pipeline_fetch_concurrency"])
+    tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
     tokenize_tasks = []  # 收集所有 tokenize 协程
 
     async def _update_fetch_progress():
@@ -354,6 +386,9 @@ async def _run_streaming_fetch_tokenize(
                 })
                 logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
                 await _update_fetch_progress()
+            finally:
+                # 关闭 ES 连接池，释放内存
+                es.close()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         """带信号量和进度追踪的 tokenize 单文件"""
@@ -383,6 +418,8 @@ async def _run_streaming_fetch_tokenize(
     finally:
         # 确保 flusher 在任何退出路径（完成/cancel/异常）下都被清理
         flusher_task.cancel()
+        # 释放已完成的 fetch Task 对象（持有协程栈帧、闭包引用）
+        fetch_tasks.clear()
 
     # ---- 更新 fetch 阶段最终状态 ----
     fetch_status = {
@@ -427,6 +464,8 @@ async def _run_streaming_fetch_tokenize(
 
     if tokenize_tasks:
         await asyncio.gather(*tokenize_tasks)
+        # 释放已完成的 tokenize Task 对象
+        tokenize_tasks.clear()
 
     # ---- 更新 tokenize 阶段最终状态 ----
     success_files = [r for r in tokenize_results if r["status"] == "completed"]
@@ -477,6 +516,12 @@ async def _run_streaming_fetch_tokenize(
         "files": tokenize_results
     })
 
+    # ---- 释放流水线中间数据，避免持续占用内存 ----
+    fetch_results.clear()
+    fetch_incomplete.clear()
+    tokenize_results.clear()
+    del success_files, failed_files
+
     if tokenize_total_lines[0] == 0:
         await _update_stage(task_id, "simulate", {"status": "skipped", "message": "序列化结果为空，跳过模拟"})
         status = _read_status(task_id)
@@ -496,7 +541,7 @@ async def _run_tokenize_single_file(
     input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int,
     models: list = None
 ) -> dict:
-    """对单个 jsonl 文件执行 tokenize + convert (per-model 分桶)，实时上报进度"""
+    """对单个 jsonl 文件执行 tokenize (per-model 分桶，直接输出 txt)，实时上报进度"""
     import re as _re
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     short_name = os.path.basename(input_file)
@@ -505,12 +550,14 @@ async def _run_tokenize_single_file(
     slice_output_dir = os.path.join(output_dir, base_name)
     os.makedirs(slice_output_dir, exist_ok=True)
 
+    cfg = _load_olap_config()
     cmd = [
         "python", "-u", os.path.join(SCRIPTS_DIR, "kv_pipeline.py"),
         "-i", input_file,
         "-o", slice_output_dir,
-        "-d", DEFAULT_MODEL,
-        "-w", str(KV_WORKERS),
+        "-d", cfg["pipeline_default_model"],
+        "--tokenize-workers", str(cfg["pipeline_tokenize_workers"]),
+        "--tokenize-batch-size", str(cfg["pipeline_tokenize_batch_size"]),
     ]
     if models:
         cmd.extend(["-m", ",".join(models)])
@@ -523,16 +570,15 @@ async def _run_tokenize_single_file(
     )
 
     # 逐行读取子进程 stdout，实时解析进度并更新 status
-    output_lines = []
+    output_tail = deque(maxlen=30)
     last_progress_update = 0  # 上次更新 status 的时间戳，节流 2s
     async for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").strip()
-        output_lines.append(line)
+        output_tail.append(line)
 
         # 解析 kv_pipeline.py / tokenize_script.py 的进度行
         # 格式: "[INFO] 进度: 10000/298+, 成功: 9800, 失败: 200, 速度: 1234 条/秒"
         # 或:   "  [INFO] 进度: ..."（带缩进，来自 kv_pipeline 转发）
-        # 或:   "Step 1/2" / "Step 2/2" 阶段切换
         now = asyncio.get_event_loop().time()
         if now - last_progress_update >= 2:
             progress_msg = None
@@ -543,10 +589,8 @@ async def _run_tokenize_single_file(
                 ok, fail = int(m.group(3)), int(m.group(4))
                 speed = m.group(5)
                 progress_msg = f"{short_name}: {done}/{total} 条 (成功 {ok}, 失败 {fail}, {speed} 条/秒)"
-            elif "Step 1/2" in line:
-                progress_msg = f"{short_name}: Step 1/2 序列化中..."
-            elif "Step 2/2" in line:
-                progress_msg = f"{short_name}: Step 2/2 格式转换中..."
+            elif "序列化" in line and base_name in line:
+                progress_msg = f"{short_name}: 序列化中..."
             elif "[INFO] 流式处理中" in line:
                 progress_msg = f"{short_name}: 流式序列化中..."
 
@@ -558,13 +602,13 @@ async def _run_tokenize_single_file(
                 })
 
     await proc.wait()
-    output_text = "\n".join(output_lines)
+    output_text = "\n".join(output_tail)
 
     if proc.returncode != 0:
         return {
             "file": short_name,
             "status": "failed",
-            "error": output_text[-300:],
+            "error": output_text[-500:],
             "outputs": {}
         }
 
@@ -680,12 +724,13 @@ async def _run_simulate_stage(task_id: str):
 
         report_file_final = os.path.join(model_report_dir, "cache_report.json")
 
+        cfg = _load_olap_config()
         cmd = [
             "python", "-u", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
             "-i", *sorted(txt_files),
             "-o", model_report_dir,
-            "-s", str(CACHE_SIZE),
-            "-b", str(BLOCK_SIZE)
+            "-s", str(cfg["pipeline_cache_size"]),
+            "-b", str(cfg["pipeline_block_size"])
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -695,12 +740,12 @@ async def _run_simulate_stage(task_id: str):
             cwd=BASE_DIR
         )
 
-        # 逐行读取 stdout，实时解析进度
-        output_lines = []
+        # 逐行读取 stdout，实时解析进度（仅保留尾部用于错误诊断）
+        output_tail = deque(maxlen=30)
         last_progress_update = 0
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
-            output_lines.append(line)
+            output_tail.append(line)
 
             now = asyncio.get_event_loop().time()
             if now - last_progress_update >= 2:
@@ -721,14 +766,14 @@ async def _run_simulate_stage(task_id: str):
                     })
 
         await proc.wait()
-        output_text = "\n".join(output_lines)
+        output_text = "\n".join(output_tail)
 
         if proc.returncode != 0:
             sim_done_count[0] += 1
             return {
                 "model": model,
                 "status": "failed",
-                "error": f"模拟失败 (rc={proc.returncode}): {output_text[-300:]}"
+                "error": f"模拟失败 (rc={proc.returncode}): {output_text[-500:]}"
             }
 
         # 读取报告（cache_pipeline.py 直接产出 cache_report.json）
@@ -774,6 +819,9 @@ async def _run_simulate_stage(task_id: str):
         for model, txt_files in model_outputs.items()
     ]
     sim_results = await asyncio.gather(*sim_tasks)
+    # 释放 simulate Task 和中间数据
+    sim_tasks.clear()
+    model_outputs.clear()
 
     # 汇总结果
     result = {}
@@ -849,20 +897,90 @@ def _is_official(user_info: dict) -> bool:
 
 
 def _load_model_list() -> list:
-    """热加载模型列表（每次读文件，修改即生效无需重启）"""
-    try:
-        with open(MODELS_JSON, "r", encoding="utf-8") as f:
-            return json.load(f).get("models", [])
-    except Exception:
-        return []
+    """热加载模型列表（从 olap_config.json 读取）"""
+    return _load_olap_config().get("models", [])
 
 
 # ============================================================
 # API 端点
 # ============================================================
+@router.get("/kv/file-tree", summary="获取任务数据目录树（懒加载）")
+async def kv_file_tree(
+    task_id: str = Query(..., description="任务 ID"),
+    path: str = Query(default="", description="相对于任务目录的子路径，空表示根目录"),
+):
+    """
+    懒加载目录树：前端每展开一层目录调用一次。
+    返回该层的子节点列表，每个节点包含 name/full_path/is_dir/is_leaf/meta。
+    """
+    status = _read_status(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task_dir = _task_dir(task_id)
+    if not os.path.isdir(task_dir):
+        raise HTTPException(status_code=404, detail="任务目录不存在")
+
+    # 拼接目标目录，防止路径穿越
+    if path:
+        target = os.path.normpath(os.path.join(task_dir, path))
+        if not target.startswith(task_dir):
+            raise HTTPException(status_code=400, detail="非法路径")
+    else:
+        target = task_dir
+
+    if not os.path.isdir(target):
+        return StandardResponse(code=0, message="success", data=[], trace_id=None)
+
+    children = []
+    try:
+        entries = sorted(os.listdir(target))
+    except OSError:
+        entries = []
+
+    for name in entries:
+        full = os.path.join(target, name)
+        rel = os.path.relpath(full, task_dir)
+        node = {
+            "name": name,
+            "full_path": full,
+            "rel_path": rel,
+            "is_dir": os.path.isdir(full),
+            "is_leaf": not os.path.isdir(full),
+        }
+        # 文件元信息
+        if not node["is_dir"]:
+            try:
+                size = os.path.getsize(full)
+                node["size"] = size
+                node["size_label"] = (
+                    f"{size / 1024 / 1024:.1f} MB" if size >= 1024 * 1024
+                    else f"{size / 1024:.1f} KB" if size >= 1024
+                    else f"{size} B"
+                )
+            except OSError:
+                node["size"] = 0
+                node["size_label"] = ""
+        children.append(node)
+
+    # 根目录请求时返回根信息
+    root_info = None
+    if not path:
+        root_info = {
+            "root_path": task_dir,
+            "root_name": os.path.basename(task_dir),
+        }
+
+    return StandardResponse(
+        code=0, message="success",
+        data={"root": root_info, "children": children},
+        trace_id=None,
+    )
+
+
 @router.get("/kv/models", summary="获取可用模型列表（热加载）")
 async def kv_models():
-    """读取 app/conf/models.json，修改文件即时生效，无需重启服务"""
+    """读取 olap_config.json 中的 models 列表，修改文件即时生效，无需重启服务"""
     models = _load_model_list()
     return StandardResponse(code=0, message="success", data=models, trace_id=None)
 
@@ -874,14 +992,15 @@ async def kv_qpd(request: Request):
     username = user_info.get("username", "unknown")
     official = _is_official(user_info)
     used = _count_user_today(username)
+    qpd_limit = _load_olap_config()["olap_qpd_limit"]
     return StandardResponse(
         code=0, message="success",
         data={
             "username": username,
             "used": used,
-            "limit": QPD_LIMIT,
+            "limit": qpd_limit,
             "is_official": official,
-            "remaining": max(0, QPD_LIMIT - used) if not official else -1,
+            "remaining": max(0, qpd_limit - used) if not official else -1,
         },
         trace_id=None,
     )
@@ -959,8 +1078,8 @@ async def es_fetch(
         description="任务名称",
     ),
     path: Optional[str] = Query(
-        default=settings.PIPELINE_DEFAULT_PATH,
-        description="场景过滤路径，非空添加 match_phrase 过滤，空字符串则不过滤",
+        default=None,
+        description="场景过滤路径，非空添加 match_phrase 过滤，为空则使用配置默认值",
     ),
     scheduled_at: Optional[str] = Query(
         default=None,
@@ -976,18 +1095,25 @@ async def es_fetch(
     立即返回任务 ID，后台异步执行。
     """
     log_usage("es_fetch", scenario="OLAP")
+    cfg = _load_olap_config()
+
+    # path 默认值（热加载）
+    if path is None:
+        path = cfg["pipeline_default_path"]
+
     # 从中间件获取用户信息
     user_info = getattr(request.state, "user", {}) or {}
     username = user_info.get("username", "unknown")
     user_name = user_info.get("name", "未知用户")
 
     # QPD 限额检查（非 official 用户）
+    qpd_limit = cfg["olap_qpd_limit"]
     if not _is_official(user_info):
         used = _count_user_today(username)
-        if used >= QPD_LIMIT:
+        if used >= qpd_limit:
             raise HTTPException(
                 status_code=429,
-                detail=f"今日配额已用完（{used}/{QPD_LIMIT}），official 身份用户无此限制"
+                detail=f"今日配额已用完（{used}/{qpd_limit}），official 身份用户无此限制"
             )
 
     try:
@@ -1051,9 +1177,9 @@ async def es_fetch(
             "stages": {}
         },
         "config": {
-            "default_model": DEFAULT_MODEL,
-            "block_size": BLOCK_SIZE,
-            "cache_size": CACHE_SIZE
+            "default_model": cfg["pipeline_default_model"],
+            "block_size": cfg["pipeline_block_size"],
+            "cache_size": cfg["pipeline_cache_size"]
         },
         "result": None,
         "is_deleted": False,
