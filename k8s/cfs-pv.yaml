@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cfs-olap-pipeline
+spec:
+  capacity:
+    storage: 10000000Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  nfs:
+    path: /
+    server: cfs-K9oT8z5hg7.lb-393afb5e.cfs.bj.baidubce.com
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+    - nordirplus
+  storageClassName: ""
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cfs-olap
+  namespace: cache-hit-rate-tokenizer
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 10000000Gi
+  volumeName: cfs-olap-pipeline

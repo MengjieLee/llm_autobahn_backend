@@ -1,7 +1,7 @@
 ARG TARGET_PLATFORM=linux/amd64
 
 # ============================================================
-# 构建阶段：安装编译依赖 + Python 包
+# 构建阶段：安装编译依赖 + Python 包 + C++ 二进制
 # ============================================================
 FROM --platform=${TARGET_PLATFORM} python:3.12-slim AS builder
 
@@ -10,11 +10,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /build
 
-# 安装编译依赖（仅构建阶段需要）
+# 安装编译依赖（Python 扩展 + C++ cache_calc）
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
+    make \
     pkg-config \
     libmariadb-dev \
   && rm -rf /var/lib/apt/lists/*
@@ -25,6 +26,10 @@ COPY requirements.txt .
 RUN python -m venv /opt/venv \
   && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# 编译 cache_calc C++ 二进制（simulate 阶段依赖）
+COPY src/domains/kv/cache_hit_rate/ /build/cache_hit_rate/
+RUN cd /build/cache_hit_rate && make clean && make
 
 # ============================================================
 # 运行阶段：精简镜像
@@ -52,6 +57,10 @@ COPY --from=builder /opt/venv /opt/venv
 COPY src/ /workspace/src/
 COPY scripts/ /workspace/scripts/
 COPY context/ /workspace/context/
+COPY k8s/ /workspace/k8s/
+
+# 从构建阶段复制编译好的 cache_calc 二进制
+COPY --from=builder /build/cache_hit_rate/cache_calc /workspace/src/domains/kv/cache_hit_rate/cache_calc
 
 # 再拷贝频繁变动的应用代码
 COPY app/ /workspace/app/

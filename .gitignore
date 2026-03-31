@@ -221,3 +221,5 @@ local_workspace
 src/domains/kv/cache_hit_rate/cache_calc
 # 大体积 tokenizer 词表文件
 src/domains/kv/cache_hit_rate/tokenizer_*.json
+app/conf/kube.config
+docs

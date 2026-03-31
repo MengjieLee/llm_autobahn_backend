@@ -24,12 +24,17 @@ env/
 
 # 构建产物
 dist/
-build/
 *.egg-info/
+src/domains/kv/cache_hit_rate/build/
+src/domains/kv/cache_hit_rate/cache_calc
 
 # 敏感文件
 .env
 credentials.txt
+app/conf/kube.config
+
+# 文档（不打入镜像）
+docs/
 
 # 运行时数据（不应打入镜像）
 olap_database/
