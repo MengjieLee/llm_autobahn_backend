@@ -392,13 +392,10 @@ async def _run_streaming_fetch_tokenize(
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         """带信号量和进度追踪的 tokenize 单文件"""
-        # 读取用户选择的模型过滤列表
-        _status = _read_status(tid)
-        _selected = _status.get("query", {}).get("models", []) if _status else []
         async with tokenize_sem:
             await _update_tokenize_progress()
             result = await _run_tokenize_single_file(
-                input_file, out_dir, tid, 0, 0, models=_selected
+                input_file, out_dir, tid, 0, 0
             )
             tokenize_results.append(result)
             tokenize_done_count[0] += 1
@@ -487,6 +484,46 @@ async def _run_streaming_fetch_tokenize(
         if skipped_models:
             logger.info(f"[tokenize] 按模型过滤: 保留 {list(model_txt_files.keys())}，跳过 {skipped_models}")
 
+    # 选定模型在数据中不存在：序列化成功但过滤后无匹配模型
+    if success_files and selected_models and not model_txt_files:
+        msg = (
+            f"序列化完成，但所选模型 {selected_models} 在数据中未检测到。"
+            f"实际检测到的模型: {all_detected_models}"
+        )
+        logger.warning(f"[tokenize] {msg}")
+        await _update_stage(task_id, "tokenize", {
+            "status": "completed",
+            "message": msg,
+            "model_outputs": {},
+            "total_lines": 0,
+            "success_count": len(success_files),
+            "failed_count": len(failed_files),
+            "models": [],
+            "all_detected_models": all_detected_models,
+            "files": tokenize_results
+        })
+        await _update_stage(task_id, "simulate", {"status": "skipped", "message": "所选模型未匹配，跳过模拟"})
+        # 为每个选定模型返回 0 结果
+        zero_result = {}
+        for m in selected_models:
+            zero_result[m] = {
+                "hit_rate": 0, "hit_rate_percent": 0,
+                "hit_count": 0, "total_queries": 0,
+                "total_tokens": 0, "total_entries": 0,
+                "input_files_count": 0
+            }
+        zero_result["all_detected_models"] = all_detected_models
+        zero_result["message"] = msg
+        status = _read_status(task_id)
+        if status:
+            status["pipeline"]["current_stage"] = "done"
+            status["result"] = zero_result
+            _write_status(status)
+        fetch_results.clear()
+        fetch_incomplete.clear()
+        tokenize_results.clear()
+        raise RuntimeError(f"Selected models {selected_models} not found in data, detected: {all_detected_models}")
+
     if not success_files:
         await _update_stage(task_id, "tokenize", {
             "status": "failed",
@@ -539,7 +576,6 @@ async def _run_streaming_fetch_tokenize(
 
 async def _run_tokenize_single_file(
     input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int,
-    models: list = None
 ) -> dict:
     """对单个 jsonl 文件执行 tokenize (per-model 分桶，直接输出 txt)，实时上报进度"""
     import re as _re
@@ -559,8 +595,9 @@ async def _run_tokenize_single_file(
         "--tokenize-workers", str(cfg["pipeline_tokenize_workers"]),
         "--tokenize-batch-size", str(cfg["pipeline_tokenize_batch_size"]),
     ]
-    if models:
-        cmd.extend(["-m", ",".join(models)])
+    # 注意：不再向 kv_pipeline.py 传递 -m 模型过滤参数
+    # 让子进程产出所有模型的 txt 文件，模型过滤统一在聚合层完成
+    # 这样即使用户选择的模型在数据中不存在，也能正确报告实际检测到的模型
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

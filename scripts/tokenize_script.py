@@ -97,8 +97,8 @@ class TokenizerManager:
     def __init__(self):
         self._cache = {}
 
-    def get_tokenizer_config(self, model_name: str) -> str:
-        """根据模型名获取 tokenizer 配置"""
+    def get_tokenizer_config(self, model_name: str) -> Optional[str]:
+        """根据模型名获取 tokenizer 配置，无匹配返回 None"""
         if model_name in MODEL_TOKENIZER_MAPPING:
             return MODEL_TOKENIZER_MAPPING[model_name]
 
@@ -107,11 +107,13 @@ class TokenizerManager:
             if key != "_default" and model_lower.startswith(key.lower()):
                 return value
 
-        return MODEL_TOKENIZER_MAPPING["_default"]
+        return None
 
     def get_tokenizer(self, model_name: str):
-        """获取或创建 tokenizer (带缓存)"""
+        """获取或创建 tokenizer (带缓存)，无匹配返回 (None, None)"""
         config = self.get_tokenizer_config(model_name)
+        if config is None:
+            return None, None
 
         if config in self._cache:
             return self._cache[config], config
@@ -242,8 +244,7 @@ def convert_record(
     模型选择优先级：
     1. override_tokenizer (命令行参数强制指定)
     2. @raw 中的 qianfan_model 值
-    3. body 中的 model 字段
-    4. default_model 默认模型
+    无匹配的模型跳过（返回 None），不再兜底到 default_model
     """
     try:
         source = record.get("_source", {})
@@ -278,7 +279,7 @@ def convert_record(
 
         tools = body.get("tools") or None
 
-        # 提取模型名，优先级: override > qianfan_model > body.model > default
+        # 提取模型名，优先级: override > qianfan_model
         qianfan_model = extract_qianfan_model(raw_str)
         body_model = body.get("model", "")
 
@@ -286,13 +287,28 @@ def convert_record(
             model_for_tokenizer = override_tokenizer
         elif qianfan_model:
             model_for_tokenizer = qianfan_model
-        elif body_model:
-            model_for_tokenizer = body_model
         else:
-            model_for_tokenizer = default_model
+            # 无法确定模型，跳过
+            if verbose:
+                print(f"[WARN] 无法确定模型 (qianfan_model 为空): as_id={as_id}")
+            return None
 
-        # 获取对应的 tokenizer
+        # 获取对应的 tokenizer，无匹配则 input_ids 为空（命中率计为 0）
         tokenizer, tokenizer_config = tokenizer_manager.get_tokenizer(model_for_tokenizer)
+        if tokenizer is None:
+            return {
+                "as_id": as_id,
+                "timestamp": timestamp,
+                "qianfan_model": qianfan_model,
+                "body_model": body_model,
+                "model_used": model_for_tokenizer,
+                "tokenizer_used": None,
+                "has_tools": False,
+                "tools_count": 0,
+                "messages_count": len(valid_messages),
+                "input_ids": [],
+                "input_ids_length": 0,
+            }
 
         # 应用 chat_template
         input_ids = apply_chat_template(tokenizer, valid_messages, tools)
