@@ -57,10 +57,13 @@ def _process_file_with_pool(
     file_prefix: str,
     batch_size: int,
     verbose: bool,
+    model_filter: set = None,
 ) -> dict:
     """
     用已有的 Pool 对单个文件执行 tokenize，返回 summary dict。
     复用 tokenize_script.py 的 batch 处理逻辑，但不重启 Pool。
+
+    model_filter: 非空时只写入指定 model 的 input_ids，其余记录直接丢弃（不写盘）。
     """
     import glob as _glob
 
@@ -86,6 +89,10 @@ def _process_file_with_pool(
             batch_results = future.get()
             for _, model, txt_line in batch_results:
                 if model is not None:
+                    # model_filter 非空时跳过不在列表里的 model
+                    if model_filter and model not in model_filter:
+                        failed_count += 1  # 计入跳过，不写盘
+                        continue
                     success_count += 1
                     if model not in model_files:
                         final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.txt")
@@ -208,6 +215,7 @@ def main():
                 file_prefix = msg.get("file_prefix", "")
                 t_batch_size = msg.get("batch_size", batch_size)
                 t_verbose = msg.get("verbose", args.verbose)
+                t_model_filter = set(msg["model_filter"]) if msg.get("model_filter") else None
 
                 try:
                     summary = _process_file_with_pool(
@@ -217,6 +225,7 @@ def main():
                         file_prefix=file_prefix,
                         batch_size=t_batch_size,
                         verbose=t_verbose,
+                        model_filter=t_model_filter,
                     )
                     _write_msg({
                         "type": "result",

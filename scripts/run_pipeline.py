@@ -512,12 +512,21 @@ async def _run_tokenize_via_daemon(
 
     cfg = _load_olap_config()
 
+    # 读取用户指定的模型过滤列表，透传给 daemon，只写入目标 model 的文件
+    # 用户未指定时，回退到 olap_config.json 的 models 作为默认白名单，
+    # 列表外的模型 tokenizer 未知，跳过以避免乱算浪费时间和磁盘
+    status = _read_status(task_id)
+    selected_models = status.get("query", {}).get("models", []) if status else []
+    if not selected_models:
+        selected_models = cfg.get("models", [])
+
     def _submit_and_wait():
         dt_id = daemon.submit(
             input_file=input_file,
             output_dir=slice_output_dir,
             file_prefix=base_name,
             batch_size=cfg["pipeline_tokenize_batch_size"],
+            model_filter=selected_models if selected_models else None,
         )
         return daemon.wait(dt_id, timeout=7200.0)
 

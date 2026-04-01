@@ -36,7 +36,6 @@ MODEL_TOKENIZER_MAPPING = {
     "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
     "glm-4.7": "zai-org/GLM-4.7",
     "minimax-m2.1": "MiniMaxAI/MiniMax-M2.1",
-    "_default": "zai-org/GLM-5",
 }
 
 
@@ -104,7 +103,7 @@ class TokenizerManager:
 
         model_lower = model_name.lower()
         for key, value in MODEL_TOKENIZER_MAPPING.items():
-            if key != "_default" and model_lower.startswith(key.lower()):
+            if model_lower.startswith(key.lower()):
                 return value
 
         return None
@@ -293,22 +292,12 @@ def convert_record(
                 print(f"[WARN] 无法确定模型 (qianfan_model 为空): as_id={as_id}")
             return None
 
-        # 获取对应的 tokenizer，无匹配则 input_ids 为空（命中率计为 0）
+        # 获取对应的 tokenizer，无匹配则跳过（不写入空 input_ids，结果不准）
         tokenizer, tokenizer_config = tokenizer_manager.get_tokenizer(model_for_tokenizer)
         if tokenizer is None:
-            return {
-                "as_id": as_id,
-                "timestamp": timestamp,
-                "qianfan_model": qianfan_model,
-                "body_model": body_model,
-                "model_used": model_for_tokenizer,
-                "tokenizer_used": None,
-                "has_tools": False,
-                "tools_count": 0,
-                "messages_count": len(valid_messages),
-                "input_ids": [],
-                "input_ids_length": 0,
-            }
+            if verbose:
+                print(f"[WARN] 无匹配 tokenizer，跳过: model={model_for_tokenizer}, as_id={as_id}")
+            return None
 
         # 应用 chat_template
         input_ids = apply_chat_template(tokenizer, valid_messages, tools)

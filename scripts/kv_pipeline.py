@@ -152,6 +152,7 @@ class TokenizeDaemonClient:
         file_prefix: str = "",
         batch_size: Optional[int] = None,
         verbose: Optional[bool] = None,
+        model_filter: Optional[list] = None,
     ) -> str:
         """提交一个 tokenize 任务，返回 task_id（异步，不等待结果）"""
         with self._lock:
@@ -166,6 +167,7 @@ class TokenizeDaemonClient:
             "file_prefix": file_prefix,
             "batch_size": batch_size if batch_size is not None else self._batch_size,
             "verbose": verbose if verbose is not None else self._verbose,
+            "model_filter": model_filter or [],
         })
         return task_id
 
