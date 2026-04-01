@@ -1,0 +1,84 @@
+# OLAP Pipeline K8s Job 模板 — 热更新配置
+# 修改此文件后无需重启 FastAPI，下次创建 Job 时自动生效
+#
+# 支持变量替换（由 k8s_client.py 在运行时填充）:
+#   ${JOB_NAME}        — pipeline-{task_id}
+#   ${NAMESPACE}        — olap_config.json 中的 namespace
+#   ${IMAGE}            — olap_config.json 中的 k8s_image
+#   ${TASK_ID}          — 任务 ID
+#   ${COMMAND}          — 由 k8s_client.py 根据参数动态生成
+#   ${MOUNT_PATH}       — olap_config.json 中的 k8s_cfs_mount_path
+#   ${WORKING_DIR}      — olap_config.json 中的 k8s_working_dir
+#   ${HOST_PATH}        — olap_config.json 中的 k8s_cfs_host_path
+#   ${CPU_REQUEST}      — olap_config.json 中的 k8s_job_cpu_request
+#   ${CPU_LIMIT}        — olap_config.json 中的 k8s_job_cpu_limit
+#   ${MEMORY_REQUEST}   — olap_config.json 中的 k8s_job_memory_request
+#   ${MEMORY_LIMIT}     — olap_config.json 中的 k8s_job_memory_limit
+#   ${TTL_SECONDS}      — olap_config.json 中的 k8s_job_ttl_seconds
+#   ${ENV_VARS}         — 由 k8s_client.py 动态注入的环境变量列表
+#
+# 以下字段可直接在 YAML 中修改（不受变量替换影响）:
+#   - restartPolicy, backoffLimit, activeDeadlineSeconds
+#   - imagePullSecrets, nodeSelector, tolerations, affinity
+#   - 额外 volumes / volumeMounts
+#   - Pod annotations / labels
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: olap-pipeline
+    task-id: ${TASK_ID}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: ${TTL_SECONDS}
+  activeDeadlineSeconds: 43200  # 12h 超时
+  template:
+    metadata:
+      labels:
+        app: olap-pipeline
+        task-id: ${TASK_ID}
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ccr-registry
+      # --- 可选调度策略（取消注释启用） ---
+      # nodeSelector:
+      #   node-type: compute
+      # tolerations:
+      #   - key: "dedicated"
+      #     operator: "Equal"
+      #     value: "olap"
+      #     effect: "NoSchedule"
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #         - matchExpressions:
+      #             - key: kubernetes.io/hostname
+      #               operator: In
+      #               values:
+      #                 - node-1
+      containers:
+        - name: pipeline
+          image: ${IMAGE}
+          command: ${COMMAND}
+          workingDir: /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend
+          env: ${ENV_VARS}
+          resources:
+            requests:
+              cpu: "${CPU_REQUEST}"
+              memory: "${MEMORY_REQUEST}"
+            limits:
+              cpu: "${CPU_LIMIT}"
+              memory: "${MEMORY_LIMIT}"
+          volumeMounts:
+            - name: cfs-workdir
+              mountPath: ${MOUNT_PATH}
+      volumes:
+        - name: cfs-workdir
+          hostPath:
+            path: ${HOST_PATH}
+            type: Directory

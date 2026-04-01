@@ -222,4 +222,5 @@ src/domains/kv/cache_hit_rate/cache_calc
 # 大体积 tokenizer 词表文件
 src/domains/kv/cache_hit_rate/tokenizer_*.json
 app/conf/kube.config
+app/conf/inner_cluster.kubeconfig
 docs

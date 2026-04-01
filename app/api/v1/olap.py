@@ -16,6 +16,7 @@ from app.core.api_schema import StandardResponse
 from app.conf.config import settings
 from app.core.request_context import log_usage
 from src.domains.kv.svc import ESIndexService
+from app.core import k8s_client
 
 
 # ============================================================
@@ -33,6 +34,7 @@ KV_DATA_DIR = os.path.join(KV_RESULTS_DIR, "data")
 KV_STATUS_DIR = os.path.join(KV_RESULTS_DIR, "status")
 SCRIPTS_DIR = os.path.join(BASE_DIR, settings.OLAP_SCRIPTS_DIR)
 OLAP_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "olap_config.json")
+KUBECONFIG_PATH = os.path.join(BASE_DIR, "app", "conf", "inner_cluster.kubeconfig")
 
 # OLAP 热配置默认值（JSON 读取失败时的兜底）
 _OLAP_DEFAULTS = {
@@ -1224,9 +1226,35 @@ async def es_fetch(
     }
     _write_status(status_data)
 
-    task = asyncio.create_task(_run_pipeline(task_id, start_datetime, end_datetime, app_id, path or "", scheduled_at or ""))
-    _running_tasks[task_id] = task
-    task.add_done_callback(lambda t: _running_tasks.pop(task_id, None))
+    # ---- 启动 pipeline ----
+    k8s_enabled = cfg.get("k8s_enabled", True)
+
+    if k8s_enabled:
+        # K8s Job 模式：pipeline 在独立 Pod 中运行
+        try:
+            job_name = k8s_client.create_pipeline_job(
+                kubeconfig_path=KUBECONFIG_PATH,
+                olap_config=cfg,
+                task_id=task_id,
+                username=username,
+                start_datetime=start_datetime,
+                end_datetime=end_datetime,
+                app_id=app_id,
+                path=path or "",
+                models=models or "",
+            )
+            logger.info(f"[k8s] Pipeline Job created: {job_name} for task {task_id}")
+        except Exception as e:
+            logger.exception(f"[k8s] Failed to create Job for task {task_id}")
+            await _set_failed(task_id, "fetch", f"K8s Job 创建失败: {str(e)[:200]}")
+            raise HTTPException(status_code=500, detail=f"K8s Job 创建失败: {str(e)[:200]}")
+    else:
+        # 本地模式：asyncio 后台任务（回滚兼容）
+        task = asyncio.create_task(
+            _run_pipeline(task_id, start_datetime, end_datetime, app_id, path or "", scheduled_at or "")
+        )
+        _running_tasks[task_id] = task
+        task.add_done_callback(lambda t: _running_tasks.pop(task_id, None))
 
     return StandardResponse(
         code=0,
@@ -1260,7 +1288,17 @@ async def delete_task(task_id: str):
 
     cur_stage = status["pipeline"].get("current_stage", "")
 
-    # 运行中的任务 → 取消 asyncio.Task
+    cfg = _load_olap_config()
+    k8s_enabled = cfg.get("k8s_enabled", True)
+
+    # K8s 模式：删除 Job（级联删除 Pod，pipeline 进程被 kill）
+    if k8s_enabled:
+        try:
+            k8s_client.delete_pipeline_job(KUBECONFIG_PATH, cfg, task_id)
+        except Exception as e:
+            logger.warning(f"[k8s] Failed to delete Job for {task_id}: {e}")
+
+    # 运行中的任务 → 取消 asyncio.Task（本地模式）
     if cur_stage not in ("done", "failed", "cancelled"):
         running_task = _running_tasks.get(task_id)
         if running_task and not running_task.done():

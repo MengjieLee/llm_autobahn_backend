@@ -57,7 +57,6 @@ COPY --from=builder /opt/venv /opt/venv
 COPY src/ /workspace/src/
 COPY scripts/ /workspace/scripts/
 COPY context/ /workspace/context/
-COPY k8s/ /workspace/k8s/
 
 # 从构建阶段复制编译好的 cache_calc 二进制
 COPY --from=builder /build/cache_hit_rate/cache_calc /workspace/src/domains/kv/cache_hit_rate/cache_calc

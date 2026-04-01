@@ -3,10 +3,10 @@
   "pipeline_block_size": 16,
   "pipeline_cache_size": 200000000,
   "pipeline_tokenize_concurrency": 4,
-  "pipeline_fetch_concurrency": 12,
+  "pipeline_fetch_concurrency": 6,
   "pipeline_es_scroll_workers": 60,
   "pipeline_tokenize_workers": 4,
-  "pipeline_tokenize_batch_size": 200,
+  "pipeline_tokenize_batch_size": 40,
   "pipeline_default_path": "/v2/coding/chat/completions",
   "olap_qpd_limit": 10,
   "models": [
@@ -17,5 +17,15 @@
     "minimax-m2.5",
     "minimax-m2.1"
   ],
-  "namespace": "cache-hit-rate-tokenizer"
+  "namespace": "cache-hit-rate-tokenizer",
+  "k8s_enabled": true,
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.3",
+  "k8s_job_cpu_request": "28",
+  "k8s_job_cpu_limit": "28",
+  "k8s_job_memory_request": "110Gi",
+  "k8s_job_memory_limit": "110Gi",
+  "k8s_job_ttl_seconds": 43200,
+  "k8s_cfs_host_path": "/mnt/cfs_bj_mt",
+  "k8s_cfs_mount_path": "/mnt/cfs_bj_mt",
+  "k8s_working_dir": "/mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend"
 }
