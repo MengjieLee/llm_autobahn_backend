@@ -212,7 +212,22 @@ async def _run_streaming_fetch_tokenize(
     cfg = _load_olap_config()
     fetch_sem = asyncio.Semaphore(cfg["pipeline_fetch_concurrency"])
     tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
+    tokenize_queue_limit = cfg.get("pipeline_tokenize_queue_limit", 4)
+    tokenize_queue_sem = asyncio.Semaphore(tokenize_queue_limit)
     tokenize_tasks = []
+
+    # 启动共享 tokenize daemon —— 整个 pipeline 生命周期内 tokenizer 只加载一次
+    if SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, SCRIPTS_DIR)
+    from kv_pipeline import TokenizeDaemonClient  # noqa: E402
+    tokenize_daemon = TokenizeDaemonClient(
+        workers=cfg["pipeline_tokenize_workers"],
+        batch_size=cfg["pipeline_tokenize_batch_size"],
+        default_model=cfg["pipeline_default_model"],
+    )
+    logger.info(f"[daemon] 启动共享 tokenize daemon (workers={cfg['pipeline_tokenize_workers']})...")
+    tokenize_daemon.start(timeout=300.0)
+    logger.info("[daemon] 就绪，所有切片共享同一批 worker")
 
     def _update_fetch_progress():
         msg_parts = [f"拉取进度 {fetch_done_count[0]}/{total_slices}，已获取 {fetch_total_count[0]} 条"]
@@ -312,15 +327,16 @@ async def _run_streaming_fetch_tokenize(
                 es.close()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
-        async with tokenize_sem:
-            _update_tokenize_progress()
-            result = await _run_tokenize_single_file(input_file, out_dir, tid, 0, 0)
-            tokenize_results.append(result)
-            tokenize_done_count[0] += 1
-            if result["status"] == "completed":
-                tokenize_total_lines[0] += result.get("lines", 0)
-                tokenize_total_seconds[0] += result.get("duration_seconds", 0.0)
-            _update_tokenize_progress()
+        async with tokenize_queue_sem:
+            async with tokenize_sem:
+                _update_tokenize_progress()
+                result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, out_dir, tid)
+                tokenize_results.append(result)
+                tokenize_done_count[0] += 1
+                if result["status"] == "completed":
+                    tokenize_total_lines[0] += result.get("lines", 0)
+                    tokenize_total_seconds[0] += result.get("duration_seconds", 0.0)
+                _update_tokenize_progress()
 
     # 启动所有 fetch（并行，受信号量控制）
     fetch_tasks_list = [
@@ -366,6 +382,7 @@ async def _run_streaming_fetch_tokenize(
                 status["result"]["incomplete_count"] = len(fetch_incomplete)
                 status["result"]["incomplete_files"] = fetch_incomplete
             _write_status(status)
+        tokenize_daemon.stop()
         return  # 不抛异常，正常结束
 
     # 等待所有 tokenize
@@ -375,8 +392,15 @@ async def _run_streaming_fetch_tokenize(
     }, "tokenize")
 
     if tokenize_tasks:
-        await asyncio.gather(*tokenize_tasks)
-        tokenize_tasks.clear()
+        try:
+            await asyncio.gather(*tokenize_tasks)
+        finally:
+            tokenize_tasks.clear()
+            try:
+                tokenize_daemon.stop()
+                logger.info("[daemon] 已关闭")
+            except Exception:
+                pass
 
     # tokenize 最终状态
     success_files = [r for r in tokenize_results if r["status"] == "completed"]
@@ -470,6 +494,68 @@ async def _run_streaming_fetch_tokenize(
         return
 
 
+async def _run_tokenize_via_daemon(
+    daemon,
+    input_file: str,
+    output_dir: str,
+    task_id: str,
+) -> dict:
+    """
+    通过共享 daemon 对单个文件执行 tokenize。
+    tokenizer 只在 daemon 启动时加载一次，所有切片复用同一批 worker。
+    由于 daemon.wait() 是阻塞调用，用 run_in_executor 避免阻塞事件循环。
+    """
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    short_name = os.path.basename(input_file)
+    slice_output_dir = os.path.join(output_dir, base_name)
+    os.makedirs(slice_output_dir, exist_ok=True)
+
+    cfg = _load_olap_config()
+
+    def _submit_and_wait():
+        dt_id = daemon.submit(
+            input_file=input_file,
+            output_dir=slice_output_dir,
+            file_prefix=base_name,
+            batch_size=cfg["pipeline_tokenize_batch_size"],
+        )
+        return daemon.wait(dt_id, timeout=7200.0)
+
+    try:
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(None, _submit_and_wait)
+    except Exception as e:
+        logger.warning(f"[daemon] {short_name} 失败: {e}")
+        return {"file": short_name, "status": "failed", "error": str(e), "outputs": {}}
+
+    if summary.get("status") != "completed":
+        err = summary.get("error", "daemon tokenize failed")
+        logger.warning(f"[daemon] {short_name} 返回 failed: {err[:200]}")
+        return {"file": short_name, "status": "failed", "error": err[:500], "outputs": {}}
+
+    # 将 daemon 返回格式转换为 _run_tokenize_single_file 的格式
+    model_outputs = {}
+    total_lines = 0
+    for model, info in summary.get("models", {}).items():
+        txt_file = info.get("file", "")
+        count = info.get("count", 0)
+        if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
+            model_outputs[model] = txt_file
+            total_lines += count
+
+    if not model_outputs:
+        return {"file": short_name, "status": "failed", "error": "daemon 无有效输出", "outputs": {}}
+
+    return {
+        "file": short_name,
+        "status": "completed",
+        "outputs": model_outputs,
+        "lines": total_lines,
+        "duration_seconds": summary.get("duration_seconds", 0.0),
+        "error": None,
+    }
+
+
 async def _run_tokenize_single_file(
     input_file: str, output_dir: str, task_id: str, file_index: int, total_files: int,
 ) -> dict:
@@ -484,8 +570,11 @@ async def _run_tokenize_single_file(
         "-i", input_file,
         "-o", slice_output_dir,
         "-d", cfg["pipeline_default_model"],
-        "--tokenize-workers", str(cfg["pipeline_tokenize_workers"]),
+        "-w", str(cfg["pipeline_tokenize_workers"]),
         "--tokenize-batch-size", str(cfg["pipeline_tokenize_batch_size"]),
+        # daemon 模式由 kv_pipeline.py 默认开启（tokenizer 常驻复用），
+        # 如需回退旧模式可在 olap_config.json 中添加 "pipeline_tokenize_no_daemon": true
+        *( ["--no-daemon"] if cfg.get("pipeline_tokenize_no_daemon") else [] ),
     ]
 
     proc = await asyncio.create_subprocess_exec(

@@ -23,7 +23,7 @@ from datetime import datetime
 
 # HuggingFace Token 从环境变量读取（在 .env 中配置 HF_TOKEN）
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 # ============================================================
@@ -370,7 +370,7 @@ def _worker_process_batch(batch):
         )
         if result:
             model = result["model_used"]
-            ids_str = ", ".join(str(tid) for tid in result["input_ids"])
+            ids_str = " ".join(map(str, result["input_ids"]))
             txt_line = f"'input_ids': [{ids_str}]"
             results.append((line_idx, model, txt_line))
         else:
@@ -423,8 +423,9 @@ def main():
         file_prefix = os.path.splitext(os.path.basename(args.input))[0]
 
     # worker 数量
-    num_workers = args.workers if args.workers > 0 else max(1, min(cpu_count() - 1, 8))
+    num_workers = args.workers if args.workers > 0 else max(1, min(cpu_count() - 1, 4))
     batch_size = args.batch_size
+    max_pending_batches = num_workers * 2
 
     print(f"[INFO] 开始处理...")
     print(f"[INFO] 输入文件: {args.input}")
@@ -514,9 +515,7 @@ def main():
                     pending_futures.append(future)
                     current_batch = []
 
-                    # 每积累一定量 future 就 flush，避免内存无限增长
-                    # 同时保持流式写出
-                    if len(pending_futures) >= num_workers * 2:
+                    if len(pending_futures) >= max_pending_batches:
                         _flush_results()
 
                         processed = success_count + failed_count

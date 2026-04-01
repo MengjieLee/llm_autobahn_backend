@@ -1162,8 +1162,6 @@ async def es_fetch(
         raise HTTPException(status_code=400, detail="时间格式错误，请使用 YYYY-MM-DD HH:MM:SS")
     if start_dt >= end_dt:
         raise HTTPException(status_code=400, detail="开始时间必须早于结束时间")
-    if not path and not app_id:
-        raise HTTPException(status_code=400, detail="全部场景下必须指定 App ID")
 
     now_bjt = datetime.now(BJT).replace(tzinfo=None)
     if scheduled_at:
@@ -1269,6 +1267,43 @@ async def es_fetch_status(task_id: str):
     status = _read_status(task_id)
     if not status:
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+
+    # K8s 模式：交叉校验 Job 状态，处理 OOM / Pending 等 status.json 无法自行更新的场景
+    cfg = _load_olap_config()
+    cur_stage = status["pipeline"].get("current_stage", "")
+    if cfg.get("k8s_enabled") and cur_stage not in ("done", "failed", "cancelled"):
+        try:
+            job_status = k8s_client.get_job_status(KUBECONFIG_PATH, cfg, task_id)
+            if job_status:
+                k8s_st = job_status["status"]
+                reason = job_status.get("reason", "")
+                msg = job_status.get("message", "")
+
+                if k8s_st == "failed":
+                    # Job 已失败（OOMKilled / Error / DeadlineExceeded）但 status.json 未更新
+                    fail_msg = f"K8s Job 异常终止: {reason}" if reason else "K8s Job 异常终止"
+                    if msg:
+                        fail_msg += f" ({msg})"
+                    stage = status["pipeline"].get("current_stage", "fetch")
+                    status["pipeline"]["current_stage"] = "failed"
+                    status["pipeline"].setdefault("stages", {}).setdefault(stage, {})
+                    status["pipeline"]["stages"][stage]["status"] = "failed"
+                    status["pipeline"]["stages"][stage]["message"] = fail_msg
+                    status["pipeline"]["stages"][stage]["completed_at"] = _now_bjt()
+                    _write_status(status)
+                    logger.warning(f"[k8s-sync] Task {task_id} marked failed: {fail_msg}")
+
+                elif k8s_st == "pending":
+                    # Pod 排队中，注入排队信息供前端展示
+                    status["pipeline"]["k8s_pending"] = True
+                    status["pipeline"]["k8s_pending_reason"] = msg or "等待集群资源分配"
+
+                else:
+                    status["pipeline"].pop("k8s_pending", None)
+                    status["pipeline"].pop("k8s_pending_reason", None)
+        except Exception as e:
+            logger.debug(f"[k8s-sync] Failed to check Job status for {task_id}: {e}")
+
     return StandardResponse(code=0, message="success", data=status, trace_id=None)
 
 

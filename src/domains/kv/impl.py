@@ -19,6 +19,16 @@ def _get_scroll_workers() -> int:
     except Exception:
         return 60
 
+
+def _get_scroll_size() -> int:
+    import os, json as _json
+    cfg_path = os.path.join(settings.OLAP_BASE_DIR, "app", "conf", "olap_config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return _json.load(f).get("pipeline_es_scroll_size", 5000)
+    except Exception:
+        return 5000
+
 _executor = ThreadPoolExecutor(max_workers=_get_scroll_workers())
 
 # ES 专用日志（写入 es_logs/ 目录）
@@ -122,13 +132,13 @@ class ESIndexClient:
         :return: 总记录数
         """
         scroll_time = "10m"
-        scroll_size = 10000
+        scroll_size = _get_scroll_size()
         total_count = 0
         scroll_id = None
         t0 = time.time()
         scroll_rounds = 0
 
-        logger.info(f"[scroll_to_file] START index={self.index} output={output_file}")
+        logger.info(f"[scroll_to_file] START index={self.index} output={output_file} scroll_size={scroll_size}")
 
         try:
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -172,12 +182,12 @@ class ESIndexClient:
     def _sync_query(self, body: dict) -> List[Dict]:
         """同步查询方法（保留兼容，小数据量使用）"""
         scroll_time = "10m"
-        scroll_size = 10000
+        scroll_size = _get_scroll_size()
         scroll_id = None
         all_results = []
         t0 = time.time()
 
-        logger.info(f"[scroll_query] START index={self.index}")
+        logger.info(f"[scroll_query] START index={self.index} scroll_size={scroll_size}")
 
         try:
             res = self.client.search(index=self.index, body=body, scroll=scroll_time, size=scroll_size)
@@ -231,12 +241,12 @@ class ESIndexClient:
         流式查询并追加写入到已打开的文件句柄（用于多窗口拼接，JSONL 格式）
         """
         scroll_time = "10m"
-        scroll_size = 10000
+        scroll_size = _get_scroll_size()
         window_count = 0
         scroll_id = None
         t0 = time.time()
 
-        logger.info(f"[scroll_appender] START index={self.index} base_count={base_count}")
+        logger.info(f"[scroll_appender] START index={self.index} base_count={base_count} scroll_size={scroll_size}")
 
         try:
             res = self.client.search(index=self.index, body=body, scroll=scroll_time, size=scroll_size)

@@ -177,11 +177,21 @@ def delete_pipeline_job(kubeconfig_path: str, olap_config: dict, task_id: str) -
 # Job 状态查询
 # ============================================================
 def get_job_status(kubeconfig_path: str, olap_config: dict, task_id: str) -> dict | None:
-    """查询 Job 状态。"""
+    """
+    查询 Job + Pod 状态。
+
+    返回字段:
+      status: completed / failed / running / pending / unknown
+      reason: OOMKilled / Error / DeadlineExceeded / Unschedulable / ... (失败时)
+      message: 人类可读描述
+    """
     namespace = olap_config["namespace"]
     job_name = _make_job_name(task_id)
 
-    batch_api = _get_batch_api(kubeconfig_path)
+    api_client = _no_proxy_api_client(kubeconfig_path)
+    batch_api = client.BatchV1Api(api_client)
+    core_api = client.CoreV1Api(api_client)
+
     try:
         job = batch_api.read_namespaced_job(name=job_name, namespace=namespace)
     except client.ApiException as e:
@@ -194,10 +204,58 @@ def get_job_status(kubeconfig_path: str, olap_config: dict, task_id: str) -> dic
     succeeded = s.succeeded or 0
     failed = s.failed or 0
 
+    reason = ""
+    message = ""
+
+    # 查 Pod 状态获取更详细的信息
+    try:
+        pods = core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"job-name={job_name}",
+        )
+        if pods.items:
+            pod = pods.items[0]
+            phase = pod.status.phase  # Pending / Running / Succeeded / Failed
+
+            # 检查容器终止原因（OOMKilled 等）
+            if pod.status.container_statuses:
+                cs = pod.status.container_statuses[0]
+                if cs.state.terminated:
+                    reason = cs.state.terminated.reason or ""
+                    message = cs.state.terminated.message or ""
+                elif cs.state.waiting:
+                    reason = cs.state.waiting.reason or ""
+                    message = cs.state.waiting.message or ""
+
+            # Pod 还在 Pending（未被调度或等待资源）
+            if phase == "Pending":
+                # 检查是否因资源不足无法调度
+                if pod.status.conditions:
+                    for cond in pod.status.conditions:
+                        if cond.type == "PodScheduled" and cond.status == "False":
+                            reason = cond.reason or "Unschedulable"
+                            message = cond.message or "等待集群资源"
+                            break
+                return {
+                    "name": job_name,
+                    "active": active, "succeeded": succeeded, "failed": failed,
+                    "status": "pending",
+                    "reason": reason or "Pending",
+                    "message": message or "Pod 等待调度",
+                }
+    except Exception as e:
+        logger.warning(f"[k8s] Failed to query Pod for {job_name}: {e}")
+
     if succeeded > 0:
         status_str = "completed"
     elif failed > 0:
         status_str = "failed"
+        # 检查 Job 级别的失败原因（如 DeadlineExceeded）
+        if not reason and s.conditions:
+            for cond in s.conditions:
+                if cond.type == "Failed" and cond.status == "True":
+                    reason = reason or cond.reason or ""
+                    message = message or cond.message or ""
     elif active > 0:
         status_str = "running"
     else:
@@ -209,6 +267,8 @@ def get_job_status(kubeconfig_path: str, olap_config: dict, task_id: str) -> dic
         "succeeded": succeeded,
         "failed": failed,
         "status": status_str,
+        "reason": reason,
+        "message": message,
     }
 
 
