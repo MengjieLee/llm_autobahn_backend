@@ -299,6 +299,20 @@ def convert_record(
                 print(f"[WARN] 无匹配 tokenizer，跳过: model={model_for_tokenizer}, as_id={as_id}")
             return None
 
+        # 超长文本预检：估算总字符数，超过 300K token 等价字符量则跳过
+        # 300K tokens × 4 字符/token = 1,200,000 字符（保守估算）
+        # 目的：避免超长请求拖慢 tokenize（单条 300K+ token 耗时约 150× 正常记录）
+        # 这类记录在生产中无法命中 KV cache（超出上下文窗口），跳过不影响命中率统计
+        _SKIP_CHARS_THRESHOLD = 1_200_000  # 300K tokens × 4 chars/token
+        total_content_chars = sum(
+            len(str(m.get("content") or "")) for m in valid_messages if isinstance(m, dict)
+        )
+        if total_content_chars > _SKIP_CHARS_THRESHOLD:
+            if verbose:
+                print(f"[SKIP] 文本过长（~{total_content_chars // 1000}K 字符"
+                      f"，阈值=1200K 字符≈300K tokens），跳过: as_id={as_id}")
+            return "TOO_LONG"  # 特殊标记：与 None（解析失败）区分，用于统计
+
         # 应用 chat_template
         input_ids = apply_chat_template(tokenizer, valid_messages, tools)
 
@@ -330,24 +344,41 @@ _worker_override = None
 _worker_default = None
 _worker_verbose = False
 
+# daemon 主进程预加载后写入此变量，fork 出的 worker 通过 COW 继承，避免重复加载
+_preloaded_tm: Optional["TokenizerManager"] = None
+
 
 def _worker_init(override_tokenizer, default_model, verbose):
-    """多进程 worker 初始化：每个子进程创建自己的 TokenizerManager"""
-    global _worker_tm, _worker_override, _worker_default, _worker_verbose
-    _worker_tm = TokenizerManager()
+    """多进程 worker 初始化：优先继承主进程预加载的 TokenizerManager（COW 共享）"""
+    global _worker_tm, _worker_override, _worker_default, _worker_verbose, _preloaded_tm
+    _worker_tm = _preloaded_tm if _preloaded_tm is not None else TokenizerManager()
     _worker_override = override_tokenizer
     _worker_default = default_model
     _worker_verbose = verbose
 
 
-def _worker_process_batch(batch):
+def _worker_process_batch(batch, model_filter=None):
     """
     处理一个 batch 的记录。
     batch: list of (line_idx, json_line_str)
-    返回: list of (line_idx, model, txt_line) 或 (line_idx, None, None) 表示失败
+    model_filter: set of model names to keep; None = keep all
+
+    返回: (results, too_long_count)
+      results: list of (line_idx, model, txt_line) 或 (line_idx, None, None) 表示失败/跳过
+      too_long_count: 本 batch 中因超长（>300K tokens）被跳过的记录数
     """
     results = []
+    too_long_count = 0
     for line_idx, json_str in batch:
+        # 快速预过滤：在 JSON 解析和 tokenize 之前，通过 regex 提取 qianfan_model
+        # 若不在 model_filter 中则直接跳过，避免无效 tokenize（最大优化点）
+        if model_filter:
+            m = re.search(r'qianfan_model:([a-zA-Z0-9._-]+)', json_str)
+            if m and m.group(1) not in model_filter:
+                results.append((line_idx, None, None))
+                continue
+            # 若未提取到 qianfan_model，透传给 convert_record 正常处理（会 return None）
+
         try:
             record = json.loads(json_str)
         except json.JSONDecodeError:
@@ -357,14 +388,17 @@ def _worker_process_batch(batch):
         result = convert_record(
             record, _worker_tm, _worker_override, _worker_default, _worker_verbose
         )
-        if result:
+        if result == "TOO_LONG":
+            too_long_count += 1
+            results.append((line_idx, None, None))
+        elif result:
             model = result["model_used"]
             ids_str = " ".join(map(str, result["input_ids"]))
             txt_line = f"'input_ids': [{ids_str}]"
             results.append((line_idx, model, txt_line))
         else:
             results.append((line_idx, None, None))
-    return results
+    return results, too_long_count
 
 
 # ============================================================
@@ -432,6 +466,7 @@ def main():
     tokenizer_stats = {}
     success_count = 0
     failed_count = 0
+    too_long_count = 0
     total_records = 0
     start_time = datetime.now()
 
@@ -458,9 +493,10 @@ def main():
 
     def _flush_results():
         """收集所有已完成的 futures 并写出结果"""
-        nonlocal success_count, failed_count
+        nonlocal success_count, failed_count, too_long_count
         for future in pending_futures:
-            batch_results = future.get()
+            batch_results, batch_too_long = future.get()
+            too_long_count += batch_too_long
             # batch_results 已经按提交顺序返回（同一 batch 内有序）
             for idx, model, txt_line in batch_results:
                 if model is not None:
@@ -536,7 +572,7 @@ def main():
     elapsed = (datetime.now() - start_time).total_seconds()
 
     print(f"\n[INFO] ========== 处理完成 ==========")
-    print(f"[INFO] 总记录: {total_records}, 成功: {success_count}, 失败: {failed_count}")
+    print(f"[INFO] 总记录: {total_records}, 成功: {success_count}, 失败: {failed_count}, 超长跳过: {too_long_count}")
     print(f"[INFO] 模型数: {len(model_files)}")
     print(f"[INFO] 耗时: {elapsed:.1f} 秒")
     print(f"[INFO] Workers: {num_workers}, Batch: {batch_size}")
@@ -551,6 +587,7 @@ def main():
         "models": {m: {"count": model_counts.get(m, 0), "file": output_files[m]} for m in output_files},
         "success_count": success_count,
         "failed_count": failed_count,
+        "too_long_count": too_long_count,
     }
     print(f"\n[SUMMARY] {json.dumps(summary, ensure_ascii=False)}")
 

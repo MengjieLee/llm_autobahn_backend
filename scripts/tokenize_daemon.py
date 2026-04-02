@@ -58,14 +58,24 @@ def _process_file_with_pool(
     batch_size: int,
     verbose: bool,
     model_filter: set = None,
+    log_fh=None,
 ) -> dict:
     """
     用已有的 Pool 对单个文件执行 tokenize，返回 summary dict。
     复用 tokenize_script.py 的 batch 处理逻辑，但不重启 Pool。
 
     model_filter: 非空时只写入指定 model 的 input_ids，其余记录直接丢弃（不写盘）。
+    log_fh: 可选的日志文件句柄，非 None 时同步写入日志（用于落盘到 /tokenize_logs）。
     """
     import glob as _glob
+
+    def _log(msg: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, file=sys.stderr, flush=True)
+        if log_fh is not None:
+            log_fh.write(line + "\n")
+            log_fh.flush()
 
     if not file_prefix:
         file_prefix = os.path.splitext(os.path.basename(input_file))[0]
@@ -76,6 +86,7 @@ def _process_file_with_pool(
     model_counts: dict = {}
     success_count = 0
     failed_count = 0
+    too_long_count = 0
     total_records = 0
 
     max_pending_batches = pool._processes * 2  # type: ignore[attr-defined]
@@ -84,9 +95,10 @@ def _process_file_with_pool(
     line_idx = 0
 
     def _flush_results():
-        nonlocal success_count, failed_count
+        nonlocal success_count, failed_count, too_long_count
         for future in pending_futures:
-            batch_results = future.get()
+            batch_results, batch_too_long = future.get()
+            too_long_count += batch_too_long
             for _, model, txt_line in batch_results:
                 if model is not None:
                     # model_filter 非空时跳过不在列表里的 model
@@ -111,6 +123,7 @@ def _process_file_with_pool(
         pending_futures.clear()
 
     start_time = datetime.now()
+    _log(f"开始处理: {input_file} (model_filter={model_filter})")
 
     with open(input_file, "r", encoding="utf-8") as fin:
         for line in fin:
@@ -123,15 +136,22 @@ def _process_file_with_pool(
             line_idx += 1
 
             if len(current_batch) >= batch_size:
-                future = pool.apply_async(_worker_process_batch, (current_batch,))
+                future = pool.apply_async(_worker_process_batch, (current_batch, model_filter))
                 pending_futures.append(future)
                 current_batch = []
 
                 if len(pending_futures) >= max_pending_batches:
                     _flush_results()
+                    processed = success_count + failed_count + too_long_count
+                    if processed > 0 and processed % 50000 < batch_size:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        speed = processed / elapsed if elapsed > 0 else 0
+                        _log(f"进度: 已处理={processed} 成功={success_count} "
+                             f"失败={failed_count} 超长跳过={too_long_count} "
+                             f"速度={speed:.0f}条/秒")
 
     if current_batch:
-        future = pool.apply_async(_worker_process_batch, (current_batch,))
+        future = pool.apply_async(_worker_process_batch, (current_batch, model_filter))
         pending_futures.append(future)
 
     _flush_results()
@@ -144,10 +164,16 @@ def _process_file_with_pool(
         output_files[model] = {"file": mf["final"], "count": mf["count"]}
 
     duration = (datetime.now() - start_time).total_seconds()
+    _log(f"完成: {input_file} | 总={total_records} 成功={success_count} "
+         f"失败={failed_count} 超长跳过={too_long_count} 耗时={duration:.1f}s")
+    for model, info in output_files.items():
+        _log(f"  输出: {model} -> {info['file']} ({info['count']} 条)")
+
     return {
         "models": output_files,
         "success_count": success_count,
         "failed_count": failed_count,
+        "too_long_count": too_long_count,
         "total_records": total_records,
         "duration_seconds": round(duration, 2),
     }
@@ -181,12 +207,26 @@ def main():
     parser.add_argument("--default-model", "-d", default="glm-5",
                         help="默认模型")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--log-dir", "-L", default=None,
+                        help="tokenize 日志落盘目录（默认不落盘，仅 stderr）")
     args = parser.parse_args()
 
     num_workers = args.workers if args.workers > 0 else max(1, min(cpu_count() - 1, 8))
     batch_size = args.batch_size
 
-    # 创建常驻 Pool，worker 进程在此一次性初始化 TokenizerManager
+    # 主进程预加载全部 tokenizer，Pool.fork() 后 worker 通过 Linux COW 共享，无需重复加载
+    # 注意：日志写 stderr，stdout 保留给 JSON 协议；每个 tokenizer 独立 try/except，加载失败不崩 daemon
+    import tokenize_script as _ts
+    _ts._preloaded_tm = _ts.TokenizerManager()
+    print(f"[daemon] 预加载 tokenizer，共 {len(_ts.MODEL_TOKENIZER_MAPPING)} 个模型...", file=sys.stderr, flush=True)
+    for model_name in _ts.MODEL_TOKENIZER_MAPPING:
+        try:
+            t, cfg = _ts._preloaded_tm.get_tokenizer(model_name)
+            print(f"[daemon]   {model_name} -> {cfg if t else '无匹配，跳过'}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[daemon]   {model_name} 预加载失败（将在 worker 内懒加载）: {e}", file=sys.stderr, flush=True)
+
+    # 创建常驻 Pool，worker fork 自主进程，直接继承已加载的 tokenizer
     pool = Pool(
         processes=num_workers,
         initializer=_worker_init,
@@ -195,6 +235,9 @@ def main():
 
     # 通知父进程 daemon 已就绪
     _write_msg({"type": "ready", "workers": num_workers, "batch_size": batch_size})
+
+    # 日志落盘目录（由 --log-dir 指定，或任务 msg 中携带）
+    _default_log_dir = args.log_dir  # 可能为 None
 
     try:
         while True:
@@ -217,6 +260,18 @@ def main():
                 t_verbose = msg.get("verbose", args.verbose)
                 t_model_filter = set(msg["model_filter"]) if msg.get("model_filter") else None
 
+                # 日志目录：优先取 task msg 中携带的 log_dir，其次用 --log-dir 参数
+                t_log_dir = msg.get("log_dir") or _default_log_dir
+                log_fh = None
+                if t_log_dir:
+                    os.makedirs(t_log_dir, exist_ok=True)
+                    _fp = os.path.splitext(os.path.basename(input_file))[0] if not file_prefix else file_prefix
+                    log_path = os.path.join(t_log_dir, f"{_fp}_tokenize.log")
+                    try:
+                        log_fh = open(log_path, "a", encoding="utf-8")
+                    except Exception as _le:
+                        print(f"[daemon] 无法打开日志文件 {log_path}: {_le}", file=sys.stderr, flush=True)
+
                 try:
                     summary = _process_file_with_pool(
                         pool=pool,
@@ -226,6 +281,7 @@ def main():
                         batch_size=t_batch_size,
                         verbose=t_verbose,
                         model_filter=t_model_filter,
+                        log_fh=log_fh,
                     )
                     _write_msg({
                         "type": "result",
@@ -242,9 +298,13 @@ def main():
                         "models": {},
                         "success_count": 0,
                         "failed_count": 0,
+                        "too_long_count": 0,
                         "duration_seconds": 0.0,
                         "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}",
                     })
+                finally:
+                    if log_fh is not None:
+                        log_fh.close()
     finally:
         pool.close()
         pool.join()

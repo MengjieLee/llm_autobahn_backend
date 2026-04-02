@@ -520,6 +520,10 @@ async def _run_tokenize_via_daemon(
     if not selected_models:
         selected_models = cfg.get("models", [])
 
+    # 日志落盘目录：task_data_dir/tokenize_logs
+    task_data_dir = _task_dir(task_id)
+    log_dir = os.path.join(task_data_dir, "tokenize_logs")
+
     def _submit_and_wait():
         dt_id = daemon.submit(
             input_file=input_file,
@@ -527,8 +531,9 @@ async def _run_tokenize_via_daemon(
             file_prefix=base_name,
             batch_size=cfg["pipeline_tokenize_batch_size"],
             model_filter=selected_models if selected_models else None,
+            log_dir=log_dir,
         )
-        return daemon.wait(dt_id, timeout=7200.0)
+        return daemon.wait(dt_id, timeout=86400.0)
 
     try:
         loop = asyncio.get_event_loop()
@@ -851,6 +856,109 @@ async def _run_simulate_stage(task_id: str):
 
 
 # ============================================================
+# Resume: 当 fetch 已完成时，仅重跑 tokenize（跳过重新拉取 ES 数据）
+# ============================================================
+async def _run_tokenize_only(task_id: str):
+    """
+    fetch 已完成时的 tokenize 恢复入口。
+    读取 status 中的 result_files，对每个已有 .jsonl 重跑 daemon tokenize。
+    用于任务中断后无需重新拉取数据的快速恢复。
+    """
+    existing_status = _read_status(task_id)
+    fetch_stage = existing_status.get("pipeline", {}).get("stages", {}).get("fetch", {})
+    result_files = fetch_stage.get("result_files", [])
+
+    if not result_files:
+        logger.error("[resume] fetch 已完成但无 result_files，无法恢复 tokenize")
+        _set_failed(task_id, "tokenize", "resume 失败：fetch 无 result_files")
+        return
+
+    cfg = _load_olap_config()
+    output_dir_base = os.path.join(_task_dir(task_id), "tokenized")
+    os.makedirs(output_dir_base, exist_ok=True)
+
+    if SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, SCRIPTS_DIR)
+    from kv_pipeline import TokenizeDaemonClient  # noqa: E402
+
+    tokenize_daemon = TokenizeDaemonClient(
+        workers=cfg["pipeline_tokenize_workers"],
+        batch_size=cfg["pipeline_tokenize_batch_size"],
+        default_model=cfg["pipeline_default_model"],
+    )
+    logger.info(f"[resume] 启动 daemon (workers={cfg['pipeline_tokenize_workers']})...")
+    tokenize_daemon.start(timeout=300.0)
+    logger.info(f"[resume] daemon 就绪，共 {len(result_files)} 个文件待 tokenize")
+
+    _update_stage(task_id, "tokenize", {
+        "status": "running",
+        "message": f"恢复 tokenize，共 {len(result_files)} 个文件...",
+    }, "tokenize")
+    _update_stage(task_id, "simulate", {"status": "pending", "message": "等待 tokenize..."})
+
+    tokenize_results = []
+    total_lines = 0
+    total_seconds = 0.0
+
+    try:
+        for file_info in result_files:
+            input_file = file_info["file"]
+            if not os.path.exists(input_file):
+                logger.warning(f"[resume] 文件不存在，跳过: {input_file}")
+                tokenize_results.append({
+                    "file": os.path.basename(input_file),
+                    "status": "failed", "error": "文件不存在", "outputs": {},
+                })
+                continue
+            logger.info(f"[resume] tokenize: {os.path.basename(input_file)} ({file_info.get('count', '?')} 条)")
+            result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, output_dir_base, task_id)
+            tokenize_results.append(result)
+            if result["status"] == "completed":
+                total_lines += result.get("lines", 0)
+                total_seconds += result.get("duration_seconds", 0.0)
+            _update_stage(task_id, "tokenize", {
+                "status": "running",
+                "message": f"tokenize 进度 {len(tokenize_results)}/{len(result_files)}，{total_lines} 条",
+            })
+    finally:
+        try:
+            tokenize_daemon.stop()
+            logger.info("[resume] daemon 已关闭")
+        except Exception:
+            pass
+
+    success_files = [r for r in tokenize_results if r["status"] == "completed"]
+    failed_files  = [r for r in tokenize_results if r["status"] == "failed"]
+
+    model_txt_files: dict = {}
+    for r in success_files:
+        for model, txt_file in r.get("outputs", {}).items():
+            model_txt_files.setdefault(model, []).append(txt_file)
+
+    status = _read_status(task_id)
+    selected_models = status.get("query", {}).get("models", []) if status else []
+    all_detected_models = list(model_txt_files.keys())
+    if selected_models:
+        model_txt_files = {m: fs for m, fs in model_txt_files.items() if m in selected_models}
+
+    if not success_files:
+        _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")
+        return
+
+    _update_stage(task_id, "tokenize", {
+        "status": "completed",
+        "message": f"恢复 tokenize 完成，{len(success_files)}/{len(tokenize_results)} 成功，{total_lines} 条",
+        "model_outputs": {m: fs for m, fs in model_txt_files.items()},
+        "total_lines": total_lines,
+        "success_count": len(success_files),
+        "failed_count": len(failed_files),
+        "models": list(model_txt_files.keys()),
+        "all_detected_models": all_detected_models,
+        "files": tokenize_results,
+    })
+
+
+# ============================================================
 # 主入口
 # ============================================================
 async def run_pipeline(args):
@@ -858,11 +966,23 @@ async def run_pipeline(args):
     logger.info(f"Pipeline started: {task_id}")
 
     try:
-        # Stage 1+2
-        await _run_streaming_fetch_tokenize(
-            task_id, args.start_datetime, args.end_datetime,
-            args.app_id, args.path
+        # 检查是否可以从 tokenize 恢复（fetch 已完成则跳过重新拉取数据）
+        existing_status = _read_status(task_id)
+        fetch_already_done = (
+            existing_status is not None
+            and existing_status.get("pipeline", {}).get("stages", {})
+                .get("fetch", {}).get("status") == "completed"
         )
+
+        if fetch_already_done:
+            logger.info(f"[pipeline] fetch 已完成，从 tokenize 阶段恢复: {task_id}")
+            await _run_tokenize_only(task_id)
+        else:
+            # Stage 1+2
+            await _run_streaming_fetch_tokenize(
+                task_id, args.start_datetime, args.end_datetime,
+                args.app_id, args.path
+            )
 
         # 检查是否已完成（无数据时 fetch 阶段直接设置 done）
         status = _read_status(task_id)

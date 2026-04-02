@@ -153,13 +153,14 @@ class TokenizeDaemonClient:
         batch_size: Optional[int] = None,
         verbose: Optional[bool] = None,
         model_filter: Optional[list] = None,
+        log_dir: Optional[str] = None,
     ) -> str:
         """提交一个 tokenize 任务，返回 task_id（异步，不等待结果）"""
         with self._lock:
             self._task_counter += 1
             task_id = f"task_{self._task_counter}"
 
-        self._send({
+        msg: dict = {
             "type": "task",
             "id": task_id,
             "input_file": input_file,
@@ -168,10 +169,13 @@ class TokenizeDaemonClient:
             "batch_size": batch_size if batch_size is not None else self._batch_size,
             "verbose": verbose if verbose is not None else self._verbose,
             "model_filter": model_filter or [],
-        })
+        }
+        if log_dir:
+            msg["log_dir"] = log_dir
+        self._send(msg)
         return task_id
 
-    def wait(self, task_id: str, timeout: float = 3600.0) -> dict:
+    def wait(self, task_id: str, timeout: float = 86400.0) -> dict:
         """阻塞等待指定 task_id 的结果，超时抛异常"""
         deadline = datetime.now().timestamp() + timeout
         while datetime.now().timestamp() < deadline:

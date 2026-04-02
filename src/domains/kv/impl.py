@@ -3,9 +3,19 @@ from datetime import datetime
 import asyncio
 import json
 import time
+import gc
+import ctypes
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Callable
+
+
+def _malloc_trim():
+    """强制归还 glibc heap 空闲页给 OS，防止 Python heap 只涨不降"""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 from app.conf.config import settings
 
@@ -161,6 +171,10 @@ class ESIndexClient:
                     if status_callback:
                         status_callback(total_count, f"已处理 {total_count} 条记录...")
 
+                    results = None
+                    gc.collect()
+                    _malloc_trim()
+
                     res = self.client.scroll(scroll_id=scroll_id, scroll=scroll_time)
                     scroll_id = res.get("_scroll_id")
                     results = res['hits']['hits']
@@ -263,6 +277,12 @@ class ESIndexClient:
 
                 if status_callback:
                     status_callback(base_count + window_count, f"已处理 {base_count + window_count} 条记录...")
+
+                # 主动释放当前 page 的 Python 对象并归还内存给 OS
+                # 防止 30 并发 scroll 线程各自的 heap 峰值叠加导致内存线性增长
+                results = None
+                gc.collect()
+                _malloc_trim()
 
                 res = self.client.scroll(scroll_id=scroll_id, scroll=scroll_time)
                 scroll_id = res.get("_scroll_id")
