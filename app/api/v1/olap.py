@@ -4,6 +4,7 @@ import glob
 import json
 import logging
 import threading
+import urllib.request
 import uuid
 import os
 
@@ -136,6 +137,109 @@ def _write_status(data: dict):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+
+
+def _notify_task_done(status: dict):
+    """
+    任务完成/失败通知（百度 IM 机器人）。
+    done:   发送命中率报告
+    failed: 发送失败原因摘要
+    只在 notified=True 之前发送一次，发完写回 status 文件防重复。
+    失败只 warning，不影响主流程。
+    """
+    try:
+        cfg = _load_olap_config()
+        bot_url  = cfg.get("notify_im_bot_url", "")
+        bot_toid = cfg.get("notify_im_bot_toid", [])
+        if not bot_url or not bot_toid:
+            return
+
+        query      = status.get("query", {})
+        result     = status.get("result") or {}
+        start_dt   = query.get("start_datetime", "")
+        end_dt     = query.get("end_datetime", "")
+        task_name  = status.get("task_name", status.get("task_id", ""))
+        app_id     = query.get("app_id") or "全局"
+        models     = query.get("models") or []
+        cur_stage  = status["pipeline"].get("current_stage", "")
+
+        created_at = status.get("created_at", "")
+        updated_at = status.get("updated_at", "")
+        try:
+            _fmt = "%Y-%m-%d %H:%M:%S"
+            duration_sec = int(
+                (datetime.strptime(updated_at, _fmt) - datetime.strptime(created_at, _fmt))
+                .total_seconds()
+            )
+            h, m, s = duration_sec // 3600, duration_sec % 3600 // 60, duration_sec % 60
+            duration_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s"
+        except Exception:
+            duration_str = "N/A"
+
+        header_base = (
+            f"**🎯 任务**: {task_name}  `{app_id}`\n"
+            f"**🗓️ 时间范围**: {start_dt} ~ {end_dt}\n"
+            f"**🤖 模型**: {', '.join(models) if models else '全部'}\n"
+            f"**⏱️ 耗时**: {duration_str}\n"
+        )
+
+        if cur_stage == "done":
+            model_lines = []
+            for model, stats in result.items():
+                hit_pct   = stats.get("hit_rate_percent", 0)
+                hit_count = stats.get("hit_count", 0)
+                total_q   = stats.get("total_queries", 0)
+                total_tok = stats.get("total_tokens", 0)
+                color = "green" if hit_pct >= 50 else ("orange" if hit_pct >= 20 else "red")
+                model_lines.append(
+                    f'> **{model}**: <font color="{color}">{hit_pct:.1f}%</font> ✅'
+                    f"  命中 {hit_count:,} / {total_q:,} 次 🧮"
+                )
+            models_result_md = "\n".join(model_lines) if model_lines else "> 无结果数据"
+            content = (
+                f"##### KV 模拟命中率报告 📊\n"
+                f"{header_base}"
+                f"\n**各模型命中率**\n"
+                f"{models_result_md}"
+            )
+        else:
+            # failed：提取各阶段失败原因
+            stages = status["pipeline"].get("stages", {})
+            fail_lines = []
+            for stage_name, stage_data in stages.items():
+                if isinstance(stage_data, dict) and stage_data.get("status") == "failed":
+                    msg = stage_data.get("message", "未知错误")
+                    fail_lines.append(f"> **{stage_name}**: {msg[:200]}")
+            fail_detail = "\n".join(fail_lines) if fail_lines else "> 未知原因"
+            content = (
+                f"##### KV Pipeline 任务失败 ❌\n"
+                f"{header_base}"
+                f"\n**失败原因**\n"
+                f"{fail_detail}"
+            )
+
+        payload = json.dumps({
+            "message": {
+                "header": {"toid": bot_toid},
+                "body": [{"type": "MD", "content": content}]
+            }
+        }, ensure_ascii=False).encode("utf-8")
+
+        req = urllib.request.Request(
+            bot_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(f"[notify] IM bot 通知成功: task={status.get('task_id')} stage={cur_stage} http={resp.status}")
+
+        # 标记已通知，防止下次轮询重复发送
+        status["notified"] = True
+        _write_status(status)
+
+    except Exception as e:
+        logger.warning(f"[notify] IM bot 通知失败: {e}")
 
 
 async def _update_stage(task_id: str, stage: str, stage_data: dict, current_stage: str = None):
@@ -1303,6 +1407,11 @@ async def es_fetch_status(task_id: str):
                     status["pipeline"].pop("k8s_pending_reason", None)
         except Exception as e:
             logger.debug(f"[k8s-sync] Failed to check Job status for {task_id}: {e}")
+
+    # 任务终态通知：首次轮询到 done/failed 时发送一次 IM 通知
+    if status["pipeline"].get("current_stage") in ("done", "failed") and not status.get("notified"):
+        _notify_task_done(status)
+        _notify_task_done(status)
 
     return StandardResponse(code=0, message="success", data=status, trace_id=None)
 

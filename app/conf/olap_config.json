@@ -29,5 +29,7 @@
   "k8s_job_ttl_seconds": 43200,
   "k8s_cfs_host_path": "/mnt/cfs_bj_mt",
   "k8s_cfs_mount_path": "/mnt/cfs_bj_mt",
-  "k8s_working_dir": "/mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend"
+  "k8s_working_dir": "/mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend",
+  "notify_im_bot_url": "http://apiin.im.baidu.com/api/msg/groupmsgsend?access_token=dcf12103ce0c579e5b339dbd2b52dd914",
+  "notify_im_bot_toid": [12716154]
 }
