@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import gc
 import glob
 import json
@@ -144,11 +145,41 @@ def _notify_task_done(status: dict):
     任务完成/失败通知（百度 IM 机器人）。
     done:   发送命中率报告
     failed: 发送失败原因摘要
-    只在 notified=True 之前发送一次，发完写回 status 文件防重复。
-    失败只 warning，不影响主流程。
+
+    防重复机制：用 fcntl.flock 对 status 文件加互斥锁，在锁内重读文件确认
+    notified 未设置后立即写 notified=True，再释放锁发送通知。
+    多 uvicorn worker 并发时只有第一个能通过检查。
     """
+    task_id = status.get("task_id", "")
+    status_path = _status_file(task_id)
     try:
         cfg = _load_olap_config()
+        bot_url  = cfg.get("notify_im_bot_url", "")
+        bot_toid = cfg.get("notify_im_bot_toid", [])
+        if not bot_url or not bot_toid:
+            return
+
+        # --- 加互斥文件锁，原子性检查并标记 notified ---
+        with open(status_path, "r+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                lock_f.seek(0)
+                fresh = json.load(lock_f)
+                if fresh.get("notified"):
+                    return  # 已被其他 worker 发送，直接跳过
+                # 立即写 notified=True，防止其他 worker 再次进入
+                fresh["notified"] = True
+                fresh["updated_at"] = _now_bjt()
+                lock_f.seek(0)
+                lock_f.truncate()
+                json.dump(fresh, lock_f, ensure_ascii=False, indent=2)
+                lock_f.flush()
+                os.fsync(lock_f.fileno())
+                # 用 fresh 覆盖传入的 status，保证后续构建消息用的是最新数据
+                status = fresh
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+        # --- 锁已释放，在锁外发送通知 ---
         bot_url  = cfg.get("notify_im_bot_url", "")
         bot_toid = cfg.get("notify_im_bot_toid", [])
         if not bot_url or not bot_toid:
@@ -163,24 +194,10 @@ def _notify_task_done(status: dict):
         models     = query.get("models") or []
         cur_stage  = status["pipeline"].get("current_stage", "")
 
-        created_at = status.get("created_at", "")
-        updated_at = status.get("updated_at", "")
-        try:
-            _fmt = "%Y-%m-%d %H:%M:%S"
-            duration_sec = int(
-                (datetime.strptime(updated_at, _fmt) - datetime.strptime(created_at, _fmt))
-                .total_seconds()
-            )
-            h, m, s = duration_sec // 3600, duration_sec % 3600 // 60, duration_sec % 60
-            duration_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s"
-        except Exception:
-            duration_str = "N/A"
-
         header_base = (
             f"**🎯 任务**: {task_name}  `{app_id}`\n"
             f"**🗓️ 时间范围**: {start_dt} ~ {end_dt}\n"
             f"**🤖 模型**: {', '.join(models) if models else '全部'}\n"
-            f"**⏱️ 耗时**: {duration_str}\n"
         )
 
         if cur_stage == "done":
@@ -232,11 +249,7 @@ def _notify_task_done(status: dict):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(f"[notify] IM bot 通知成功: task={status.get('task_id')} stage={cur_stage} http={resp.status}")
-
-        # 标记已通知，防止下次轮询重复发送
-        status["notified"] = True
-        _write_status(status)
+            logger.info(f"[notify] IM bot 通知成功: task={task_id} stage={cur_stage} http={resp.status}")
 
     except Exception as e:
         logger.warning(f"[notify] IM bot 通知失败: {e}")
