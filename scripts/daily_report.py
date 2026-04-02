@@ -62,7 +62,7 @@ def find_daily_overview_task(target_date: str) -> Optional[dict]:
     return None
 
 
-def format_report(task: dict, target_date: str) -> str:
+def format_report(task: dict, target_date: str, detail_url: str) -> str:
     """
     格式化报告内容（Markdown）
     """
@@ -91,7 +91,7 @@ def format_report(task: dict, target_date: str) -> str:
 **各模型命中率 🎯**
 {chr(10).join(model_lines)}
 
-[✨✨ 查看明细数据]({DETAIL_URL}) ✨✨"""
+[✨✨ 查看明细数据]({detail_url}) ✨✨"""
 
     return content
 
@@ -141,13 +141,14 @@ def main():
     config = load_config()
     bot_url = config.get("daily_report_im_bot_url") or config.get("notify_im_bot_url", "")
     bot_toid = config.get("daily_report_im_bot_toid") or config.get("notify_im_bot_toid", [])
+    detail_url = config.get("daily_report_detail_url", "https://vortex.n.baidu-int.com/olap/kv")
 
     if not bot_url or not bot_toid:
         print("[daily_report] 未配置 IM bot，跳过推送")
         return
 
     # 格式化报告
-    content = format_report(task, target_date)
+    content = format_report(task, target_date, detail_url)
     print("[daily_report] 报告内容:")
     print(content)
     print()
