@@ -82,16 +82,16 @@ def format_report(task: dict, target_date: str, detail_url: str) -> str:
         tokens = stats.get("total_tokens", 0)
 
         model_lines.append(
-            f"> **{model}**: <font color=\"green\">{rate:.1f}%</font>  "
+            f"> 🤖 **{model}**: <font color=\"green\">{rate:.1f}%</font>  "
             f"命中 {hit:,} / {total:,}  tokens {tokens:,}"
         )
 
-    content = f"""##### KV Cache 模拟命中日报 📊 (🗓️{data_date})
+    content = f"""##### 📊 KV Cache 模拟命中日报 (🗓️{data_date})
 
 **各模型命中率 🎯**
 {chr(10).join(model_lines)}
 
-[✨✨ 查看明细数据]({detail_url}) ✨✨"""
+[✨✨ 查看明细数据 ✨✨]({detail_url})"""
 
     return content
 
