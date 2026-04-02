@@ -27,9 +27,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STATUS_DIR = BASE_DIR / "olap_database" / "status"
 CONFIG_FILE = BASE_DIR / "app" / "conf" / "olap_config.json"
 
-# 明细页 URL
-DETAIL_URL = "https://vortex.n.baidu-int.com/olap/kv"
-
 
 def load_config():
     """加载 olap 配置"""
