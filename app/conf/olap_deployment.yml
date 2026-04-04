@@ -34,7 +34,7 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: ${TTL_SECONDS}
-  activeDeadlineSeconds: 43200  # 12h 超时
+  activeDeadlineSeconds: 86400  # 24h 超时
   template:
     metadata:
       labels:

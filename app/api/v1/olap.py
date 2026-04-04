@@ -302,10 +302,162 @@ async def _set_failed(task_id: str, stage: str, error_msg: str):
 
 
 # ============================================================
+# K8s Job 生命周期监听
+# ============================================================
+async def _watch_k8s_job(task_id: str):
+    """
+    轻量级 K8s Job 监听：轮询 Job 状态直到终态，然后触发通知。
+    每个 K8s 任务创建后启动一个 asyncio task 运行此函数。
+    """
+    cfg = _load_olap_config()
+    poll_interval = 60  # 每 60 秒轮询一次
+    # K8s Job 已到终态后，等待 status.json 追赶的最大轮数
+    MAX_STATUS_WAIT_ROUNDS = 10  # 最多再等 10 轮 (10 * 60s = 10 分钟)
+    status_wait_rounds = 0
+
+    try:
+        while True:
+            await asyncio.sleep(poll_interval)
+            try:
+                job_status = await asyncio.to_thread(
+                    k8s_client.get_job_status, KUBECONFIG_PATH, cfg, task_id
+                )
+            except Exception:
+                logger.debug(f"[k8s-watch] 查询 Job 状态异常: {task_id}", exc_info=True)
+                continue
+
+            if not job_status:
+                # Job 不存在（被 TTL 清理或删除）
+                # 检查 status.json，可能 pipeline 已经完成但 Job 被回收了
+                status = _read_status(task_id)
+                if status:
+                    cur_stage = status["pipeline"].get("current_stage", "")
+                    if cur_stage in ("done", "failed") and not status.get("notified"):
+                        logger.info(f"[k8s-watch] Job 已消失但任务已结束，补发通知: {task_id}")
+                        _notify_task_done(status)
+                logger.info(f"[k8s-watch] Job 不存在，停止监听: {task_id}")
+                return
+
+            k8s_st = job_status["status"]
+
+            if k8s_st in ("completed", "failed"):
+                # 读取最新 status 文件
+                status = _read_status(task_id)
+                if not status:
+                    return
+
+                cur_stage = status["pipeline"].get("current_stage", "")
+
+                # 如果 status.json 已经是终态，直接通知
+                if cur_stage in ("done", "failed"):
+                    _notify_task_done(status)
+                    return
+
+                # K8s Job 失败但 status.json 未更新（OOM/DeadlineExceeded等），同步状态后通知
+                if k8s_st == "failed":
+                    reason = job_status.get("reason", "")
+                    msg = job_status.get("message", "")
+                    fail_msg = f"K8s Job 异常终止: {reason}" if reason else "K8s Job 异常终止"
+                    if msg:
+                        fail_msg += f" ({msg})"
+                    stage = status["pipeline"].get("current_stage", "fetch")
+                    status["pipeline"]["current_stage"] = "failed"
+                    status["pipeline"].setdefault("stages", {}).setdefault(stage, {})
+                    status["pipeline"]["stages"][stage]["status"] = "failed"
+                    status["pipeline"]["stages"][stage]["message"] = fail_msg
+                    status["pipeline"]["stages"][stage]["completed_at"] = _now_bjt()
+                    _write_status(status)
+                    _notify_task_done(status)
+                    return
+
+                # K8s Job completed 但 status.json 还不是 done — pipeline 可能还在写文件
+                status_wait_rounds += 1
+                if status_wait_rounds >= MAX_STATUS_WAIT_ROUNDS:
+                    # 等待超时：K8s Job 已 completed 但 status.json 始终没到终态
+                    # 标记失败并通知，防止无限空转
+                    logger.warning(
+                        f"[k8s-watch] K8s Job completed 但 status.json 停滞在 '{cur_stage}'，"
+                        f"等待 {status_wait_rounds} 轮后强制标记失败: {task_id}"
+                    )
+                    stage = cur_stage or "simulate"
+                    status["pipeline"]["current_stage"] = "failed"
+                    status["pipeline"].setdefault("stages", {}).setdefault(stage, {})
+                    status["pipeline"]["stages"][stage]["status"] = "failed"
+                    status["pipeline"]["stages"][stage]["message"] = (
+                        f"K8s Job 已完成但 Pipeline 状态停滞在 {cur_stage}，"
+                        f"可能是 Pod 进程在写入最终结果前被回收"
+                    )
+                    status["pipeline"]["stages"][stage]["completed_at"] = _now_bjt()
+                    _write_status(status)
+                    _notify_task_done(status)
+                    return
+
+                logger.debug(
+                    f"[k8s-watch] K8s Job completed 但 status={cur_stage}，"
+                    f"等待 status.json 更新 ({status_wait_rounds}/{MAX_STATUS_WAIT_ROUNDS}): {task_id}"
+                )
+                continue
+
+    except asyncio.CancelledError:
+        logger.info(f"[k8s-watch] 监听被取消: {task_id}")
+    except Exception:
+        logger.warning(f"[k8s-watch] 监听异常退出: {task_id}", exc_info=True)
+
+
+# ============================================================
+# Stage 4: 分钟级命中率趋势
+# ============================================================
+async def _run_trend_stage(task_id: str):
+    """计算分钟级命中率趋势并保存到 report/hit_rate_trend.json"""
+    await _update_stage(task_id, "trend", {"status": "running", "message": "正在计算分钟级命中率趋势..."}, "trend")
+    try:
+        from scripts.compute_trend import compute_and_save, _collect_model_outputs
+
+        task_data_dir = _task_dir(task_id)
+        status = _read_status(task_id)
+        tokenize_stage = (status or {}).get("pipeline", {}).get("stages", {}).get("tokenize", {})
+        status_model_outputs = tokenize_stage.get("model_outputs")
+        model_outputs = _collect_model_outputs(task_data_dir, status_model_outputs)
+
+        if not model_outputs:
+            await _update_stage(task_id, "trend", {
+                "status": "completed",
+                "message": "无 input_ids 文件，跳过趋势计算",
+            })
+            return
+
+        cfg = _load_olap_config()
+        cache_size = cfg.get("pipeline_cache_size", 200000000)
+        block_size = cfg.get("pipeline_block_size", 16)
+
+        # 在线程池中执行（CPU 密集 + subprocess 调用）
+        output_file = await asyncio.to_thread(
+            compute_and_save,
+            task_data_dir=task_data_dir,
+            cache_size=cache_size,
+            block_size=block_size,
+            model_outputs=model_outputs,
+        )
+
+        await _update_stage(task_id, "trend", {
+            "status": "completed",
+            "message": f"趋势计算完成 ({len(model_outputs)} 模型)",
+            "output_file": output_file,
+        })
+    except Exception as e:
+        # 趋势计算失败不影响整体 pipeline，仅标记 trend 阶段失败
+        logger.warning(f"[trend] 趋势计算失败: {task_id}: {e}", exc_info=True)
+        await _update_stage(task_id, "trend", {
+            "status": "failed",
+            "message": f"趋势计算失败: {str(e)[:200]}",
+        })
+
+
+# ============================================================
 # Pipeline 后台任务
 # ============================================================
 async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = "", scheduled_at: str = ""):
-    """全自动流水线: (scheduled wait →) fetch+tokenize (streaming) → simulate"""
+    """全自动流水线: (scheduled wait →) fetch+tokenize (streaming) → simulate → trend"""
     try:
         # ---- 定时等待 ----
         if scheduled_at:
@@ -324,6 +476,16 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
 
         # ---- Stage 3: simulate ----
         await _run_simulate_stage(task_id)
+
+        # ---- Stage 4: 分钟级命中率趋势 ----
+        await _run_trend_stage(task_id)
+
+        # ---- 标记 done ----
+        async with _get_status_lock(task_id):
+            status = _read_status(task_id)
+            if status and status["pipeline"].get("current_stage") not in ("done", "failed"):
+                status["pipeline"]["current_stage"] = "done"
+                _write_status(status)
 
     except asyncio.CancelledError:
         logger.info(f"Pipeline cancelled for {task_id}")
@@ -347,6 +509,13 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
 
     finally:
         _cleanup_task_resources(task_id)
+        # 生命周期通知：本地模式任务完成/失败时立即发送通知
+        try:
+            status = _read_status(task_id)
+            if status and status["pipeline"].get("current_stage") in ("done", "failed"):
+                _notify_task_done(status)
+        except Exception:
+            logger.warning(f"[notify] 本地模式通知失败: {task_id}", exc_info=True)
 
 
 async def _run_streaming_fetch_tokenize(
@@ -1015,7 +1184,13 @@ async def _run_simulate_stage(task_id: str):
         "message": sim_msg,
         "models": [sr["model"] for sr in sim_results],
     })
-    await _set_result(task_id, result)
+
+    # 将 result 暂存到 status 但不设 done（由 pipeline 在 trend 之后统一 _set_result）
+    async with _get_status_lock(task_id):
+        status = _read_status(task_id)
+        if status:
+            status["result"] = result
+            _write_status(status)
 
 
 # ============================================================
@@ -1359,6 +1534,8 @@ async def es_fetch(
                 models=models or "",
             )
             logger.info(f"[k8s] Pipeline Job created: {job_name} for task {task_id}")
+            # 启动 K8s Job 生命周期监听，任务终态时自动通知
+            asyncio.create_task(_watch_k8s_job(task_id))
         except Exception as e:
             logger.exception(f"[k8s] Failed to create Job for task {task_id}")
             await _set_failed(task_id, "fetch", f"K8s Job 创建失败: {str(e)[:200]}")
@@ -1377,6 +1554,37 @@ async def es_fetch(
         data={"task_id": task_id},
         trace_id=None
     )
+
+
+@router.get("/kv/hit-rate-trend/{task_id}", summary="获取分钟级命中率趋势（预计算）")
+async def kv_hit_rate_trend(task_id: str):
+    """
+    读取预计算的趋势数据文件 report/hit_rate_trend.json。
+    趋势在 pipeline 的 trend 阶段自动生成；存量任务可用 compute_trend.py 回填。
+    """
+    status = _read_status(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+
+    task_data_dir = _task_dir(task_id)
+    trend_file = os.path.join(task_data_dir, "report", "hit_rate_trend.json")
+
+    if not os.path.exists(trend_file):
+        return StandardResponse(
+            code=0, message="趋势数据尚未生成",
+            data={"series": []}, trace_id=None
+        )
+
+    try:
+        with open(trend_file, "r", encoding="utf-8") as f:
+            trend_data = json.load(f)
+    except Exception as e:
+        return StandardResponse(
+            code=-1, message=f"读取趋势数据失败: {e}",
+            data={"series": []}, trace_id=None
+        )
+
+    return StandardResponse(code=0, message="success", data=trend_data, trace_id=None)
 
 
 @router.get("/kv/status/{task_id}", summary="查询任务状态")
@@ -1420,11 +1628,6 @@ async def es_fetch_status(task_id: str):
                     status["pipeline"].pop("k8s_pending_reason", None)
         except Exception as e:
             logger.debug(f"[k8s-sync] Failed to check Job status for {task_id}: {e}")
-
-    # 任务终态通知：首次轮询到 done/failed 时发送一次 IM 通知
-    if status["pipeline"].get("current_stage") in ("done", "failed") and not status.get("notified"):
-        _notify_task_done(status)
-        _notify_task_done(status)
 
     return StandardResponse(code=0, message="success", data=status, trace_id=None)
 

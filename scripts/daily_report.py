@@ -73,6 +73,16 @@ def format_report(task: dict, target_date: str, detail_url: str) -> str:
     start_dt = query.get("start_datetime", "")
     data_date = start_dt.split(" ")[0] if start_dt else target_date
 
+    # 汇总整体命中率
+    total_hit = 0
+    total_queries = 0
+    total_tokens = 0
+    for stats in result.values():
+        total_hit += stats.get("hit_count", 0)
+        total_queries += stats.get("total_queries", 0)
+        total_tokens += stats.get("total_tokens", 0)
+    overall_rate = (total_hit / total_queries * 100) if total_queries > 0 else 0
+
     # 构建各模型明细
     model_lines = []
     for model, stats in sorted(result.items(), key=lambda x: x[1].get("hit_rate_percent", 0), reverse=True):
@@ -86,7 +96,11 @@ def format_report(task: dict, target_date: str, detail_url: str) -> str:
             f"命中 {hit:,} / {total:,}  tokens {tokens:,}"
         )
 
+    overall_color = "green" if overall_rate >= 50 else ("orange" if overall_rate >= 20 else "red")
+
     content = f"""##### 📊 KV Cache 模拟命中日报 (🗓️{data_date})
+
+**整体命中率 🎯**: <font color="{overall_color}">{overall_rate:.1f}%</font>  命中 {total_hit:,} / {total_queries:,} 次  tokens {total_tokens:,}
 
 **各模型命中率 🎯**
 {chr(10).join(model_lines)}

@@ -212,8 +212,6 @@ async def _run_streaming_fetch_tokenize(
     cfg = _load_olap_config()
     fetch_sem = asyncio.Semaphore(cfg["pipeline_fetch_concurrency"])
     tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
-    tokenize_queue_limit = cfg.get("pipeline_tokenize_queue_limit", 4)
-    tokenize_queue_sem = asyncio.Semaphore(tokenize_queue_limit)
     tokenize_tasks = []
 
     # 启动共享 tokenize daemon —— 整个 pipeline 生命周期内 tokenizer 只加载一次
@@ -327,8 +325,7 @@ async def _run_streaming_fetch_tokenize(
                 es.close()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
-        async with tokenize_queue_sem:
-            async with tokenize_sem:
+        async with tokenize_sem:
                 _update_tokenize_progress()
                 result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, out_dir, tid)
                 tokenize_results.append(result)
@@ -852,7 +849,12 @@ async def _run_simulate_stage(task_id: str):
         "message": sim_msg,
         "models": [sr["model"] for sr in sim_results],
     })
-    _set_result(task_id, result)
+
+    # 将 result 暂存到 status 但不设 done（由 pipeline 在 trend 之后统一标记）
+    status = _read_status(task_id)
+    if status:
+        status["result"] = result
+        _write_status(status)
 
 
 # ============================================================
@@ -899,27 +901,35 @@ async def _run_tokenize_only(task_id: str):
     tokenize_results = []
     total_lines = 0
     total_seconds = 0.0
+    done_count = [0]
+    tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
+
+    async def _tokenize_one(file_info):
+        input_file = file_info["file"]
+        if not os.path.exists(input_file):
+            logger.warning(f"[resume] 文件不存在，跳过: {input_file}")
+            return {
+                "file": os.path.basename(input_file),
+                "status": "failed", "error": "文件不存在", "outputs": {},
+            }
+        logger.info(f"[resume] tokenize: {os.path.basename(input_file)} ({file_info.get('count', '?')} 条)")
+        async with tokenize_sem:
+            result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, output_dir_base, task_id)
+        done_count[0] += 1
+        _update_stage(task_id, "tokenize", {
+            "status": "running",
+            "message": f"tokenize 进度 {done_count[0]}/{len(result_files)}",
+        })
+        return result
 
     try:
-        for file_info in result_files:
-            input_file = file_info["file"]
-            if not os.path.exists(input_file):
-                logger.warning(f"[resume] 文件不存在，跳过: {input_file}")
-                tokenize_results.append({
-                    "file": os.path.basename(input_file),
-                    "status": "failed", "error": "文件不存在", "outputs": {},
-                })
-                continue
-            logger.info(f"[resume] tokenize: {os.path.basename(input_file)} ({file_info.get('count', '?')} 条)")
-            result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, output_dir_base, task_id)
-            tokenize_results.append(result)
-            if result["status"] == "completed":
-                total_lines += result.get("lines", 0)
-                total_seconds += result.get("duration_seconds", 0.0)
-            _update_stage(task_id, "tokenize", {
-                "status": "running",
-                "message": f"tokenize 进度 {len(tokenize_results)}/{len(result_files)}，{total_lines} 条",
-            })
+        tasks = [asyncio.create_task(_tokenize_one(fi)) for fi in result_files]
+        tokenize_results = await asyncio.gather(*tasks)
+        tokenize_results = list(tokenize_results)
+        for r in tokenize_results:
+            if r["status"] == "completed":
+                total_lines += r.get("lines", 0)
+                total_seconds += r.get("duration_seconds", 0.0)
     finally:
         try:
             tokenize_daemon.stop()
@@ -959,6 +969,55 @@ async def _run_tokenize_only(task_id: str):
 
 
 # ============================================================
+# Stage 4: 分钟级命中率趋势
+# ============================================================
+async def _run_trend_stage(task_id: str):
+    """计算分钟级命中率趋势并保存到 report/hit_rate_trend.json"""
+    _update_stage(task_id, "trend", {"status": "running", "message": "正在计算分钟级命中率趋势..."}, "trend")
+    logger.info("[trend] 开始趋势计算: %s", task_id)
+    try:
+        from compute_trend import compute_and_save, _collect_model_outputs
+
+        task_data_dir = _task_dir(task_id)
+        status = _read_status(task_id)
+        tokenize_stage = (status or {}).get("pipeline", {}).get("stages", {}).get("tokenize", {})
+        status_model_outputs = tokenize_stage.get("model_outputs")
+        model_outputs = _collect_model_outputs(task_data_dir, status_model_outputs)
+
+        if not model_outputs:
+            _update_stage(task_id, "trend", {
+                "status": "completed",
+                "message": "无 input_ids 文件，跳过趋势计算",
+            })
+            return
+
+        cfg = _load_olap_config()
+        cache_size = cfg.get("pipeline_cache_size", 200000000)
+        block_size = cfg.get("pipeline_block_size", 16)
+
+        output_file = await asyncio.to_thread(
+            compute_and_save,
+            task_data_dir=task_data_dir,
+            cache_size=cache_size,
+            block_size=block_size,
+            model_outputs=model_outputs,
+        )
+
+        _update_stage(task_id, "trend", {
+            "status": "completed",
+            "message": f"趋势计算完成 ({len(model_outputs)} 模型)",
+            "output_file": output_file,
+        })
+        logger.info("[trend] 趋势计算完成: %s -> %s", task_id, output_file)
+    except Exception as e:
+        logger.warning(f"[trend] 趋势计算失败: {task_id}: {e}", exc_info=True)
+        _update_stage(task_id, "trend", {
+            "status": "failed",
+            "message": f"趋势计算失败: {str(e)[:200]}",
+        })
+
+
+# ============================================================
 # 主入口
 # ============================================================
 async def run_pipeline(args):
@@ -966,15 +1025,21 @@ async def run_pipeline(args):
     logger.info(f"Pipeline started: {task_id}")
 
     try:
-        # 检查是否可以从 tokenize 恢复（fetch 已完成则跳过重新拉取数据）
+        # 检查是否可以从更晚的阶段恢复
         existing_status = _read_status(task_id)
+        stages = (existing_status or {}).get("pipeline", {}).get("stages", {})
+        tokenize_already_done = (
+            existing_status is not None
+            and stages.get("tokenize", {}).get("status") == "completed"
+        )
         fetch_already_done = (
             existing_status is not None
-            and existing_status.get("pipeline", {}).get("stages", {})
-                .get("fetch", {}).get("status") == "completed"
+            and stages.get("fetch", {}).get("status") == "completed"
         )
 
-        if fetch_already_done:
+        if tokenize_already_done:
+            logger.info(f"[pipeline] tokenize 已完成，直接进入 simulate: {task_id}")
+        elif fetch_already_done:
             logger.info(f"[pipeline] fetch 已完成，从 tokenize 阶段恢复: {task_id}")
             await _run_tokenize_only(task_id)
         else:
@@ -992,6 +1057,15 @@ async def run_pipeline(args):
 
         # Stage 3
         await _run_simulate_stage(task_id)
+
+        # Stage 4: 分钟级命中率趋势
+        await _run_trend_stage(task_id)
+
+        # 标记 done
+        status = _read_status(task_id)
+        if status and status["pipeline"].get("current_stage") not in ("done", "failed"):
+            status["pipeline"]["current_stage"] = "done"
+            _write_status(status)
         logger.info(f"Pipeline completed: {task_id}")
 
     except Exception as e:

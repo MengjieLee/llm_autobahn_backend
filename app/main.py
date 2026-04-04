@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -40,12 +42,54 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:  # noqa: BLE001
         logger.exception("初始化 Doris 连接失败，已跳过 Doris，应用继续启动")
+
+    # 启动兜底扫描（最近 24h 未通知任务），跑完即释放，不持有引用
+    asyncio.create_task(_scan_unnotified_tasks_once())
+
     try:
         yield
     finally:
         if doris_connector:
             await close_doris_connector()
         logger.info(f"后台终止 | name={settings.app_name}", )
+
+
+async def _scan_unnotified_tasks_once():
+    """启动时扫描一次，处理历史遗留的未通知任务（如上次重启前完成的任务）。"""
+    import glob as _glob
+    import json as _json
+    import time as _time
+    from app.api.v1.olap import _notify_task_done
+
+    STATUS_BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "olap_database", "status")
+
+    await asyncio.sleep(10)  # 等服务完全启动
+
+    def _do_scan():
+        now = _time.time()
+        results = []
+        for path in _glob.glob(os.path.join(STATUS_BASE, "**", "*.json"), recursive=True):
+            try:
+                if now - os.path.getmtime(path) > 86400:
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    status = _json.load(f)
+                stage = status.get("pipeline", {}).get("current_stage", "")
+                if stage in ("done", "failed") and not status.get("notified"):
+                    results.append(status)
+            except Exception:
+                continue
+        return results
+
+    try:
+        unnotified = await asyncio.to_thread(_do_scan)
+        for status in unnotified:
+            logger.info(f"[notify-scan] 启动时发现未通知任务: {status.get('task_id')}")
+            _notify_task_done(status)
+        if unnotified:
+            logger.info(f"[notify-scan] 启动扫描完成，补发 {len(unnotified)} 条通知")
+    except Exception as e:
+        logger.warning(f"[notify-scan] 启动扫描异常: {e}")
 
 
 def create_app() -> FastAPI:
