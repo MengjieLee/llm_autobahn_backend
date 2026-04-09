@@ -69,7 +69,10 @@ def _calc_single_file(txt_file: str, cache_calc_path: str, cache_size: int, bloc
             "-b", str(block_size),
             "-p", "true"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        # 动态超时：基础120秒 + 每100MB增加1秒，最大600秒（10分钟）
+        file_size_mb = os.path.getsize(txt_file) / (1024 * 1024)
+        timeout = min(600, max(120, int(file_size_mb / 100) + 120))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         elapsed = _time.monotonic() - t0
         if result.returncode != 0:
             logger.warning(
@@ -112,7 +115,10 @@ def _calc_stats(data_points: List[dict]) -> dict:
     }
 
 
-def _collect_model_outputs(task_data_dir: str, status_model_outputs: Optional[Dict] = None) -> Dict[str, List[str]]:
+def _collect_model_outputs(
+    task_data_dir: str,
+    status_model_outputs: Optional[Dict] = None,
+) -> Dict[str, List[str]]:
     """收集 per-model per-slice 文件，优先使用 status 中记录的路径，否则扫描目录"""
     model_outputs = {}
     if status_model_outputs:
@@ -197,11 +203,11 @@ def compute_trend(
     # ------------------------------------------------------------------
     # 构建任务列表：区分可复用缓存 vs 需计算的文件
     # ------------------------------------------------------------------
-    work_items: List[tuple] = []       # (model, txt_file)
+    work_items: List[tuple] = []       # (model, file_path)
     cached_items: List[tuple] = []     # (model, {"time": ..., "hit_rate": ...})
 
-    for model, txt_files in model_outputs.items():
-        for f in txt_files:
+    for model, files in model_outputs.items():
+        for f in files:
             if not os.path.exists(f) or os.path.getsize(f) == 0:
                 continue
             fname = os.path.basename(f)
@@ -231,8 +237,8 @@ def compute_trend(
         workers = min(max_workers, len(work_items))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             future_to_model = {}
-            for model, txt_file in work_items:
-                fut = pool.submit(_calc_single_file, txt_file, cache_calc_path, cache_size, block_size)
+            for model, file_path in work_items:
+                fut = pool.submit(_calc_single_file, file_path, cache_calc_path, cache_size, block_size)
                 future_to_model[fut] = model
 
             for future in concurrent.futures.as_completed(future_to_model):
@@ -305,7 +311,10 @@ def compute_and_save(
     返回输出文件路径。
     """
     logger.info("[trend] compute_and_save: %s", task_data_dir)
-    result = compute_trend(task_data_dir, cache_calc_path, cache_size, block_size, model_outputs, max_workers)
+    result = compute_trend(
+        task_data_dir, cache_calc_path, cache_size, block_size,
+        model_outputs, max_workers,
+    )
     report_dir = os.path.join(task_data_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
     output_file = os.path.join(report_dir, "hit_rate_trend.json")

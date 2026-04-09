@@ -54,6 +54,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("run_pipeline")
 
+# es_query logger 在 logging_config.py 中设置了 propagate=False，
+# K8s Job 环境不加载该配置，需手动配置 handler
+_es_logger = logging.getLogger("es_query")
+_es_logger.setLevel(logging.INFO)
+_es_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+if not _es_logger.handlers:
+    # stderr — kubectl logs 可见
+    _es_stderr = logging.StreamHandler()
+    _es_stderr.setFormatter(_es_fmt)
+    _es_logger.addHandler(_es_stderr)
+
+
+def _setup_es_log_file(task_id: str):
+    """在 main() 解析出 task_id 后调用，添加文件 handler。"""
+    _es_log_dir = os.path.join(BASE_DIR, "es_logs")
+    os.makedirs(_es_log_dir, exist_ok=True)
+    _es_log_file = os.path.join(
+        _es_log_dir,
+        f"{task_id}_es_query.log",
+    )
+    _es_file = logging.FileHandler(_es_log_file, encoding="utf-8")
+    _es_file.setFormatter(_es_fmt)
+    _es_logger.addHandler(_es_file)
+
 
 # ============================================================
 # 工具函数（与 olap.py 保持一致）
@@ -67,10 +91,12 @@ _OLAP_DEFAULTS = {
     "pipeline_block_size": 16,
     "pipeline_cache_size": 200000000,
     "pipeline_tokenize_concurrency": 4,
-    "pipeline_fetch_concurrency": 12,
-    "pipeline_es_scroll_workers": 60,
+    "pipeline_fetch_concurrency": 2,
+    "pipeline_fetch_window_concurrency": 24,
+    "pipeline_es_scroll_workers": 30,
     "pipeline_tokenize_workers": 4,
     "pipeline_tokenize_batch_size": 200,
+    "pipeline_slice_minutes": 60,
     "pipeline_default_path": "/v2/coding/chat/completions",
     "olap_qpd_limit": 1,
     "models": [],
@@ -167,6 +193,134 @@ def _set_failed(task_id: str, stage: str, error_msg: str):
 
 
 # ============================================================
+# 分钟级子切片：将大 JSONL 文件按 @timestamp 拆分
+# ============================================================
+_TS_RE = re.compile(rb'"@timestamp"\s*:\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+_BJT_OFFSET = timedelta(hours=8)
+
+
+def _extract_timestamp_bjt(line: bytes):
+    """从 JSONL 行中快速提取 @timestamp 并转为 BJT datetime（不做 json.loads）。"""
+    m = _TS_RE.search(line)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1).decode(), "%Y-%m-%dT%H:%M:%S") + _BJT_OFFSET
+
+
+def _split_jsonl_by_time(
+    hourly_file: str,
+    hour_start: datetime,
+    hour_end: datetime,
+    slice_minutes: int,
+    task_data_dir: str,
+) -> list:
+    """
+    将已按 @timestamp 升序排列的 JSONL 文件拆分为多个子切片文件。
+
+    返回: [{"file": path, "start": dt, "end": dt, "line_count": n}, ...]
+    空子切片不写文件、不返回。
+
+    性能优化（针对 CFS 网络文件系统）：
+    - 读写均使用 128MB 缓冲区，大幅减少网络 I/O 次数
+    - 预编译时间边界为 epoch 秒数，避免每行创建 datetime 对象
+    - 时间戳提取用 int 算术代替 datetime.strptime
+    """
+    # 生成时间边界
+    boundaries = []
+    cur = hour_start
+    while cur < hour_end:
+        nxt = min(cur + timedelta(minutes=slice_minutes), hour_end)
+        boundaries.append((cur, nxt))
+        cur = nxt
+
+    if len(boundaries) <= 1:
+        # 不需要拆分
+        return []
+
+    # 预计算边界的 epoch 秒数（用 int 比较代替 datetime 比较，快 ~5x）
+    _EPOCH = datetime(1970, 1, 1)
+    boundary_ends_epoch = [int((b[1] - _EPOCH).total_seconds()) for b in boundaries]
+
+    # 预编译子切片文件名
+    sub_files = []
+    for s_start, s_end in boundaries:
+        s_tag_start = s_start.strftime("%Y%m%d_%H%M%S")
+        s_tag_end = s_end.strftime("%Y%m%d_%H%M%S")
+        sub_files.append(os.path.join(task_data_dir, f"kv_{s_tag_start}_{s_tag_end}.jsonl"))
+
+    # 快速时间戳提取：返回 epoch 秒数（int），避免 datetime 对象创建
+    # @timestamp 格式: "2026-04-06T12:34:56" (UTC)，+8h 转 BJT
+    _ts_re = _TS_RE
+    _BJT_SECS = 8 * 3600
+
+    def _extract_epoch(line: bytes) -> int:
+        """提取 @timestamp 并返回 BJT epoch 秒数，失败返回 -1。"""
+        m = _ts_re.search(line)
+        if not m:
+            return -1
+        raw = m.group(1)  # b"2026-04-06T12:34:56"
+        # 手动解析避免 strptime 开销（占原逻辑 ~60% 时间）
+        yr = int(raw[0:4])
+        mo = int(raw[5:7])
+        dy = int(raw[8:10])
+        hr = int(raw[11:13])
+        mi = int(raw[14:16])
+        sc = int(raw[17:19])
+        # 简化 days 计算（2000-2099 范围内精确）
+        # days from epoch (1970-01-01)
+        y = yr - 1
+        days = y * 365 + y // 4 - y // 100 + y // 400 - 719162  # days from 0000 to epoch
+        _MONTH_DAYS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+        days += _MONTH_DAYS[mo - 1] + (dy - 1)
+        if mo > 2 and (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0)):
+            days += 1
+        return days * 86400 + hr * 3600 + mi * 60 + sc + _BJT_SECS
+
+    # 128MB 缓冲区：大幅减少 CFS 上的 read/write 系统调用次数
+    _BUF_SIZE = 128 * 1024 * 1024
+
+    handles = [None] * len(boundaries)
+    counts = [0] * len(boundaries)
+    slot = 0  # 前向游标
+    n_boundaries = len(boundaries)
+
+    logger.info(f"[split] 开始拆分 {os.path.basename(hourly_file)} -> {n_boundaries} 个子切片 (buf={_BUF_SIZE // (1024*1024)}MB)")
+
+    with open(hourly_file, "rb", buffering=_BUF_SIZE) as f_in:
+        for line in f_in:
+            if len(line) <= 1:
+                continue  # 跳过空行（\n 或空）
+
+            ts_epoch = _extract_epoch(line)
+            if ts_epoch >= 0:
+                # 前向推进游标（用 int 比较）
+                while slot < n_boundaries - 1 and ts_epoch >= boundary_ends_epoch[slot]:
+                    slot += 1
+
+            if handles[slot] is None:
+                handles[slot] = open(sub_files[slot], "wb", buffering=_BUF_SIZE)
+
+            handles[slot].write(line)
+            counts[slot] += 1
+
+    # 关闭所有句柄，收集结果
+    results = []
+    for i, (s_start, s_end) in enumerate(boundaries):
+        if handles[i] is not None:
+            handles[i].close()
+            results.append({
+                "file": sub_files[i],
+                "start": s_start,
+                "end": s_end,
+                "line_count": counts[i],
+            })
+            logger.info(f"[split] 子切片 {os.path.basename(sub_files[i])}: {counts[i]} 行")
+
+    logger.info(f"[split] {os.path.basename(hourly_file)} -> {len(results)} 个子切片 (完成)")
+    return results
+
+
+# ============================================================
 # Stage 1+2: fetch → tokenize (streaming pipeline)
 # ============================================================
 async def _run_streaming_fetch_tokenize(
@@ -218,14 +372,16 @@ async def _run_streaming_fetch_tokenize(
     if SCRIPTS_DIR not in sys.path:
         sys.path.insert(0, SCRIPTS_DIR)
     from kv_pipeline import TokenizeDaemonClient  # noqa: E402
+    num_daemons = cfg["pipeline_tokenize_concurrency"]
     tokenize_daemon = TokenizeDaemonClient(
         workers=cfg["pipeline_tokenize_workers"],
         batch_size=cfg["pipeline_tokenize_batch_size"],
         default_model=cfg["pipeline_default_model"],
+        num_daemons=num_daemons,
     )
-    logger.info(f"[daemon] 启动共享 tokenize daemon (workers={cfg['pipeline_tokenize_workers']})...")
+    logger.info(f"[daemon] 启动 {num_daemons} 个 tokenize daemon (workers_each={cfg['pipeline_tokenize_workers']})...")
     tokenize_daemon.start(timeout=300.0)
-    logger.info("[daemon] 就绪，所有切片共享同一批 worker")
+    logger.info(f"[daemon] {num_daemons} 个 daemon 就绪，切片级真并行")
 
     def _update_fetch_progress():
         msg_parts = [f"拉取进度 {fetch_done_count[0]}/{total_slices}，已获取 {fetch_total_count[0]} 条"]
@@ -280,49 +436,111 @@ async def _run_streaming_fetch_tokenize(
         incomplete_file = os.path.join(task_data_dir, f"{base_name}.jsonl.incomplete")
         final_file = os.path.join(task_data_dir, f"{base_name}.jsonl")
 
-        es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
+        max_scroll_retries = 8
+        for scroll_attempt in range(max_scroll_retries + 1):
+            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
 
-        async with fetch_sem:
-            _update_fetch_progress()
-
-            def _cb(count, msg):
-                _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
-                _progress_dirty[0] = True
-
-            try:
-                hour_count = await es.query_to_file(
-                    h_start_str, h_end_str, incomplete_file, status_callback=_cb
-                )
-                os.rename(incomplete_file, final_file)
-                fetch_total_count[0] += hour_count
-                fetch_done_count[0] += 1
-                fetch_results.append({
-                    "file": final_file,
-                    "hour": f"{h_start_str}~{h_end_str}",
-                    "count": hour_count
-                })
+            async with fetch_sem:
                 _update_fetch_progress()
 
-                if hour_count > 0:
-                    t = asyncio.create_task(
-                        _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                def _cb(count, msg):
+                    _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
+                    _progress_dirty[0] = True
+
+                try:
+                    hour_count = await es.query_to_file(
+                        h_start_str, h_end_str, incomplete_file, status_callback=_cb,
+                        window_concurrency=cfg.get("pipeline_fetch_window_concurrency", 24)
                     )
-                    tokenize_tasks.append(t)
+                    os.rename(incomplete_file, final_file)
+                    fetch_total_count[0] += hour_count
+                    fetch_done_count[0] += 1
+                    fetch_results.append({
+                        "file": final_file,
+                        "hour": f"{h_start_str}~{h_end_str}",
+                        "count": hour_count
+                    })
+                    _update_fetch_progress()
 
-            except Exception as e:
-                if not os.path.exists(incomplete_file):
-                    with open(incomplete_file, 'w') as _f:
-                        pass
-                fetch_done_count[0] += 1
-                fetch_incomplete.append({
-                    "file": f"{base_name}.jsonl.incomplete",
-                    "hour": f"{h_start_str}~{h_end_str}",
-                    "error": str(e)[:200]
-                })
-                logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
-                _update_fetch_progress()
-            finally:
-                es.close()
+                    if hour_count > 0:
+                        # 优先读取 per-task 配置的 slice_minutes
+                        task_status = _read_status(task_id)
+                        slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
+                        if slice_minutes < 60:
+                            # 拆分为子切片并分别提交 tokenize
+                            sub_slices = await asyncio.to_thread(
+                                _split_jsonl_by_time, final_file, h_start, h_end, slice_minutes, task_data_dir
+                            )
+                            if sub_slices:
+                                for sub in sub_slices:
+                                    t = asyncio.create_task(
+                                        _tokenize_single_with_tracking(sub["file"], output_dir, task_id)
+                                    )
+                                    tokenize_tasks.append(t)
+                            else:
+                                # 拆分返回空（slice_minutes >= 整段时长），走原逻辑
+                                t = asyncio.create_task(
+                                    _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                                )
+                                tokenize_tasks.append(t)
+                        else:
+                            t = asyncio.create_task(
+                                _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                            )
+                            tokenize_tasks.append(t)
+
+                    es.close()
+                    return  # 成功，退出重试循环
+
+                except Exception as e:
+                    es.close()
+                    err_msg = str(e)
+                    is_scroll_err = "too many scroll contexts" in err_msg.lower() or "Trying to create too many scroll contexts" in err_msg
+                    if is_scroll_err and scroll_attempt < max_scroll_retries:
+                        wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                        logger.warning(
+                            f"[fetch] slice {h_start_str}~{h_end_str} scroll limit hit "
+                            f"(attempt {scroll_attempt + 1}/{max_scroll_retries}), "
+                            f"waiting {wait_secs}s before retry..."
+                        )
+                        _cb_msg[0] = f"[{idx + 1}/{total_slices}] scroll 超限，等待 {wait_secs}s 后重试 ({scroll_attempt + 1}/{max_scroll_retries})..."
+                        _progress_dirty[0] = True
+                        # 释放 fetch_sem（退出 async with），等待后重新进入循环
+                        break  # break 出 async with，然后 await sleep 在外面
+
+                    # 非 scroll 错误或重试耗尽，走失败路径
+                    if not os.path.exists(incomplete_file):
+                        with open(incomplete_file, 'w') as _f:
+                            pass
+                    fetch_done_count[0] += 1
+                    fetch_incomplete.append({
+                        "file": f"{base_name}.jsonl.incomplete",
+                        "hour": f"{h_start_str}~{h_end_str}",
+                        "error": str(e)[:200]
+                    })
+                    logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
+                    _update_fetch_progress()
+                    return  # 失败，退出重试循环
+            # end async with fetch_sem — semaphore released
+
+            # scroll limit 重试等待（在 semaphore 外等待，不占位）
+            if scroll_attempt < max_scroll_retries:
+                wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                await asyncio.sleep(wait_secs)
+                continue  # 重新进入 for 循环获取 semaphore
+
+        # 所有重试用尽仍失败
+        if not os.path.exists(incomplete_file):
+            with open(incomplete_file, 'w') as _f:
+                pass
+        fetch_done_count[0] += 1
+        fetch_incomplete.append({
+            "file": f"{base_name}.jsonl.incomplete",
+            "hour": f"{h_start_str}~{h_end_str}",
+            "error": f"scroll context limit exceeded after {max_scroll_retries} retries"
+        })
+        logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} scroll limit retries exhausted")
+        _update_fetch_progress()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         async with tokenize_sem:
@@ -466,7 +684,7 @@ async def _run_streaming_fetch_tokenize(
         "success_count": len(success_files), "failed_count": len(failed_files),
         "models": list(model_txt_files.keys()),
         "all_detected_models": all_detected_models,
-        "files": tokenize_results
+        "files": tokenize_results,
     })
 
     # 释放中间数据
@@ -686,6 +904,7 @@ async def _run_simulate_stage(task_id: str):
     tokenize_stage = status.get("pipeline", {}).get("stages", {}).get("tokenize", {})
     model_outputs = tokenize_stage.get("model_outputs", {})
 
+    # ---- file 模式 ----
     if not model_outputs:
         tokenized_dir = os.path.join(task_data_dir, "tokenized")
         for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "**", "*_input_ids.txt"), recursive=True)):
@@ -883,20 +1102,54 @@ async def _run_tokenize_only(task_id: str):
         sys.path.insert(0, SCRIPTS_DIR)
     from kv_pipeline import TokenizeDaemonClient  # noqa: E402
 
+    num_daemons = cfg["pipeline_tokenize_concurrency"]
     tokenize_daemon = TokenizeDaemonClient(
         workers=cfg["pipeline_tokenize_workers"],
         batch_size=cfg["pipeline_tokenize_batch_size"],
         default_model=cfg["pipeline_default_model"],
+        num_daemons=num_daemons,
     )
-    logger.info(f"[resume] 启动 daemon (workers={cfg['pipeline_tokenize_workers']})...")
+    logger.info(f"[resume] 启动 {num_daemons} 个 daemon (workers_each={cfg['pipeline_tokenize_workers']})...")
     tokenize_daemon.start(timeout=300.0)
-    logger.info(f"[resume] daemon 就绪，共 {len(result_files)} 个文件待 tokenize")
+    logger.info(f"[resume] {num_daemons} 个 daemon 就绪，共 {len(result_files)} 个文件待 tokenize")
 
     _update_stage(task_id, "tokenize", {
         "status": "running",
         "message": f"恢复 tokenize，共 {len(result_files)} 个文件...",
     }, "tokenize")
     _update_stage(task_id, "simulate", {"status": "pending", "message": "等待 tokenize..."})
+
+    # 子切片：如果 slice_minutes < 60，对每个小时文件先拆分
+    # 优先读取 per-task 配置的 slice_minutes
+    task_status = _read_status(task_id)
+    slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
+    task_data_dir = _task_dir(task_id)
+    tokenize_file_list = []  # 最终要 tokenize 的文件列表
+
+    if slice_minutes < 60:
+        for fi in result_files:
+            input_file = fi["file"]
+            if not os.path.exists(input_file):
+                continue
+            # 从文件名解析时间范围
+            fname = os.path.basename(input_file)
+            m = re.match(r'kv_(\d{8}_\d{6})_(\d{8}_\d{6})\.jsonl$', fname)
+            if not m:
+                tokenize_file_list.append({"file": input_file})
+                continue
+            h_start = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+            h_end = datetime.strptime(m.group(2), "%Y%m%d_%H%M%S")
+            sub_slices = _split_jsonl_by_time(input_file, h_start, h_end, slice_minutes, task_data_dir)
+            if sub_slices:
+                for sub in sub_slices:
+                    tokenize_file_list.append({"file": sub["file"]})
+            else:
+                tokenize_file_list.append({"file": input_file})
+        logger.info(f"[resume] 子切片拆分完成，共 {len(tokenize_file_list)} 个文件待 tokenize")
+    else:
+        tokenize_file_list = [{"file": fi["file"]} for fi in result_files]
+
+    total_tokenize_files = len(tokenize_file_list)
 
     tokenize_results = []
     total_lines = 0
@@ -912,18 +1165,18 @@ async def _run_tokenize_only(task_id: str):
                 "file": os.path.basename(input_file),
                 "status": "failed", "error": "文件不存在", "outputs": {},
             }
-        logger.info(f"[resume] tokenize: {os.path.basename(input_file)} ({file_info.get('count', '?')} 条)")
+        logger.info(f"[resume] tokenize: {os.path.basename(input_file)}")
         async with tokenize_sem:
             result = await _run_tokenize_via_daemon(tokenize_daemon, input_file, output_dir_base, task_id)
         done_count[0] += 1
         _update_stage(task_id, "tokenize", {
             "status": "running",
-            "message": f"tokenize 进度 {done_count[0]}/{len(result_files)}",
+            "message": f"tokenize 进度 {done_count[0]}/{total_tokenize_files}",
         })
         return result
 
     try:
-        tasks = [asyncio.create_task(_tokenize_one(fi)) for fi in result_files]
+        tasks = [asyncio.create_task(_tokenize_one(fi)) for fi in tokenize_file_list]
         tokenize_results = await asyncio.gather(*tasks)
         tokenize_results = list(tokenize_results)
         for r in tokenize_results:
@@ -982,6 +1235,7 @@ async def _run_trend_stage(task_id: str):
         status = _read_status(task_id)
         tokenize_stage = (status or {}).get("pipeline", {}).get("stages", {}).get("tokenize", {})
         status_model_outputs = tokenize_stage.get("model_outputs")
+
         model_outputs = _collect_model_outputs(task_data_dir, status_model_outputs)
 
         if not model_outputs:
@@ -1025,6 +1279,14 @@ async def run_pipeline(args):
     logger.info(f"Pipeline started: {task_id}")
 
     try:
+        # CLI --slice-minutes 覆盖写入 status config
+        if getattr(args, "slice_minutes", None) is not None:
+            status = _read_status(task_id)
+            if status:
+                status.setdefault("config", {})["slice_minutes"] = args.slice_minutes
+                _write_status(status)
+                logger.info(f"[pipeline] CLI 覆盖 slice_minutes={args.slice_minutes}")
+
         # 检查是否可以从更晚的阶段恢复
         existing_status = _read_status(task_id)
         stages = (existing_status or {}).get("pipeline", {}).get("stages", {})
@@ -1088,7 +1350,12 @@ def main():
     parser.add_argument("--app-id", default="app-3Lut8O2E", help="ES app ID")
     parser.add_argument("--path", default="/v2/coding/chat/completions", help="场景过滤路径")
     parser.add_argument("--models", default="", help="模型过滤，逗号分隔")
+    parser.add_argument("--slice-minutes", type=int, default=None,
+                        help="子切片粒度（分钟），覆盖 status.json 和全局配置。60=不拆分，1=每分钟一个子切片")
     args = parser.parse_args()
+
+    # es_query 日志文件以 task_id 命名，便于定位
+    _setup_es_log_file(args.task_id)
 
     # 确保 HF_TOKEN 可用
     hf_token = os.environ.get("HF_TOKEN", "")

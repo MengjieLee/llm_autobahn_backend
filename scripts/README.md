@@ -25,7 +25,7 @@
          │                       │                       │
          ▼                       ▼                       ▼
    ES scroll 查询          ES scroll 查询          ES scroll 查询
-   (最多 12 路并发)
+   (最多 2 路并发)         (每切片内 60 个 1 分钟窗口 × 24 路并行)
          │                       │                       │
          ▼                       ▼                       ▼
    kv_0.jsonl              kv_1.jsonl              kv_23.jsonl
@@ -54,8 +54,6 @@
                   │  cache_pipeline.py (per model)│
                   │                              │
                   │  Step 1: 合并所有切片的 txt    │
-                  │  (二进制读写+缓存拷贝，快速 I/O)│
-                  │                              │
                   │  Step 2: cache_simulation.py  │
                   │    └→ cache_calc (C++ LRU)    │
                   │                              │
@@ -82,19 +80,17 @@
 olap.py (_run_pipeline) / run_pipeline.py
   │
   ├─ Stage 1: ESIndexService.query_to_file()
-  │     └→ ES scroll → kv_xxx.jsonl
+  │     └→ 按 1 分钟拆窗口 → N 路并行 scroll → 临时文件 → 按序合并 → kv_xxx.jsonl
   │
   ├─ Stage 2: kv_pipeline.py (TokenizeDaemonClient)
-  │     └→ tokenize_script.py (multiprocessing.Pool)
-  │           └→ per-model _input_ids.txt
+  │     └→ tokenize_daemon.py (multiprocessing.Pool, 常驻复用 tokenizer)
+  │           └→ per-model _input_ids.txt (逐行 write)
   │
-  ├─ Stage 3: subprocess cache_pipeline.py
-  │     ├→ merge_input_files() → merged_input_ids.txt
-  │     └→ subprocess cache_simulation.py
-  │           └→ subprocess cache_calc (C++) → cache_report.json
+  ├─ Stage 3: 缓存模拟
+  │     └→ cache_pipeline.py → merge_input_files() → cache_calc
   │
   └─ Stage 4: compute_trend.py (ThreadPoolExecutor)
-        └→ 对每个 model 的每个时间片调用 cache_calc
+        └→ _calc_single_file() → cache_calc -f <txt>
               └→ hit_rate_trend.json
 ```
 
@@ -104,29 +100,83 @@ olap.py (_run_pipeline) / run_pipeline.py
 
 | 层级 | 配置项 | 作用 | 默认值 |
 |------|--------|------|--------|
-| **fetch 并发** | `pipeline_fetch_concurrency` | 同时拉取 ES 的切片数（asyncio Semaphore） | 24 |
-| **tokenize 并发** | `pipeline_tokenize_concurrency` | 同时做序列化的切片数（asyncio Semaphore） | 4 |
-| **tokenize 多进程** | `pipeline_tokenize_workers` | 单切片内的 CPU 并行 worker 数（multiprocessing Pool） | 7 |
+| **fetch 并发** | `pipeline_fetch_concurrency` | 同时拉取 ES 的切片数（asyncio Semaphore） | 2 |
+| **fetch 窗口并发** | `pipeline_fetch_window_concurrency` | 单切片内 1 分钟窗口的并行 scroll 数 | 24 |
+| **tokenize 并发（daemon 数）** | `pipeline_tokenize_concurrency` | 同时运行的 daemon 进程数，每个独立处理一个切片 | 4 |
+| **tokenize 多进程** | `pipeline_tokenize_workers` | 每个 daemon 内的 CPU 并行 worker 数（multiprocessing Pool） | 7 |
+
+**ES scroll context 预算**：ES 集群全局限制 500 个并发 scroll context。每个 K8s Job 的最大并发 scroll = `fetch_concurrency × window_concurrency`。当前配置 `2 × 24 = 48`，8 Job 同时运行 = `384 < 500`（23% 余量）。
 
 系统 CPU 峰值负载 ≈ `tokenize_concurrency × tokenize_workers`（如 4 × 7 = 28 核）。
 
 所有配置通过 `app/conf/olap_config.json` **热更新**，修改即生效，无需重启服务。
 
+### 多 Daemon 并行架构
+
+`TokenizeDaemonClient` 会启动 N 个独立的 `tokenize_daemon.py` 子进程（N = `tokenize_concurrency`），每个 daemon 拥有自己的 `multiprocessing.Pool(workers)` 和完整的 tokenizer 副本。任务通过 **Round-Robin** 均匀分配到各 daemon，实现切片级真并行。
+
+```
+run_pipeline.py (asyncio 事件循环)
+  │
+  ├── fetch_sem (Semaphore=2)：并发拉取 ES
+  │
+  └── tokenize_sem (Semaphore=4)：控制 in-flight 任务数
+        │
+        ▼  Round-Robin 分发
+  ┌───────────┬───────────┬───────────┬───────────┐
+  │ daemon-0  │ daemon-1  │ daemon-2  │ daemon-3  │
+  │ Pool(7)   │ Pool(7)   │ Pool(7)   │ Pool(7)   │
+  │ 切片 0,4  │ 切片 1,5  │ 切片 2,6  │ 切片 3,7  │
+  │ 8,12,16   │ 9,13,17   │ 10,14,18  │ 11,15,19  │
+  │ 20        │ 21        │ 22        │ 23        │
+  └───────────┴───────────┴───────────┴───────────┘
+        │           │           │           │
+        └───────────┴───────────┴───────────┘
+                    ▼
+          共享 _pending dict（线程安全）
+          → wait(task_id) 返回结果
+```
+
+**多 daemon 的代价**：
+
+| 代价 | 量级 | 说明 |
+|------|------|------|
+| 内存 × N | 每 daemon 独立加载 tokenizer ~2-3GB，4 daemon ≈ 12GB | 110Gi Pod 充裕（COW 仅在 daemon 内部 fork 时生效，跨 daemon 不共享） |
+| 进程数 × N | 4 daemon 主进程 + 28 Pool workers = 32 进程 | 实际 CPU 密集的只有 28 个 worker |
+| batch_size 内存 | 4 daemon × 14 pending batches × batch_size 条 | batch_size=3500 时峰值 ~2GB，无压力 |
+| 启动时间 | 并行启动，≈ 单个 daemon 时间（~60s） | N 个 daemon 同时加载 tokenizer |
+
+**性能对比**：
+
+| 指标 | 改造前（1 daemon 串行） | 改造后（4 daemon 并行） |
+|------|----------------------|----------------------|
+| 24 切片 tokenize 总时间 | ~10 小时 | ~2.5 小时 |
+| CPU 利用率 | 7/28 = 25% | 28/28 = 100% |
+| 提速倍数 | 1x | **~4x** |
+
 ### 并发调优注意事项
 
 K8s Job Pod 的工作目录挂载在 **CFS（云文件存储）**上，每次 `read()`/`write()` 都经过网络往返（延迟 1-5ms，带宽约 200-500 MB/s）。
-tokenize 阶段的 I/O 模式是**主进程串行读写 CFS** + worker 并行 CPU 计算：
+tokenize 阶段的 I/O 模式是**每个 daemon 主进程串行读写 CFS** + 各自的 worker 并行 CPU 计算：
 
 ```
+[每个 daemon 内部]
 主进程: open(jsonl, CFS) → 逐行 read → 攒 batch → 分发 worker
 worker: 纯 CPU（tokenize）→ 返回 result 给主进程
 主进程: 收集结果 → write(txt, CFS)
+
+[4 个 daemon 并行]
+daemon-0: 处理切片 0 ──────────────────▶ 处理切片 4 ──────▶ ...
+daemon-1: 处理切片 1 ──────────────────▶ 处理切片 5 ──────▶ ...
+daemon-2: 处理切片 2 ──────────────────▶ 处理切片 6 ──────▶ ...
+daemon-3: 处理切片 3 ──────────────────▶ 处理切片 7 ──────▶ ...
 ```
 
 因此：
-- **`tokenize_concurrency`（文件级并发）是主要调速旋钮**：决定同时有多少个切片在做 I/O + 计算
-- **`tokenize_workers`（单文件 worker 数）加到超过 CPU 核 / concurrency 后收益递减**：worker 产出快于主进程串行收集+写盘的速度
-- 不建议 `workers` 设得过大（如 12+），会导致 worker 空等主进程、内存上涨，反而变慢
+- **`tokenize_concurrency`（daemon 数）是主要调速旋钮**：决定同时有多少个切片在做 I/O + 计算
+- **`tokenize_workers`（单 daemon worker 数）**：确保 `concurrency × workers ≤ CPU 核数`
+- **`tokenize_batch_size`**：每个 worker 一次处理的记录数，影响 IPC 开销和内存；默认 3500，4 daemon 下峰值内存 ~2GB
+- 不建议 `concurrency × workers` 远超 CPU 核数，会导致上下文切换开销反而变慢
 
 ---
 
@@ -245,9 +295,9 @@ output_dir/
 
 ### 3. cache_pipeline.py — 缓存模拟流水线
 
-**被谁调用**：`olap.py` 的 `_run_simulate_stage()` → `_simulate_single_model()` (subprocess)
+**被谁调用**：`run_pipeline.py` 的 `_run_simulate_stage()` → `_simulate_single_model()` (subprocess / asyncio.to_thread)
 
-**两个步骤**：
+**步骤**：
 1. **合并** (`merge_input_files`)：将同一 model 下所有切片的 txt 按文件名排序（含时间戳），逐行合并为 `merged_input_ids.txt`。二进制模式读写 + 缓存拷贝。
 2. **模拟** (`run_simulation`)：调用 `cache_simulation.py` → `cache_calc` 执行 LRU 命中计算。
 
@@ -321,7 +371,7 @@ python scripts/es_model_stats.py -s "2026-03-28 00:00:00" -e "2026-03-29 00:00:0
 
 **被谁调用**：`run_pipeline.py` 的 `_run_trend_stage()` (asyncio.to_thread)，也可 CLI 独立回填。
 
-**职责**：对每个模型的每个时间片 `input_ids.txt` 独立调用 `cache_calc`，提取 per-slice `hit_rate`，按时间排序后计算整体维度的 mean/max/min 统计，生成趋势曲线数据。
+**职责**：对每个模型的每个时间片独立调用 `cache_calc`，提取 per-slice `hit_rate`，按时间排序后计算整体维度的 mean/max/min 统计，生成趋势曲线数据。
 
 **核心优化**：
 - **单一共享 ThreadPoolExecutor**：所有模型的文件统一提交到一个线程池并行处理（默认 max_workers=8）
@@ -430,6 +480,74 @@ python scripts/daily_report.py
 
 ---
 
+### 10. daily_cache_plan.py — 每日定时分析任务调度
+
+**被谁调用**：crontab 定时执行（每天凌晨 00:05）
+
+**职责**：从 `local_workspace/daily_tasks.json` 热加载任务列表，按 `phase` 分批提交 OLAP 分析任务到 API 服务，实现分阶段调度。
+
+**调度策略**：
+```
+                Phase 1（长尾任务）
+                ┌──────────────────────┐
+                │ 全场景_各模型          │  ← 数据量最大，独占全部 scroll 资源
+                │ coding_plan_各模型     │
+                └──────────┬───────────┘
+                           │  轮询 fetch 状态
+                           │  等待 phase 1 fetch 完成
+                           ▼
+                Phase 2（轻量 per-app 任务）
+                ┌──────────────────────┐
+                │ 无问芯穹_glm-5        │
+                │ 讯飞_glm-5           │  ← 6 个任务同时提交
+                │ 金山_glm-5           │    利用 phase 1 释放的余额资源
+                │ 得物_glm-5           │
+                │ 智谱_glm-5           │
+                │ 腾讯_glm-5           │
+                └──────────────────────┘
+```
+
+**热加载任务配置** (`local_workspace/daily_tasks.json`)：
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| `task_name` | 任务名称，支持 `{mm-dd}` 占位符（替换为昨天月日） | `【v6】{mm-dd}_全场景_各模型` |
+| `app_id` | 应用 ID 过滤，空字符串表示全局 | `app-zp79IHFw` |
+| `path` | 场景过滤 | `/v2/coding/chat/completions` |
+| `models` | 模型列表，逗号分隔 | `glm-5,kimi-k2.5` |
+| `start_offset` / `end_offset` | 时间偏移，`day` 相对今天 00:00，`time` 为时刻 | `{"day": -1, "time": "00:00:00"}` |
+| `slice_minutes` | 子切片粒度（覆盖全局配置） | `1` |
+| `phase` | 调度阶段（1 先启动，2 等 1 完成后启动） | `1` |
+| `enabled` | 是否启用 | `true` |
+
+**Phase 间等待机制**：
+- 每 30 秒轮询 `/api/v1/olap/kv/status/{task_id}` 检查 fetch 阶段状态
+- 所有 phase N 任务 fetch 完成（或失败）后才提交 phase N+1
+- 超时 2 小时后强制继续下一阶段（scroll limit retry 兜底）
+
+```bash
+# 直接运行
+python scripts/daily_cache_plan.py
+
+# 预览模式（不实际发送请求）
+python scripts/daily_cache_plan.py --dry-run
+
+# 指定 API 地址
+python scripts/daily_cache_plan.py --base-url http://your-api:8739
+
+# crontab 配置（每天凌晨 00:05）
+5 0 * * * cd /path/to/backend && python scripts/daily_cache_plan.py >> logs/daily_cache_plan.log 2>&1
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--base-url` | API 服务地址 | `http://localhost:8739` |
+| `--token` | API Bearer Token（也可通过 `OLAP_API_TOKEN` 环境变量） | 无 |
+| `--tasks-json` | 任务配置文件路径 | `local_workspace/daily_tasks.json` |
+| `--dry-run` | 仅打印请求参数，不实际发送 | 关闭 |
+
+---
+
 ## cache_calc 算法说明
 
 ### 工作原理
@@ -489,12 +607,14 @@ olap_database/
 │   │   │   ├── kv_..._deepseek-v3.2_input_ids.txt
 │   │   │   └── pipeline_summary.json
 │   │   └── ...
+│   ├── tokenize_logs/                                    ← tokenize 日志（per-slice）
+│   │   ├── kv_..._000000_tokenize.log
+│   │   └── ...
 │   └── report/                                           ← Stage 3+4 产出
 │       ├── glm-5/
 │       │   ├── merged_input_ids.txt
 │       │   └── cache_report.json
 │       ├── deepseek-v3.2/
-│       │   ├── merged_input_ids.txt
 │       │   └── cache_report.json
 │       └── hit_rate_trend.json                            ← Stage 4 趋势数据
 │
@@ -513,16 +633,18 @@ olap_database/
   "pipeline_block_size": 16,
   "pipeline_cache_size": 200000000,
   "pipeline_tokenize_concurrency": 4,
-  "pipeline_fetch_concurrency": 24,
-  "pipeline_es_scroll_workers": 20,
+  "pipeline_fetch_concurrency": 2,
+  "pipeline_fetch_window_concurrency": 24,
+  "pipeline_es_scroll_workers": 30,
   "pipeline_tokenize_workers": 7,
   "pipeline_tokenize_batch_size": 1000,
+  "pipeline_slice_minutes": 60,
   "pipeline_es_scroll_size": 10000,
   "pipeline_default_path": "/v2/coding/chat/completions",
   "olap_qpd_limit": 100,
   "models": ["glm-5", "glm-4.7", "deepseek-v3.2", "kimi-k2.5", "minimax-m2.5", "minimax-m2.1"],
   "k8s_enabled": true,
-  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.4",
+  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.5",
   "k8s_job_cpu_request": "28",
   "k8s_job_memory_request": "110Gi"
 }
@@ -533,12 +655,14 @@ olap_database/
 | `pipeline_default_model` | tokenize 兜底模型 |
 | `pipeline_block_size` | cache_calc block 大小 (token/block) |
 | `pipeline_cache_size` | cache_calc 缓存容量 (block 数量) |
-| `pipeline_tokenize_concurrency` | 同时序列化的切片数 |
+| `pipeline_tokenize_concurrency` | **daemon 数 = 同时并行处理的切片数**（每个 daemon 独立 Pool） |
 | `pipeline_fetch_concurrency` | 同时拉取 ES 的切片数 |
+| `pipeline_fetch_window_concurrency` | 单切片内 1 分钟窗口的并行 ES scroll 数 |
 | `pipeline_es_scroll_workers` | ES scroll 线程池大小 |
 | `pipeline_es_scroll_size` | ES scroll 单次拉取条数 |
-| `pipeline_tokenize_workers` | 单切片的多进程 worker 数 |
-| `pipeline_tokenize_batch_size` | worker 每批处理记录数 |
+| `pipeline_tokenize_workers` | **每个 daemon** 的 Pool worker 数，总 CPU = concurrency × workers |
+| `pipeline_tokenize_batch_size` | 每个 worker 一次处理的记录数（影响 IPC 开销和内存） |
+| `pipeline_slice_minutes` | 子切片粒度（分钟），60=不拆分（向后兼容），设为 10/15/20/30 启用分钟级子切片并行 |
 | `pipeline_default_path` | ES 查询的 path 过滤默认值 |
 | `olap_qpd_limit` | 非 official 用户每日提交限额 |
 | `models` | 前端展示的可选模型列表 |
@@ -563,13 +687,15 @@ olap_database/
 
 | 脚本 | 角色 | 被谁调用 |
 |------|------|---------|
-| `tokenize_script.py` | Token 序列化（核心 CPU 计算） | `kv_pipeline.py` |
+| `tokenize_script.py` | Token 序列化（核心 CPU 计算） | `kv_pipeline.py` (legacy 模式) |
+| `tokenize_daemon.py` | Token 序列化（常驻 daemon，tokenizer 一次加载复用） | `kv_pipeline.py` (daemon 模式，默认) |
 | `kv_pipeline.py` | 序列化调度 + 模型过滤 + 汇总 | `run_pipeline.py` Stage 2 |
 | `cache_pipeline.py` | 合并 txt + 调度模拟 | `run_pipeline.py` Stage 3 |
 | `cache_simulation.py` | 调用 cache_calc + 生成 JSON 报告 | `cache_pipeline.py` |
 | `compute_trend.py` | 分钟级命中率趋势计算 | `run_pipeline.py` Stage 4 / CLI 回填 |
 | `run_pipeline.py` | K8s Job 完整 Pipeline 入口 | K8s Job Pod entrypoint |
 | `daily_report.py` | 每日命中率日报推送 | crontab 定时执行 |
+| `daily_cache_plan.py` | 每日分析任务分阶段调度 | crontab 定时执行 |
 | `es_model_stats.py` | ES 模型分布统计 | 手动运行（独立工具） |
 | `convert_to_cache_input.py` | JSON → txt 格式转换 | 已废弃，不再使用 |
 
@@ -661,4 +787,36 @@ cd src/domains/kv/cache_hit_rate && make clean && make
 已修复。原因是 `loadTrendData` 中 `trendLoading` 在 `renderTrendChart` 之后才设为 false，导致 ECharts canvas 容器尚未渲染到 DOM（被 `v-if="trendLoading"` 遮挡）。修复：在 `nextTick` 之前先关 `trendLoading`。
 
 **Q: tokenize_workers 加大后反而变慢？**
-tokenize 阶段 I/O 在主进程串行执行（读 jsonl + 写 txt 到 CFS），worker 只做纯 CPU 计算。workers 过多会导致产出远超主进程消费速度，worker 空等浪费资源。建议 `workers ≈ CPU 核数 / tokenize_concurrency`。
+确保 `tokenize_concurrency × tokenize_workers ≤ CPU 核数`。例如 4 daemon × 7 workers = 28，刚好匹配 28 核 Pod。设置 12 × 4 = 48 会严重超订 CPU，上下文切换开销导致吞吐腰斩。
+
+**Q: tokenize_concurrency 的含义变了吗？**
+是的。**之前**：`concurrency` 只控制 asyncio Semaphore 排队数，daemon 实际串行处理。**现在**：`concurrency` = 启动的 daemon 数，实现切片级真并行。4 daemon 并行处理 24 切片，理论提速 ~4x。
+
+**Q: 多 daemon 的内存开销有多大？**
+每个 daemon 独立加载全部 6 个 tokenizer（~2-3GB），4 daemon ≈ 12GB。加上 batch_size=3500 时的在途数据 ~2GB，总计 ~14GB。110Gi Pod 完全承受。
+
+**Q: tokenize_batch_size 需要随 daemon 数调整吗？**
+通常不需要。batch_size=3500 在 4 daemon 下的峰值内存约 2GB。如果 daemon 数增加到 8+，可按比例缩小 batch_size。
+
+**Q: ES 查询同一天数据但两次结果条数不同？**
+正常现象。原因有二：(1) ES 上游数据写入有延迟，凌晨查当天数据时部分日志尚未入库，建议至少等到次日中午再查；(2) ES 索引 TTL 会自动清理旧数据，查询时间越晚可能反而略少（差异通常 < 1%）。`pipeline_es_scroll_size` 只是分页大小，不影响总量。
+
+**Q: pipeline_slice_minutes 是什么？什么时候需要调整？**
+`pipeline_slice_minutes` 控制每小时 JSONL 文件的子切片粒度。默认 60（不拆分），设为 10 表示将每小时数据按 `@timestamp` 拆成 6 个 10 分钟的子切片文件，分别提交给不同 daemon 并行 tokenize。当单小时数据量极大（如 5000 万+ 条）导致一个 daemon 独占数小时时，设置更小的 `slice_minutes`（如 10 或 15）可让所有 daemon 同时参与处理，显著缩短 tokenize 时间。趋势图会自动按子切片粒度展示分钟级命中率。
+
+**Q: pipeline_fetch_window_concurrency 是什么？**
+控制单个小时切片内，1 分钟窗口的 ES scroll 并行数。默认 24，即同时启动 24 个 scroll 上下文并行拉取不同分钟的数据，每个窗口写独立临时文件，全部完成后按时间顺序合并为最终 JSONL。改造前 60 个窗口串行执行，单小时 9500 万条需 ~6 小时；改造后 24 路并行 + 合并，预计 ~30-40 分钟。调大该值可提速但会增加 ES scroll context 占用，需确保 `fetch_concurrency × window_concurrency × 同时 Job 数 < 500`（ES 集群 scroll context 上限）。
+
+**Q: fetch 阶段为什么还有合并步骤？会不会很慢？**
+窗口并行化后，每个 1 分钟窗口各写独立临时文件（`*.win_0000.tmp` ~ `*.win_0059.tmp`），fetch 完成后需按顺序合并为单个 JSONL 文件，以保证 `@timestamp` 时间序。合并使用 64MB 大缓冲区的 `shutil.copyfileobj`，对 ~95GB 文件约需 5-15 分钟（纯顺序 I/O），相比串行 fetch 节省的 5+ 小时可忽略不计。
+
+**Q: ES 报 "Trying to create too many scroll contexts" 怎么办？**
+ES 集群全局限制 500 个并发 scroll context。系统内置 **三层防护**：
+1. **并发预算控制**：每个 K8s Job 最多占用 `fetch_concurrency × window_concurrency = 2 × 24 = 48` 个 scroll context，8 Job 同时运行 = 384（预留 23% 余量）。
+2. **svc.py 窗口级重试**：`_query_parallel_windows()` 捕获 scroll limit 错误，自动将 `window_concurrency` 减半重试（最多 3 轮，每轮等 30s）。
+3. **_fetch_slice 切片级重试**：整个切片 fetch 失败时释放 Semaphore 让出资源，等待递增间隔（30s/60s/90s/120s/150s）后重新竞争，最多 5 次重试。
+
+如仍频繁触发，可通过 `olap_config.json` 降低 `pipeline_fetch_concurrency` 或 `pipeline_fetch_window_concurrency`，或减少同时运行的 K8s Job 数量。
+
+**Q: daily_cache_plan.py 的分阶段调度是什么意思？**
+`daily_cache_plan.py` 是每日定时调度脚本，从 `local_workspace/daily_tasks.json` 热加载任务列表。任务按 `phase` 字段分批提交：phase 1（长尾大数据量任务，如全场景全模型、coding plan）先提交，独占全部 ES scroll 资源；等 phase 1 的 fetch 阶段完成后（释放 scroll context），再提交 phase 2（轻量的 per-app 任务）。这避免了所有任务同时启动导致 scroll context 超限，同时确保大任务获得最多资源、最快完成。

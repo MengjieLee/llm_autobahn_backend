@@ -48,10 +48,11 @@ SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 
 class TokenizeDaemonClient:
     """
-    管理一个 tokenize_daemon.py 子进程的生命周期。
+    管理 N 个 tokenize_daemon.py 子进程的生命周期（N = num_daemons）。
     提供 submit(task) / wait(task_id) 接口，内部通过 stdin/stdout JSON 协议通信。
+    Round-Robin 将任务均匀分配到 N 个 daemon，实现切片级真并行。
 
-    关键优化：daemon 进程的 multiprocessing.Pool worker 在整个 pipeline 生命周期内
+    关键优化：每个 daemon 进程的 multiprocessing.Pool worker 在整个 pipeline 生命周期内
     只初始化一次，所有 .jsonl 文件复用同一批 worker，彻底消除重复加载 tokenizer 的开销。
     """
 
@@ -62,21 +63,23 @@ class TokenizeDaemonClient:
         default_model: str = "glm-5",
         override_tokenizer: Optional[str] = None,
         verbose: bool = False,
+        num_daemons: int = 1,
     ):
         self._workers = workers
         self._batch_size = batch_size
         self._default_model = default_model
         self._override_tokenizer = override_tokenizer
         self._verbose = verbose
+        self._num_daemons = max(2, num_daemons)
 
-        self._proc: Optional[subprocess.Popen] = None
+        # 多 daemon 状态：每个元素是 (proc, reader_thread, index) 的 tuple
+        self._daemons: List[tuple] = []
         self._lock = threading.Lock()
         self._pending: Dict[str, dict] = {}   # id -> result (filled on arrival)
-        self._reader_thread: Optional[threading.Thread] = None
         self._task_counter = 0
 
-    def start(self, timeout: float = 120.0):
-        """启动 daemon 进程，阻塞直到收到 ready 信号"""
+    def _start_one_daemon(self, daemon_index: int, timeout: float):
+        """启动单个 daemon 子进程，阻塞直到收到 ready 信号，返回 (proc, reader_thread, index)"""
         cmd = [
             sys.executable, "-u",
             os.path.join(SCRIPTS_DIR, "tokenize_daemon.py"),
@@ -89,11 +92,13 @@ class TokenizeDaemonClient:
         if self._verbose:
             cmd.append("-v")
 
-        self._proc = subprocess.Popen(
+        tag = f"[daemon-{daemon_index}]"
+
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,   # daemon 的 stderr 直通，方便调试
+            stderr=sys.stderr,
             text=True,
             bufsize=1,
             cwd=BASE_DIR,
@@ -102,35 +107,85 @@ class TokenizeDaemonClient:
         # 等待 ready 信号
         deadline = datetime.now().timestamp() + timeout
         while datetime.now().timestamp() < deadline:
-            line = self._proc.stdout.readline()
+            line = proc.stdout.readline()
             if not line:
-                raise RuntimeError("tokenize_daemon 进程意外退出（未收到 ready 信号）")
+                proc.kill()
+                raise RuntimeError(f"{tag} 进程意外退出（未收到 ready 信号）")
             line = line.strip()
             try:
                 msg = json.loads(line)
                 if msg.get("type") == "ready":
-                    print(f"[daemon] 就绪: workers={msg.get('workers')}, batch_size={msg.get('batch_size')}", flush=True)
+                    print(f"{tag} 就绪: workers={msg.get('workers')}, batch_size={msg.get('batch_size')}", flush=True)
                     break
             except json.JSONDecodeError:
-                print(f"[daemon] init: {line}", flush=True)
+                print(f"{tag} init: {line}", flush=True)
         else:
-            self.stop()
-            raise TimeoutError("tokenize_daemon 启动超时")
+            proc.kill()
+            raise TimeoutError(f"{tag} 启动超时 ({timeout}s)")
 
-        # 启动后台读取线程，持续消费 daemon 的输出
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        # 启动后台读取线程
+        reader = threading.Thread(
+            target=self._reader_loop,
+            args=(proc, daemon_index),
+            daemon=True,
+        )
+        reader.start()
 
-    def _reader_loop(self):
-        """后台线程：持续读取 daemon stdout，将结果写入 _pending"""
-        for line in self._proc.stdout:
+        return (proc, reader, daemon_index)
+
+    def start(self, timeout: float = 120.0):
+        """启动所有 daemon 进程，阻塞直到全部就绪"""
+        if self._num_daemons == 1:
+            handle = self._start_one_daemon(0, timeout)
+            self._daemons.append(handle)
+            return
+
+        # 并行启动 N 个 daemon（tokenizer 加载并行发生，总时间 ≈ 单个的时间）
+        handles = [None] * self._num_daemons
+        errors = [None] * self._num_daemons
+
+        def _start_thread(idx):
+            try:
+                handles[idx] = self._start_one_daemon(idx, timeout)
+            except Exception as e:
+                errors[idx] = e
+
+        threads = []
+        for i in range(self._num_daemons):
+            t = threading.Thread(target=_start_thread, args=(i,))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join(timeout + 10)
+
+        # 检查失败
+        failed = [(i, e) for i, e in enumerate(errors) if e is not None]
+        if failed:
+            # 清理已启动的
+            for h in handles:
+                if h is not None:
+                    try:
+                        h[0].stdin.close()
+                        h[0].kill()
+                    except Exception:
+                        pass
+            idx, err = failed[0]
+            raise RuntimeError(f"daemon-{idx} 启动失败: {err}")
+
+        self._daemons = [h for h in handles if h is not None]
+
+    def _reader_loop(self, proc: subprocess.Popen, daemon_index: int):
+        """后台线程：持续读取 daemon stdout，将结果写入共享 _pending"""
+        tag = f"[daemon-{daemon_index}]"
+        for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
-                print(f"[daemon] {line}", flush=True)
+                print(f"{tag} {line}", flush=True)
                 continue
 
             if msg.get("type") == "result":
@@ -138,12 +193,14 @@ class TokenizeDaemonClient:
                 with self._lock:
                     self._pending[task_id] = msg
             else:
-                print(f"[daemon] {line}", flush=True)
+                print(f"{tag} {line}", flush=True)
 
-    def _send(self, msg: dict):
+    def _send(self, daemon_handle: tuple, msg: dict):
+        """向指定 daemon 发送 JSON 消息"""
+        proc = daemon_handle[0]
         line = json.dumps(msg, ensure_ascii=False) + "\n"
-        self._proc.stdin.write(line)
-        self._proc.stdin.flush()
+        proc.stdin.write(line)
+        proc.stdin.flush()
 
     def submit(
         self,
@@ -155,10 +212,11 @@ class TokenizeDaemonClient:
         model_filter: Optional[list] = None,
         log_dir: Optional[str] = None,
     ) -> str:
-        """提交一个 tokenize 任务，返回 task_id（异步，不等待结果）"""
+        """提交一个 tokenize 任务到下一个 daemon（Round-Robin），返回 task_id"""
         with self._lock:
             self._task_counter += 1
             task_id = f"task_{self._task_counter}"
+            daemon_idx = (self._task_counter - 1) % len(self._daemons)
 
         msg: dict = {
             "type": "task",
@@ -172,7 +230,7 @@ class TokenizeDaemonClient:
         }
         if log_dir:
             msg["log_dir"] = log_dir
-        self._send(msg)
+        self._send(self._daemons[daemon_idx], msg)
         return task_id
 
     def wait(self, task_id: str, timeout: float = 86400.0) -> dict:
@@ -187,19 +245,19 @@ class TokenizeDaemonClient:
         raise TimeoutError(f"等待 tokenize 结果超时: {task_id}")
 
     def stop(self):
-        """优雅关闭 daemon"""
-        if self._proc and self._proc.stdin:
+        """优雅关闭所有 daemon"""
+        for handle in self._daemons:
             try:
-                self._send({"type": "shutdown"})
-                self._proc.stdin.close()
+                self._send(handle, {"type": "shutdown"})
+                handle[0].stdin.close()
             except Exception:
                 pass
-        if self._proc:
+        for handle in self._daemons:
             try:
-                self._proc.wait(timeout=30)
+                handle[0].wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
+                handle[0].kill()
+        self._daemons.clear()
 
 
 # ============================================================

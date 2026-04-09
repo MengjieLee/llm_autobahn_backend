@@ -106,6 +106,7 @@ def _process_file_with_pool(
                         failed_count += 1  # 计入跳过，不写盘
                         continue
                     success_count += 1
+
                     if model not in model_files:
                         final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.txt")
                         incomplete_file = final_file + ".incomplete"
@@ -156,7 +157,7 @@ def _process_file_with_pool(
 
     _flush_results()
 
-    # 关闭文件，rename incomplete → final
+    # 关闭写入，rename incomplete → final
     output_files = {}
     for model, mf in model_files.items():
         mf["fh"].close()
@@ -259,7 +260,6 @@ def main():
                 t_batch_size = msg.get("batch_size", batch_size)
                 t_verbose = msg.get("verbose", args.verbose)
                 t_model_filter = set(msg["model_filter"]) if msg.get("model_filter") else None
-
                 # 日志目录：优先取 task msg 中携带的 log_dir，其次用 --log-dir 参数
                 t_log_dir = msg.get("log_dir") or _default_log_dir
                 log_fh = None

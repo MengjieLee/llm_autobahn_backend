@@ -503,7 +503,6 @@ def main():
                     success_count += 1
                     model_stats[model] = model_stats.get(model, 0) + 1
 
-                    # 懒初始化 model 文件
                     if model not in model_files:
                         final_file = os.path.join(output_dir, f"{file_prefix}_{model}_input_ids.txt")
                         incomplete_file = final_file + ".incomplete"
@@ -562,7 +561,7 @@ def main():
         pool.close()
         pool.join()
 
-    # 关闭所有文件句柄，完成 .incomplete → .txt rename
+    # 关闭写入，rename incomplete → final
     for model, mf in model_files.items():
         mf["fh"].close()
         os.rename(mf["incomplete"], mf["final"])

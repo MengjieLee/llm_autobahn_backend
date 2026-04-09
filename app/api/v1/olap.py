@@ -4,6 +4,7 @@ import gc
 import glob
 import json
 import logging
+import re
 import threading
 import urllib.request
 import uuid
@@ -44,10 +45,12 @@ _OLAP_DEFAULTS = {
     "pipeline_block_size": 16,
     "pipeline_cache_size": 200000000,
     "pipeline_tokenize_concurrency": 4,
-    "pipeline_fetch_concurrency": 12,
-    "pipeline_es_scroll_workers": 60,
+    "pipeline_fetch_concurrency": 2,
+    "pipeline_fetch_window_concurrency": 24,
+    "pipeline_es_scroll_workers": 30,
     "pipeline_tokenize_workers": 4,
     "pipeline_tokenize_batch_size": 200,
+    "pipeline_slice_minutes": 60,
     "pipeline_default_path": "/v2/coding/chat/completions",
     "olap_qpd_limit": 1,
     "models": [],
@@ -518,6 +521,124 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
             logger.warning(f"[notify] 本地模式通知失败: {task_id}", exc_info=True)
 
 
+# ============================================================
+# 分钟级子切片：将大 JSONL 文件按 @timestamp 拆分
+# ============================================================
+_TS_RE = re.compile(rb'"@timestamp"\s*:\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+_BJT_OFFSET = timedelta(hours=8)
+
+
+def _extract_timestamp_bjt(line: bytes):
+    """从 JSONL 行中快速提取 @timestamp 并转为 BJT datetime（不做 json.loads）。"""
+    m = _TS_RE.search(line)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1).decode(), "%Y-%m-%dT%H:%M:%S") + _BJT_OFFSET
+
+
+def _split_jsonl_by_time(
+    hourly_file: str,
+    hour_start: datetime,
+    hour_end: datetime,
+    slice_minutes: int,
+    task_data_dir: str,
+) -> list:
+    """
+    将已按 @timestamp 升序排列的 JSONL 文件拆分为多个子切片文件。
+
+    返回: [{"file": path, "start": dt, "end": dt, "line_count": n}, ...]
+    空子切片不写文件、不返回。
+
+    性能优化（针对 CFS 网络文件系统）：
+    - 读写均使用 128MB 缓冲区，大幅减少网络 I/O 次数
+    - 预编译时间边界为 epoch 秒数，避免每行创建 datetime 对象
+    - 时间戳提取用 int 算术代替 datetime.strptime
+    """
+    boundaries = []
+    cur = hour_start
+    while cur < hour_end:
+        nxt = min(cur + timedelta(minutes=slice_minutes), hour_end)
+        boundaries.append((cur, nxt))
+        cur = nxt
+
+    if len(boundaries) <= 1:
+        return []
+
+    # 预计算边界的 epoch 秒数
+    _EPOCH = datetime(1970, 1, 1)
+    boundary_ends_epoch = [int((b[1] - _EPOCH).total_seconds()) for b in boundaries]
+
+    # 预编译子切片文件名
+    sub_files = []
+    for s_start, s_end in boundaries:
+        s_tag_start = s_start.strftime("%Y%m%d_%H%M%S")
+        s_tag_end = s_end.strftime("%Y%m%d_%H%M%S")
+        sub_files.append(os.path.join(task_data_dir, f"kv_{s_tag_start}_{s_tag_end}.jsonl"))
+
+    # 快速时间戳提取：返回 epoch 秒数（int），避免 datetime 对象创建
+    _ts_re = _TS_RE
+    _BJT_SECS = 8 * 3600
+
+    def _extract_epoch(line: bytes) -> int:
+        m = _ts_re.search(line)
+        if not m:
+            return -1
+        raw = m.group(1)
+        yr = int(raw[0:4])
+        mo = int(raw[5:7])
+        dy = int(raw[8:10])
+        hr = int(raw[11:13])
+        mi = int(raw[14:16])
+        sc = int(raw[17:19])
+        y = yr - 1
+        days = y * 365 + y // 4 - y // 100 + y // 400 - 719162
+        _MONTH_DAYS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+        days += _MONTH_DAYS[mo - 1] + (dy - 1)
+        if mo > 2 and (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0)):
+            days += 1
+        return days * 86400 + hr * 3600 + mi * 60 + sc + _BJT_SECS
+
+    _BUF_SIZE = 128 * 1024 * 1024
+
+    handles = [None] * len(boundaries)
+    counts = [0] * len(boundaries)
+    slot = 0
+    n_boundaries = len(boundaries)
+
+    logger.info(f"[split] 开始拆分 {os.path.basename(hourly_file)} -> {n_boundaries} 个子切片 (buf={_BUF_SIZE // (1024*1024)}MB)")
+
+    with open(hourly_file, "rb", buffering=_BUF_SIZE) as f_in:
+        for line in f_in:
+            if len(line) <= 1:
+                continue
+
+            ts_epoch = _extract_epoch(line)
+            if ts_epoch >= 0:
+                while slot < n_boundaries - 1 and ts_epoch >= boundary_ends_epoch[slot]:
+                    slot += 1
+
+            if handles[slot] is None:
+                handles[slot] = open(sub_files[slot], "wb", buffering=_BUF_SIZE)
+
+            handles[slot].write(line)
+            counts[slot] += 1
+
+    results = []
+    for i, (s_start, s_end) in enumerate(boundaries):
+        if handles[i] is not None:
+            handles[i].close()
+            results.append({
+                "file": sub_files[i],
+                "start": s_start,
+                "end": s_end,
+                "line_count": counts[i],
+            })
+            logger.info(f"[split] 子切片 {os.path.basename(sub_files[i])}: {counts[i]} 行")
+
+    logger.info(f"[split] {os.path.basename(hourly_file)} -> {len(results)} 个子切片 (完成)")
+    return results
+
+
 async def _run_streaming_fetch_tokenize(
     task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
 ):
@@ -629,54 +750,111 @@ async def _run_streaming_fetch_tokenize(
         incomplete_file = os.path.join(task_data_dir, f"{base_name}.jsonl.incomplete")
         final_file = os.path.join(task_data_dir, f"{base_name}.jsonl")
 
-        es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
+        max_scroll_retries = 8
+        for scroll_attempt in range(max_scroll_retries + 1):
+            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
 
-        async with fetch_sem:
-            await _update_fetch_progress()
-
-            def _cb(count, msg):
-                # 在线程池中被调用，只更新内存，不做文件 I/O
-                _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
-                _progress_dirty[0] = True
-
-            try:
-                hour_count = await es.query_to_file(
-                    h_start_str, h_end_str, incomplete_file, status_callback=_cb
-                )
-                # 成功: rename .incomplete → .jsonl
-                os.rename(incomplete_file, final_file)
-                fetch_total_count[0] += hour_count
-                fetch_done_count[0] += 1
-                fetch_results.append({
-                    "file": final_file,
-                    "hour": f"{h_start_str}~{h_end_str}",
-                    "count": hour_count
-                })
+            async with fetch_sem:
                 await _update_fetch_progress()
 
-                # 立即触发 tokenize（钩子）
-                if hour_count > 0:
-                    t = asyncio.create_task(
-                        _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                def _cb(count, msg):
+                    # 在线程池中被调用，只更新内存，不做文件 I/O
+                    _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
+                    _progress_dirty[0] = True
+
+                try:
+                    hour_count = await es.query_to_file(
+                        h_start_str, h_end_str, incomplete_file, status_callback=_cb,
+                        window_concurrency=cfg.get("pipeline_fetch_window_concurrency", 24)
                     )
-                    tokenize_tasks.append(t)
+                    # 成功: rename .incomplete → .jsonl
+                    os.rename(incomplete_file, final_file)
+                    fetch_total_count[0] += hour_count
+                    fetch_done_count[0] += 1
+                    fetch_results.append({
+                        "file": final_file,
+                        "hour": f"{h_start_str}~{h_end_str}",
+                        "count": hour_count
+                    })
+                    await _update_fetch_progress()
 
-            except Exception as e:
-                # 失败: 保留 .incomplete
-                if not os.path.exists(incomplete_file):
-                    with open(incomplete_file, 'w') as _f:
-                        pass
-                fetch_done_count[0] += 1
-                fetch_incomplete.append({
-                    "file": f"{base_name}.jsonl.incomplete",
-                    "hour": f"{h_start_str}~{h_end_str}",
-                    "error": str(e)[:200]
-                })
-                logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
-                await _update_fetch_progress()
-            finally:
-                # 关闭 ES 连接池，释放内存
-                es.close()
+                    # 立即触发 tokenize（钩子）
+                    if hour_count > 0:
+                        # 优先读取 per-task 配置的 slice_minutes
+                        task_status = _read_status(task_id)
+                        task_slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
+                        if task_slice_minutes < 60:
+                            sub_slices = await asyncio.to_thread(
+                                _split_jsonl_by_time, final_file, h_start, h_end, task_slice_minutes, task_data_dir
+                            )
+                            if sub_slices:
+                                for sub in sub_slices:
+                                    t = asyncio.create_task(
+                                        _tokenize_single_with_tracking(sub["file"], output_dir, task_id)
+                                    )
+                                    tokenize_tasks.append(t)
+                            else:
+                                t = asyncio.create_task(
+                                    _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                                )
+                                tokenize_tasks.append(t)
+                        else:
+                            t = asyncio.create_task(
+                                _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                            )
+                            tokenize_tasks.append(t)
+
+                    es.close()
+                    return  # 成功，退出重试循环
+
+                except Exception as e:
+                    es.close()
+                    err_msg = str(e)
+                    is_scroll_err = "too many scroll contexts" in err_msg.lower() or "Trying to create too many scroll contexts" in err_msg
+                    if is_scroll_err and scroll_attempt < max_scroll_retries:
+                        wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                        logger.warning(
+                            f"[fetch] slice {h_start_str}~{h_end_str} scroll limit hit "
+                            f"(attempt {scroll_attempt + 1}/{max_scroll_retries}), "
+                            f"waiting {wait_secs}s before retry..."
+                        )
+                        _cb_msg[0] = f"[{idx + 1}/{total_slices}] scroll 超限，等待 {wait_secs}s 后重试 ({scroll_attempt + 1}/{max_scroll_retries})..."
+                        _progress_dirty[0] = True
+                        break  # 释放 fetch_sem，在外面等待
+
+                    # 非 scroll 错误或重试耗尽
+                    if not os.path.exists(incomplete_file):
+                        with open(incomplete_file, 'w') as _f:
+                            pass
+                    fetch_done_count[0] += 1
+                    fetch_incomplete.append({
+                        "file": f"{base_name}.jsonl.incomplete",
+                        "hour": f"{h_start_str}~{h_end_str}",
+                        "error": str(e)[:200]
+                    })
+                    logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
+                    await _update_fetch_progress()
+                    return  # 失败，退出重试循环
+            # end async with fetch_sem — semaphore released
+
+            # scroll limit 重试等待（在 semaphore 外等待，不占位）
+            if scroll_attempt < max_scroll_retries:
+                wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                await asyncio.sleep(wait_secs)
+                continue
+
+        # 所有重试用尽仍失败
+        if not os.path.exists(incomplete_file):
+            with open(incomplete_file, 'w') as _f:
+                pass
+        fetch_done_count[0] += 1
+        fetch_incomplete.append({
+            "file": f"{base_name}.jsonl.incomplete",
+            "hour": f"{h_start_str}~{h_end_str}",
+            "error": f"scroll context limit exceeded after {max_scroll_retries} retries"
+        })
+        logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} scroll limit retries exhausted")
+        await _update_fetch_progress()
 
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         """带信号量和进度追踪的 tokenize 单文件"""
@@ -1419,6 +1597,10 @@ async def es_fetch(
     models: Optional[str] = Query(
         default=None,
         description="模型过滤，逗号分隔（如 glm-5,deepseek-v3.2），为空则分析所有检测到的模型",
+    ),
+    slice_minutes: Optional[int] = Query(
+        default=None,
+        description="子切片粒度（分钟），覆盖全局 pipeline_slice_minutes。60=不拆分，10=每10分钟一个子切片",
     )
 ):
     """
@@ -1508,7 +1690,15 @@ async def es_fetch(
         "config": {
             "default_model": cfg["pipeline_default_model"],
             "block_size": cfg["pipeline_block_size"],
-            "cache_size": cfg["pipeline_cache_size"]
+            "cache_size": cfg["pipeline_cache_size"],
+            "tokenize_concurrency": cfg.get("pipeline_tokenize_concurrency", 4),
+            "fetch_concurrency": cfg.get("pipeline_fetch_concurrency", 2),
+            "fetch_window_concurrency": cfg.get("pipeline_fetch_window_concurrency", 24),
+            "es_scroll_workers": cfg.get("pipeline_es_scroll_workers", 30),
+            "tokenize_workers": cfg.get("pipeline_tokenize_workers", 7),
+            "tokenize_batch_size": cfg.get("pipeline_tokenize_batch_size", 1000),
+            "es_scroll_size": cfg.get("pipeline_es_scroll_size", 10000),
+            "slice_minutes": slice_minutes if slice_minutes is not None else cfg.get("pipeline_slice_minutes", 60)
         },
         "result": None,
         "is_deleted": False,

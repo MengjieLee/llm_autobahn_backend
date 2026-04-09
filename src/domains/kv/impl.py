@@ -25,9 +25,9 @@ def _get_scroll_workers() -> int:
     cfg_path = os.path.join(settings.OLAP_BASE_DIR, "app", "conf", "olap_config.json")
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
-            return _json.load(f).get("pipeline_es_scroll_workers", 60)
+            return _json.load(f).get("pipeline_es_scroll_workers", 30)
     except Exception:
-        return 60
+        return 30
 
 
 def _get_scroll_size() -> int:
@@ -151,7 +151,7 @@ class ESIndexClient:
         logger.info(f"[scroll_to_file] START index={self.index} output={output_file} scroll_size={scroll_size}")
 
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
+            with open(output_file, 'w', encoding='utf-8', buffering=16 * 1024 * 1024) as f:
                 # 首次查询
                 res = self.client.search(index=self.index, body=body, scroll=scroll_time, size=scroll_size)
                 scroll_id = res.get("_scroll_id")
@@ -161,17 +161,23 @@ class ESIndexClient:
 
                 while len(results) > 0:
                     scroll_rounds += 1
+                    # 逐条序列化写入，避免攒 list 导致内存翻倍
+                    page_count = 0
                     for r in results:
                         parsed = parse_single_record(r)
                         if parsed:
                             f.write(json.dumps(parsed, ensure_ascii=False))
                             f.write('\n')
-                            total_count += 1
+                            page_count += 1
+                    total_count += page_count
 
                     if status_callback:
                         status_callback(total_count, f"已处理 {total_count} 条记录...")
 
+                    # 立即释放当页数据，每 2 页强制 gc + malloc_trim 归还 OS
+                    res = None
                     results = None
+                    # if scroll_rounds % 2 == 0:
                     gc.collect()
                     _malloc_trim()
 
@@ -183,6 +189,8 @@ class ESIndexClient:
             raise
         finally:
             elapsed = time.time() - t0
+            gc.collect()
+            _malloc_trim()
             if scroll_id:
                 try:
                     self.client.clear_scroll(scroll_id=scroll_id)
@@ -259,6 +267,7 @@ class ESIndexClient:
         window_count = 0
         scroll_id = None
         t0 = time.time()
+        scroll_rounds = 0
 
         logger.info(f"[scroll_appender] START index={self.index} base_count={base_count} scroll_size={scroll_size}")
 
@@ -268,19 +277,24 @@ class ESIndexClient:
             results = res["hits"]["hits"]
 
             while len(results) > 0:
+                scroll_rounds += 1
+                # 逐条序列化写入，避免攒 list 导致内存翻倍
+                page_count = 0
                 for r in results:
                     parsed = parse_single_record(r)
                     if parsed:
                         f.write(json.dumps(parsed, ensure_ascii=False))
                         f.write('\n')
-                        window_count += 1
+                        page_count += 1
+                window_count += page_count
 
                 if status_callback:
                     status_callback(base_count + window_count, f"已处理 {base_count + window_count} 条记录...")
 
-                # 主动释放当前 page 的 Python 对象并归还内存给 OS
-                # 防止 30 并发 scroll 线程各自的 heap 峰值叠加导致内存线性增长
+                # 立即释放当页数据，每 2 页强制 gc + malloc_trim 归还 OS
+                res = None
                 results = None
+                # if scroll_rounds % 2 == 0:
                 gc.collect()
                 _malloc_trim()
 
@@ -292,12 +306,14 @@ class ESIndexClient:
             raise
         finally:
             elapsed = time.time() - t0
+            gc.collect()
+            _malloc_trim()
             if scroll_id:
                 try:
                     self.client.clear_scroll(scroll_id=scroll_id)
                 except Exception:
                     pass
-            logger.info(f"[scroll_appender] END index={self.index} window_count={window_count} elapsed={elapsed:.1f}s")
+            logger.info(f"[scroll_appender] END index={self.index} window_count={window_count} rounds={scroll_rounds} elapsed={elapsed:.1f}s")
 
         return window_count
 
