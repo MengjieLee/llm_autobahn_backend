@@ -21,8 +21,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
@@ -103,6 +105,92 @@ def _calc_single_file(txt_file: str, cache_calc_path: str, cache_size: int, bloc
         return {"time": time_label, "hit_rate": None}
 
 
+def _calc_model_shared_cache(
+    model_files: List[str],
+    cache_calc_path: str,
+    cache_size: int,
+    block_size: int,
+) -> List[dict]:
+    """
+    将同一模型的多个 slice 文件合并为带 __SECTION__ 标记的临时文件，
+    运行一次 cache_calc（共享 LRU Cache），返回 per-section 结果。
+
+    每个文件之间插入 __SECTION__:<time_label> 标记，cache_calc 遇到标记时
+    输出上一段的 section 统计并重置段计数器，但保留 LRU Cache 状态。
+    """
+    if not model_files:
+        return []
+
+    # 按文件名排序（即时间排序）
+    sorted_files = sorted(model_files, key=lambda f: _parse_time_from_filename(os.path.basename(f)))
+
+    # 创建临时合并文件
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="cache_merged_")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
+            for fpath in sorted_files:
+                time_label = _parse_time_from_filename(os.path.basename(fpath))
+                out.write(f"__SECTION__:{time_label}\n")
+                with open(fpath, "r", encoding="utf-8") as src:
+                    shutil.copyfileobj(src, out)
+
+        # 运行 cache_calc
+        t0 = _time.monotonic()
+        cmd = [
+            cache_calc_path, "-f", tmp_path,
+            "-s", str(cache_size),
+            "-b", str(block_size),
+            "-p", "true",
+        ]
+        file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        timeout = min(600, max(120, int(file_size_mb / 100) + 120))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        elapsed = _time.monotonic() - t0
+
+        if result.returncode != 0:
+            logger.warning(
+                "[trend] shared cache_calc failed (rc=%d, %.1fs): %s",
+                result.returncode, elapsed,
+                (result.stderr or result.stdout or "")[:200],
+            )
+            return []
+
+        # 解析 section 行
+        points = []
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("section:"):
+                m = re.match(r'section:\s*(\S+)\s+.*section_hit_rate:\s*([\d.]+)', line)
+                if m:
+                    time_label = m.group(1)
+                    hit_rate = float(m.group(2))
+                    points.append({"time": time_label, "hit_rate": hit_rate})
+
+        if points:
+            logger.debug(
+                "[trend] shared cache: %d slices -> %d points (%.1fs)",
+                len(sorted_files), len(points), elapsed,
+            )
+        else:
+            logger.warning(
+                "[trend] shared cache_calc: no section results (%.1fs): %s",
+                elapsed, result.stdout[:200],
+            )
+
+        return points
+    except subprocess.TimeoutExpired:
+        elapsed = _time.monotonic() - t0
+        logger.error("[trend] shared cache_calc TIMEOUT after %.1fs", elapsed)
+        return []
+    except Exception as e:
+        logger.error("[trend] shared cache_calc exception: %s", e)
+        return []
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _calc_stats(data_points: List[dict]) -> dict:
     """计算 mean / max / min"""
     rates = [d["hit_rate"] for d in data_points if d.get("hit_rate") is not None]
@@ -160,6 +248,9 @@ def compute_trend(
     """
     计算分钟级命中率趋势数据。
 
+    使用共享 LRU Cache 计算同一任务内各分钟的命中率，
+    避免 per-slice 冷启动导致的命中率低估问题。
+
     返回:
       {"series": [{"model": "...", "data": [...], "stats": {...}}, ...]}
     """
@@ -201,54 +292,63 @@ def compute_trend(
             existing_results = {}
 
     # ------------------------------------------------------------------
-    # 构建任务列表：区分可复用缓存 vs 需计算的文件
+    # 按模型分类：全部缓存命中 vs 需要计算
     # ------------------------------------------------------------------
-    work_items: List[tuple] = []       # (model, file_path)
-    cached_items: List[tuple] = []     # (model, {"time": ..., "hit_rate": ...})
+    model_data: Dict[str, List[dict]] = {}
+    models_to_calc: List[tuple] = []  # (model, files)
+    cached_count = 0
+    calc_count = 0
 
     for model, files in model_outputs.items():
-        for f in files:
-            if not os.path.exists(f) or os.path.getsize(f) == 0:
-                continue
-            fname = os.path.basename(f)
-            time_label = _parse_time_from_filename(fname)
-            cached_rate = existing_results.get((model, time_label))
-            if cached_rate is not None:
-                cached_items.append((model, {"time": time_label, "hit_rate": cached_rate}))
-            else:
-                work_items.append((model, f))
+        valid_files = [f for f in files if os.path.exists(f) and os.path.getsize(f) > 0]
+        if not valid_files:
+            continue
+
+        # 检查该模型是否所有 time point 都已缓存
+        all_cached = True
+        for f in valid_files:
+            time_label = _parse_time_from_filename(os.path.basename(f))
+            if (model, time_label) not in existing_results:
+                all_cached = False
+                break
+
+        if all_cached:
+            # 复用缓存结果
+            for f in valid_files:
+                time_label = _parse_time_from_filename(os.path.basename(f))
+                rate = existing_results[(model, time_label)]
+                model_data.setdefault(model, []).append({"time": time_label, "hit_rate": rate})
+            cached_count += len(valid_files)
+        else:
+            models_to_calc.append((model, valid_files))
+            calc_count += len(valid_files)
 
     logger.info(
-        "[trend] 去重: %d 已有结果复用, %d 文件需计算",
-        len(cached_items), len(work_items),
+        "[trend] 去重: %d 文件复用缓存, %d 文件需计算 (%d 模型)",
+        cached_count, calc_count, len(models_to_calc),
     )
 
     # ------------------------------------------------------------------
-    # 单一共享 ThreadPoolExecutor 处理所有模型的文件
+    # 共享 LRU Cache 计算（每个模型运行一次 cache_calc）
     # ------------------------------------------------------------------
-    model_data: Dict[str, List[dict]] = {}
+    if models_to_calc:
+        workers = min(max_workers, len(models_to_calc))
 
-    # 先填入缓存结果
-    for model, dp in cached_items:
-        model_data.setdefault(model, []).append(dp)
+        def _calc_model(item):
+            model, files = item
+            points = _calc_model_shared_cache(files, cache_calc_path, cache_size, block_size)
+            return model, points
 
-    if work_items:
-        done_count = 0
-        workers = min(max_workers, len(work_items))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_model = {}
-            for model, file_path in work_items:
-                fut = pool.submit(_calc_single_file, file_path, cache_calc_path, cache_size, block_size)
-                future_to_model[fut] = model
-
-            for future in concurrent.futures.as_completed(future_to_model):
-                model = future_to_model[future]
-                dp = future.result()
+            done_count = 0
+            futures = {pool.submit(_calc_model, item): item[0] for item in models_to_calc}
+            for future in concurrent.futures.as_completed(futures):
+                model, points = future.result()
+                if points:
+                    model_data[model] = points
                 done_count += 1
-                if dp and dp.get("hit_rate") is not None:
-                    model_data.setdefault(model, []).append(dp)
-                if done_count % 20 == 0 or done_count == len(work_items):
-                    logger.info("[trend] 进度: %d/%d 文件完成", done_count, len(work_items))
+                if done_count % 5 == 0 or done_count == len(models_to_calc):
+                    logger.info("[trend] 进度: %d/%d 模型完成", done_count, len(models_to_calc))
 
     # ------------------------------------------------------------------
     # 构建 per-model series
@@ -292,7 +392,7 @@ def compute_trend(
     logger.info(
         "[trend] 完成: %d 模型, %d 数据点, 耗时 %.1fs (复用 %d, 计算 %d)",
         len(model_series), total_points, elapsed,
-        len(cached_items), len(work_items),
+        cached_count, calc_count,
     )
 
     return {"series": series}

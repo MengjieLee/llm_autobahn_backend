@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.request
 import uuid
 import os
@@ -37,6 +38,7 @@ KV_DATA_DIR = os.path.join(KV_RESULTS_DIR, "data")
 KV_STATUS_DIR = os.path.join(KV_RESULTS_DIR, "status")
 SCRIPTS_DIR = os.path.join(BASE_DIR, settings.OLAP_SCRIPTS_DIR)
 OLAP_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "olap_config.json")
+REALTIME_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "realtime_config.json")
 KUBECONFIG_PATH = os.path.join(BASE_DIR, "app", "conf", "inner_cluster.kubeconfig")
 
 # OLAP 热配置默认值（JSON 读取失败时的兜底）
@@ -521,123 +523,6 @@ async def _run_pipeline(task_id: str, start_datetime: str, end_datetime: str, ap
             logger.warning(f"[notify] 本地模式通知失败: {task_id}", exc_info=True)
 
 
-# ============================================================
-# 分钟级子切片：将大 JSONL 文件按 @timestamp 拆分
-# ============================================================
-_TS_RE = re.compile(rb'"@timestamp"\s*:\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
-_BJT_OFFSET = timedelta(hours=8)
-
-
-def _extract_timestamp_bjt(line: bytes):
-    """从 JSONL 行中快速提取 @timestamp 并转为 BJT datetime（不做 json.loads）。"""
-    m = _TS_RE.search(line)
-    if not m:
-        return None
-    return datetime.strptime(m.group(1).decode(), "%Y-%m-%dT%H:%M:%S") + _BJT_OFFSET
-
-
-def _split_jsonl_by_time(
-    hourly_file: str,
-    hour_start: datetime,
-    hour_end: datetime,
-    slice_minutes: int,
-    task_data_dir: str,
-) -> list:
-    """
-    将已按 @timestamp 升序排列的 JSONL 文件拆分为多个子切片文件。
-
-    返回: [{"file": path, "start": dt, "end": dt, "line_count": n}, ...]
-    空子切片不写文件、不返回。
-
-    性能优化（针对 CFS 网络文件系统）：
-    - 读写均使用 128MB 缓冲区，大幅减少网络 I/O 次数
-    - 预编译时间边界为 epoch 秒数，避免每行创建 datetime 对象
-    - 时间戳提取用 int 算术代替 datetime.strptime
-    """
-    boundaries = []
-    cur = hour_start
-    while cur < hour_end:
-        nxt = min(cur + timedelta(minutes=slice_minutes), hour_end)
-        boundaries.append((cur, nxt))
-        cur = nxt
-
-    if len(boundaries) <= 1:
-        return []
-
-    # 预计算边界的 epoch 秒数
-    _EPOCH = datetime(1970, 1, 1)
-    boundary_ends_epoch = [int((b[1] - _EPOCH).total_seconds()) for b in boundaries]
-
-    # 预编译子切片文件名
-    sub_files = []
-    for s_start, s_end in boundaries:
-        s_tag_start = s_start.strftime("%Y%m%d_%H%M%S")
-        s_tag_end = s_end.strftime("%Y%m%d_%H%M%S")
-        sub_files.append(os.path.join(task_data_dir, f"kv_{s_tag_start}_{s_tag_end}.jsonl"))
-
-    # 快速时间戳提取：返回 epoch 秒数（int），避免 datetime 对象创建
-    _ts_re = _TS_RE
-    _BJT_SECS = 8 * 3600
-
-    def _extract_epoch(line: bytes) -> int:
-        m = _ts_re.search(line)
-        if not m:
-            return -1
-        raw = m.group(1)
-        yr = int(raw[0:4])
-        mo = int(raw[5:7])
-        dy = int(raw[8:10])
-        hr = int(raw[11:13])
-        mi = int(raw[14:16])
-        sc = int(raw[17:19])
-        y = yr - 1
-        days = y * 365 + y // 4 - y // 100 + y // 400 - 719162
-        _MONTH_DAYS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
-        days += _MONTH_DAYS[mo - 1] + (dy - 1)
-        if mo > 2 and (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0)):
-            days += 1
-        return days * 86400 + hr * 3600 + mi * 60 + sc + _BJT_SECS
-
-    _BUF_SIZE = 128 * 1024 * 1024
-
-    handles = [None] * len(boundaries)
-    counts = [0] * len(boundaries)
-    slot = 0
-    n_boundaries = len(boundaries)
-
-    logger.info(f"[split] 开始拆分 {os.path.basename(hourly_file)} -> {n_boundaries} 个子切片 (buf={_BUF_SIZE // (1024*1024)}MB)")
-
-    with open(hourly_file, "rb", buffering=_BUF_SIZE) as f_in:
-        for line in f_in:
-            if len(line) <= 1:
-                continue
-
-            ts_epoch = _extract_epoch(line)
-            if ts_epoch >= 0:
-                while slot < n_boundaries - 1 and ts_epoch >= boundary_ends_epoch[slot]:
-                    slot += 1
-
-            if handles[slot] is None:
-                handles[slot] = open(sub_files[slot], "wb", buffering=_BUF_SIZE)
-
-            handles[slot].write(line)
-            counts[slot] += 1
-
-    results = []
-    for i, (s_start, s_end) in enumerate(boundaries):
-        if handles[i] is not None:
-            handles[i].close()
-            results.append({
-                "file": sub_files[i],
-                "start": s_start,
-                "end": s_end,
-                "line_count": counts[i],
-            })
-            logger.info(f"[split] 子切片 {os.path.basename(sub_files[i])}: {counts[i]} 行")
-
-    logger.info(f"[split] {os.path.basename(hourly_file)} -> {len(results)} 个子切片 (完成)")
-    return results
-
 
 async def _run_streaming_fetch_tokenize(
     task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
@@ -741,14 +626,12 @@ async def _run_streaming_fetch_tokenize(
     flusher_task = asyncio.create_task(_progress_flusher())
 
     async def _fetch_slice(idx: int, h_start: datetime, h_end: datetime):
-        """拉取单个切片，成功 rename 为 .jsonl，失败保留 .incomplete"""
+        """拉取单个切片，per-minute 文件直写 hour 目录"""
         h_start_str = h_start.strftime("%Y-%m-%d %H:%M:%S")
         h_end_str = h_end.strftime("%Y-%m-%d %H:%M:%S")
-        h_start_tag = h_start.strftime("%Y%m%d_%H%M%S")
-        h_end_tag = h_end.strftime("%Y%m%d_%H%M%S")
-        base_name = f"kv_{h_start_tag}_{h_end_tag}"
-        incomplete_file = os.path.join(task_data_dir, f"{base_name}.jsonl.incomplete")
-        final_file = os.path.join(task_data_dir, f"{base_name}.jsonl")
+        hour_dir_name = h_start.strftime("%H")
+        hour_dir = os.path.join(task_data_dir, hour_dir_name)
+        os.makedirs(hour_dir, exist_ok=True)
 
         max_scroll_retries = 8
         for scroll_attempt in range(max_scroll_retries + 1):
@@ -758,61 +641,41 @@ async def _run_streaming_fetch_tokenize(
                 await _update_fetch_progress()
 
                 def _cb(count, msg):
-                    # 在线程池中被调用，只更新内存，不做文件 I/O
                     _cb_msg[0] = f"[{idx + 1}/{total_slices}] {msg}"
                     _progress_dirty[0] = True
 
                 try:
-                    hour_count = await es.query_to_file(
-                        h_start_str, h_end_str, incomplete_file, status_callback=_cb,
+                    result = await es.query_to_dir(
+                        h_start_str, h_end_str, hour_dir, status_callback=_cb,
                         window_concurrency=cfg.get("pipeline_fetch_window_concurrency", 24)
                     )
-                    # 成功: rename .incomplete → .jsonl
-                    os.rename(incomplete_file, final_file)
+                    hour_count = result["total_count"]
                     fetch_total_count[0] += hour_count
                     fetch_done_count[0] += 1
-                    fetch_results.append({
-                        "file": final_file,
-                        "hour": f"{h_start_str}~{h_end_str}",
-                        "count": hour_count
-                    })
-                    await _update_fetch_progress()
 
-                    # 立即触发 tokenize（钩子）
-                    if hour_count > 0:
-                        # 优先读取 per-task 配置的 slice_minutes
-                        task_status = _read_status(task_id)
-                        task_slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
-                        if task_slice_minutes < 60:
-                            sub_slices = await asyncio.to_thread(
-                                _split_jsonl_by_time, final_file, h_start, h_end, task_slice_minutes, task_data_dir
-                            )
-                            if sub_slices:
-                                for sub in sub_slices:
-                                    t = asyncio.create_task(
-                                        _tokenize_single_with_tracking(sub["file"], output_dir, task_id)
-                                    )
-                                    tokenize_tasks.append(t)
-                            else:
-                                t = asyncio.create_task(
-                                    _tokenize_single_with_tracking(final_file, output_dir, task_id)
-                                )
-                                tokenize_tasks.append(t)
-                        else:
+                    for fi in result["files"]:
+                        fetch_results.append({
+                            "file": fi["file"],
+                            "hour": f"{h_start_str}~{h_end_str}",
+                            "minute": fi["minute"],
+                            "count": fi["count"]
+                        })
+                        if fi["count"] > 0 and os.path.exists(fi["file"]):
                             t = asyncio.create_task(
-                                _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                                _tokenize_single_with_tracking(fi["file"], output_dir, task_id)
                             )
                             tokenize_tasks.append(t)
 
+                    await _update_fetch_progress()
                     es.close()
-                    return  # 成功，退出重试循环
+                    return
 
                 except Exception as e:
                     es.close()
                     err_msg = str(e)
                     is_scroll_err = "too many scroll contexts" in err_msg.lower() or "Trying to create too many scroll contexts" in err_msg
                     if is_scroll_err and scroll_attempt < max_scroll_retries:
-                        wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                        wait_secs = min(60 * (scroll_attempt + 1), 300)
                         logger.warning(
                             f"[fetch] slice {h_start_str}~{h_end_str} scroll limit hit "
                             f"(attempt {scroll_attempt + 1}/{max_scroll_retries}), "
@@ -820,36 +683,26 @@ async def _run_streaming_fetch_tokenize(
                         )
                         _cb_msg[0] = f"[{idx + 1}/{total_slices}] scroll 超限，等待 {wait_secs}s 后重试 ({scroll_attempt + 1}/{max_scroll_retries})..."
                         _progress_dirty[0] = True
-                        break  # 释放 fetch_sem，在外面等待
+                        break
 
-                    # 非 scroll 错误或重试耗尽
-                    if not os.path.exists(incomplete_file):
-                        with open(incomplete_file, 'w') as _f:
-                            pass
                     fetch_done_count[0] += 1
                     fetch_incomplete.append({
-                        "file": f"{base_name}.jsonl.incomplete",
                         "hour": f"{h_start_str}~{h_end_str}",
                         "error": str(e)[:200]
                     })
                     logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
                     await _update_fetch_progress()
-                    return  # 失败，退出重试循环
-            # end async with fetch_sem — semaphore released
+                    return
+            # end async with fetch_sem
 
-            # scroll limit 重试等待（在 semaphore 外等待，不占位）
             if scroll_attempt < max_scroll_retries:
-                wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                wait_secs = min(60 * (scroll_attempt + 1), 300)
                 await asyncio.sleep(wait_secs)
                 continue
 
         # 所有重试用尽仍失败
-        if not os.path.exists(incomplete_file):
-            with open(incomplete_file, 'w') as _f:
-                pass
         fetch_done_count[0] += 1
         fetch_incomplete.append({
-            "file": f"{base_name}.jsonl.incomplete",
             "hour": f"{h_start_str}~{h_end_str}",
             "error": f"scroll context limit exceeded after {max_scroll_retries} retries"
         })
@@ -889,7 +742,7 @@ async def _run_streaming_fetch_tokenize(
         "status": "completed",
         "message": f"查询完成，共 {fetch_total_count[0]} 条",
         "total_count": fetch_total_count[0],
-        "result_files": fetch_results,
+        "total_files": len(fetch_results),
     }
     if fetch_incomplete:
         fetch_status["incomplete_count"] = len(fetch_incomplete)
@@ -1485,6 +1338,643 @@ async def kv_file_tree(
         data={"root": root_info, "children": children},
         trace_id=None,
     )
+
+
+# ============================================================
+# 日报数据目录
+# ============================================================
+DAILY_REPORTS_DIR = os.path.join(KV_RESULTS_DIR, "daily_reports")
+
+
+def _save_daily_report(date_label: str, task_data: dict):
+    """
+    将已完成任务的 result 写入 daily_reports/{MM-DD}.json。
+    每个日期一个文件，内含所有场景的聚合数据。
+
+    task_data 格式:
+      {"task_name": "04-08_全场景_各模型", "result": {"glm-5": {...}, ...}}
+    """
+    os.makedirs(DAILY_REPORTS_DIR, exist_ok=True)
+    filepath = os.path.join(DAILY_REPORTS_DIR, f"{date_label}.json")
+
+    # 读取已有数据
+    existing = {}
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+
+    task_name = task_data.get("task_name", "")
+    result = task_data.get("result", {})
+    if not result or not isinstance(result, dict):
+        return
+
+    # 提取场景名
+    import re as _re
+    scenario = task_name
+    # 去掉 【xxx】 前缀
+    scenario = _re.sub(r"^【[^】]+】", "", scenario)
+    # 去掉日期前缀
+    target_mm, target_dd = date_label.split("-")
+    _patterns = [
+        rf"^{_re.escape(date_label)}_(.+)",                         # 04-08_xxx
+        rf"^{target_mm}{target_dd}_(.+)",                           # 0408_xxx
+        rf"^{_re.escape(date_label)}{target_mm}{target_dd}_(.+)",   # 04-080408_xxx
+        rf"^{_re.escape(date_label)}{_re.escape(date_label)}_(.+)", # 04-0804-08_xxx
+    ]
+    for _pat in _patterns:
+        _m = _re.match(_pat, scenario)
+        if _m:
+            scenario = _m.group(1)
+            break
+    else:
+        return
+
+    # 构建场景数据
+    total_hit = sum(r.get("hit_count", 0) for r in result.values())
+    total_queries = sum(r.get("total_queries", 0) for r in result.values())
+    total_tokens = sum(r.get("total_tokens", 0) for r in result.values())
+    hit_rate_pct = round((total_hit / total_queries * 100), 2) if total_queries > 0 else 0
+
+    scenario_data = {
+        "hit_rate_percent": hit_rate_pct,
+        "hit_count": total_hit,
+        "total_queries": total_queries,
+        "total_tokens": total_tokens,
+        "models": {
+            model: {
+                "hit_rate_percent": stats.get("hit_rate_percent", 0),
+                "hit_count": stats.get("hit_count", 0),
+                "total_queries": stats.get("total_queries", 0),
+                "total_tokens": stats.get("total_tokens", 0),
+            }
+            for model, stats in result.items()
+        },
+        "updated_at": task_data.get("updated_at", _now_bjt()),
+    }
+
+    scenarios = existing.get("scenarios", {})
+    scenarios[scenario] = scenario_data
+
+    existing.update({
+        "date": date_label,
+        "updated_at": _now_bjt(),
+        "scenarios": scenarios,
+    })
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# Dashboard — 场景列表（固定 8 个）
+# ============================================================
+DASHBOARD_SCENARIOS = [
+    "全场景_各模型",
+    "coding_plan_各模型",
+    "讯飞_全场景_glm-5",
+    "无问芯穹_全场景_glm-5",
+    "得物_全场景_glm-5",
+    "金山_全场景_glm-5",
+    "腾讯_全场景_glm-5",
+    "智谱_全场景_glm-5",
+]
+
+# 时间范围 → 秒数映射
+_TIME_RANGE_MAP = {
+    "1h": 3600,
+    "6h": 21600,
+    "1d": 86400,
+    "7d": 604800,
+    "30d": 2592000,
+}
+
+# 缓存: scenario → {task_id, trend_data, updated_at}
+_dashboard_cache: dict = {}
+
+
+def _find_latest_task_for_scenario(scenario: str) -> Optional[dict]:
+    """在 status 目录中查找指定场景的最新已完成任务"""
+    best = None
+    for status_file in glob.glob(os.path.join(KV_STATUS_DIR, "**/*.json"), recursive=True):
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            task_name = data.get("task_name", "")
+            if scenario not in task_name:
+                continue
+            if data.get("pipeline", {}).get("current_stage") != "done":
+                continue
+            if not data.get("result") or not isinstance(data["result"], dict):
+                continue
+            updated = data.get("updated_at", "")
+            if not best or updated > best[0]:
+                best = (updated, data)
+        except Exception:
+            continue
+    return best[1] if best else None
+
+
+def _find_tasks_for_scenario_in_range(scenario: str, cutoff_naive: datetime, now_naive: datetime) -> List[dict]:
+    """
+    查找指定场景在时间范围内的所有已完成任务，按时间排序。
+    用于非实时场景的趋势图数据聚合。
+    """
+    tasks = []
+    for status_file in glob.glob(os.path.join(KV_STATUS_DIR, "**/*.json"), recursive=True):
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            task_name = data.get("task_name", "")
+            if scenario not in task_name:
+                continue
+            if data.get("pipeline", {}).get("current_stage") != "done":
+                continue
+            if not data.get("result") or not isinstance(data["result"], dict):
+                continue
+
+            # 解析任务时间
+            updated_str = data.get("updated_at", "")
+            if not updated_str:
+                continue
+            try:
+                # 兼容格式 "2026-04-10 15:30:00"
+                updated_dt = datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+
+            # 检查是否在时间范围内
+            if cutoff_naive <= updated_dt <= now_naive:
+                tasks.append((updated_dt, data))
+        except Exception:
+            continue
+
+    # 按时间排序
+    tasks.sort(key=lambda x: x[0])
+    return [t[1] for t in tasks]
+
+
+def _read_trend_for_task(task_id: str) -> Optional[dict]:
+    """读取任务的 hit_rate_trend.json"""
+    trend_path = os.path.join(_task_dir(task_id), "report", "hit_rate_trend.json")
+    if not os.path.exists(trend_path):
+        return None
+    try:
+        with open(trend_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _parse_trend_time(raw_time: str, year: int) -> tuple:
+    """
+    解析趋势数据中的时间格式。
+    兼容新格式 "MM-DD HH:MM" 和旧格式 "HH:MM"。
+    返回: (标准化时间字符串, datetime对象)，解析失败返回 (None, None)
+    """
+    if not raw_time:
+        return None, None
+
+    # 尝试新格式 "MM-DD HH:MM"
+    if " " in raw_time and "-" in raw_time:
+        try:
+            pt = datetime.strptime(f"{year}-{raw_time}", "%Y-%m-%d %H:%M")
+            return raw_time, pt
+        except ValueError:
+            pass
+
+    # 尝试旧格式 "HH:MM"
+    if " " not in raw_time and ":" in raw_time:
+        try:
+            # 用今天补全日期（可能不准确，但至少能显示）
+            today = datetime.now(BJT).strftime("%m-%d")
+            full_time = f"{today} {raw_time}"
+            pt = datetime.strptime(f"{year}-{full_time}", "%Y-%m-%d %H:%M")
+            return full_time, pt
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def _aggregate_task_results_to_points(tasks: List[dict], year: int, cutoff_naive: datetime, now_naive: datetime) -> tuple:
+    """
+    将多个任务的结果聚合为时间序列数据点。
+    每个任务产生一个数据点（使用任务的 updated_at 作为时间）。
+    返回: (overall_points, models_points)
+        overall_points: [{time, hit_rate}, ...]
+        models_points: {model_name: [{time, hit_rate}, ...]}
+    """
+    overall_points = []
+    models_points = {}
+
+    for task in tasks:
+        updated_str = task.get("updated_at", "")
+        if not updated_str:
+            continue
+        try:
+            updated_dt = datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+
+        # 检查是否在时间范围内
+        if not (cutoff_naive <= updated_dt <= now_naive):
+            continue
+
+        # 格式化时间
+        time_str = updated_dt.strftime("%m-%d %H:%M")
+
+        # 获取整体命中率
+        result = task.get("result", {})
+        if not result:
+            continue
+
+        # 计算整体命中率（各模型加权平均）
+        total_hit = sum(r.get("hit_count", 0) for r in result.values())
+        total_queries = sum(r.get("total_queries", 0) for r in result.values())
+        if total_queries > 0:
+            hit_rate = round((total_hit / total_queries) * 100, 2)
+            overall_points.append({"time": time_str, "hit_rate": hit_rate})
+
+        # 各模型的命中率
+        for model_name, stats in result.items():
+            hit_count = stats.get("hit_count", 0)
+            total_q = stats.get("total_queries", 0)
+            if total_q > 0:
+                m_hit_rate = round((hit_count / total_q) * 100, 2)
+                if model_name not in models_points:
+                    models_points[model_name] = []
+                models_points[model_name].append({"time": time_str, "hit_rate": m_hit_rate})
+
+    return overall_points, models_points
+
+
+@router.get("/kv/dashboard", summary="获取命中率趋势数据（实时）")
+async def kv_dashboard(time_range: str = Query(default="1d", description="时间范围: 1h, 6h, 1d, 7d, 30d")):
+    """
+    实时 Dashboard API。
+    对 8 个固定场景，分别读取已完成任务的趋势数据。
+    - 实时场景（全场景_各模型）：使用任务的分钟级 trend 数据
+    - 非实时场景：聚合时间范围内的多个任务，每个任务作为日级数据点
+    返回: {scenarios: {name: {task_id, points: [{time, hit_rate}], stats: {mean, max, min}}}}
+    """
+    if time_range not in _TIME_RANGE_MAP:
+        raise HTTPException(status_code=400, detail=f"不支持的 time_range: {time_range}，可选: {list(_TIME_RANGE_MAP.keys())}")
+
+    range_seconds = _TIME_RANGE_MAP[time_range]
+    now_bjt = datetime.now(BJT)
+    cutoff_bjt = now_bjt - timedelta(seconds=range_seconds)
+    # 趋势数据时间格式 "MM-DD HH:MM"，解析时去掉时区避免 naive/aware 比较问题
+    cutoff_naive = cutoff_bjt.replace(tzinfo=None)
+    now_naive = now_bjt.replace(tzinfo=None)
+    year = now_bjt.year
+
+    result = {}
+    for scenario in DASHBOARD_SCENARIOS:
+        is_realtime_scenario = (scenario == "全场景_各模型")
+
+        if is_realtime_scenario:
+            # 实时场景：使用单个任务的分钟级 trend 数据
+            task = _find_latest_task_for_scenario(scenario)
+            if not task:
+                result[scenario] = None
+                continue
+
+            task_id = task.get("task_id", "")
+            if not task_id:
+                result[scenario] = None
+                continue
+
+            trend = _read_trend_for_task(task_id)
+            if not trend or not trend.get("series"):
+                result[scenario] = {"task_id": task_id, "points": [], "stats": {"mean": 0, "max": 0, "min": 0}, "models": {}}
+                continue
+
+            # 解析 trend 数据
+            overall_series = None
+            model_series = {}
+            for s in trend["series"]:
+                if s.get("model") == "整体":
+                    overall_series = s
+                else:
+                    model_series[s["model"]] = s
+
+            points = []
+            if overall_series:
+                for p in overall_series.get("data", []):
+                    raw_time = p.get("time", "")
+                    if not raw_time:
+                        continue
+                    time_str, pt = _parse_trend_time(raw_time, year)
+                    if pt is None:
+                        continue
+                    if pt >= cutoff_naive and pt <= now_naive:
+                        hit_rate = p.get("hit_rate")
+                        if hit_rate is not None:
+                            points.append({"time": time_str, "hit_rate": round(hit_rate * 100, 2)})
+
+            # 提取模型级数据
+            models = {}
+            for model_name, m_series in model_series.items():
+                m_points = []
+                for p in m_series.get("data", []):
+                    raw_time = p.get("time", "")
+                    if not raw_time:
+                        continue
+                    time_str, pt = _parse_trend_time(raw_time, year)
+                    if pt is None:
+                        continue
+                    if pt >= cutoff_naive and pt <= now_naive:
+                        hr = p.get("hit_rate")
+                        if hr is not None:
+                            m_points.append({"time": time_str, "hit_rate": round(hr * 100, 2)})
+                if m_points:
+                    m_rates = [p["hit_rate"] for p in m_points]
+                    models[model_name] = {
+                        "points": m_points,
+                        "stats": {
+                            "mean": round(sum(m_rates) / len(m_rates), 2) if m_rates else 0,
+                            "max": max(m_rates) if m_rates else 0,
+                            "min": min(m_rates) if m_rates else 0,
+                        }
+                    }
+
+            rates = [p["hit_rate"] for p in points]
+            stats = {
+                "mean": round(sum(rates) / len(rates), 2) if rates else 0,
+                "max": max(rates) if rates else 0,
+                "min": min(rates) if rates else 0,
+            }
+
+            result[scenario] = {
+                "task_id": task_id,
+                "points": points,
+                "stats": stats,
+                "models": models,
+            }
+
+        else:
+            # 非实时场景：聚合时间范围内的多个任务
+            tasks = _find_tasks_for_scenario_in_range(scenario, cutoff_naive, now_naive)
+            if not tasks:
+                result[scenario] = None
+                continue
+
+            # 使用最新任务的 task_id
+            latest_task = tasks[-1] if tasks else None
+            task_id = latest_task.get("task_id", "") if latest_task else ""
+
+            # 将任务结果聚合为时间序列
+            overall_points, models_points = _aggregate_task_results_to_points(tasks, year, cutoff_naive, now_naive)
+
+            if not overall_points:
+                result[scenario] = {"task_id": task_id, "points": [], "stats": {"mean": 0, "max": 0, "min": 0}, "models": {}}
+                continue
+
+            # 计算统计数据
+            rates = [p["hit_rate"] for p in overall_points]
+            stats = {
+                "mean": round(sum(rates) / len(rates), 2) if rates else 0,
+                "max": max(rates) if rates else 0,
+                "min": min(rates) if rates else 0,
+            }
+
+            # 构建模型级数据
+            models = {}
+            for model_name, m_points in models_points.items():
+                if m_points:
+                    m_rates = [p["hit_rate"] for p in m_points]
+                    models[model_name] = {
+                        "points": m_points,
+                        "stats": {
+                            "mean": round(sum(m_rates) / len(m_rates), 2) if m_rates else 0,
+                            "max": max(m_rates) if m_rates else 0,
+                            "min": min(m_rates) if m_rates else 0,
+                        }
+                    }
+
+            result[scenario] = {
+                "task_id": task_id,
+                "points": overall_points,
+                "stats": stats,
+                "models": models,
+            }
+
+    return {"scenarios": result, "time_range": time_range}
+
+
+# ============================================================
+# Realtime — 实时命中率趋势（独立于 Dashboard 的实时管道）
+# ============================================================
+_REALTIME_DIR = os.path.join(KV_RESULTS_DIR, "realtime")
+
+
+def _load_realtime_config() -> dict:
+    """加载实时 pipeline 独立配置"""
+    try:
+        with open(REALTIME_CONFIG_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_realtime_daily(scenario: str, date_str: str) -> dict:
+    """读取 realtime/{scenario}/{date_str}.json 的 data dict"""
+    daily_file = os.path.join(_REALTIME_DIR, scenario, f"{date_str}.json")
+    if not os.path.exists(daily_file):
+        return {}
+    try:
+        with open(daily_file, "r", encoding="utf-8") as f:
+            return json.load(f).get("data", {})
+    except Exception:
+        return {}
+
+
+def _compute_stats(data_points: list) -> dict:
+    """计算 mean / max / min"""
+    rates = [p["hit_rate"] for p in data_points if p.get("hit_rate") is not None]
+    if not rates:
+        return {"mean": 0, "max": 0, "min": 0}
+    return {
+        "mean": round(sum(rates) / len(rates), 2),
+        "max": round(max(rates), 2),
+        "min": round(min(rates), 2),
+    }
+
+
+@router.get("/kv/realtime", summary="获取全场景实时命中率趋势")
+async def kv_realtime(
+    time_range: str = Query(default="1h", description="时间范围: 1h, 6h, 1d, 7d, 30d"),
+):
+    """
+    从 realtime/ 目录读取常驻 Worker 产出的分钟级趋势数据。
+    后端计算 mean/max/min，前端直接展示。
+    支持 1h / 6h / 1d / 7d / 30d 跨天查询。
+    """
+    if time_range not in _TIME_RANGE_MAP:
+        raise HTTPException(status_code=400, detail=f"不支持的 time_range: {time_range}")
+
+    cfg = _load_realtime_config()
+    if not cfg.get("enabled", True):
+        raise HTTPException(status_code=404, detail="实时分析未启用")
+
+    scenario = cfg.get("scenario", "全场景_各模型")
+    range_seconds = _TIME_RANGE_MAP[time_range]
+
+    now_bjt = datetime.now(BJT)
+    cutoff_bjt = now_bjt - timedelta(seconds=range_seconds)
+
+    # 确定需要加载的天文件列表
+    days_to_load = []
+    current = cutoff_bjt
+    while current.date() <= now_bjt.date():
+        days_to_load.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+
+    # 加载所有天文件的 data dict，key 带日期避免跨天覆盖: "YYYY-MM-DD HH:MM" -> {model: hit_rate}
+    all_minutes: dict = {}
+    for day_str in days_to_load:
+        day_data = _load_realtime_daily(scenario, day_str)
+        for minute_str, model_rates in day_data.items():
+            if isinstance(model_rates, dict):
+                # 用带日期的 key 存储，避免跨天冲突
+                full_key = f"{day_str} {minute_str}"
+                all_minutes[full_key] = model_rates
+
+    # 过滤时间范围，key 转换为 "MM-DD HH:MM"
+    filtered_minutes = {}
+    for full_key, model_rates in all_minutes.items():
+        try:
+            dt = datetime.strptime(full_key, "%Y-%m-%d %H:%M")
+            dt_bjt = dt.replace(tzinfo=BJT)
+            if dt_bjt >= cutoff_bjt.replace(tzinfo=BJT) and dt_bjt <= now_bjt:
+                display_time = f"{dt.strftime('%m-%d')} {dt.strftime('%H:%M')}"
+                filtered_minutes[display_time] = model_rates
+        except ValueError:
+            continue
+
+    # 按时间排序
+    sorted_minutes = sorted(filtered_minutes.items(), key=lambda x: x[0])
+
+    # 提取模型列表（从配置或数据中检测）
+    configured_models = cfg.get("models", "")
+    model_list = [m.strip() for m in configured_models.split(",") if m.strip()]
+    if not model_list and sorted_minutes:
+        model_list = [k for k in sorted_minutes[0][1].keys() if k != "整体"]
+
+    # 构建整体 data points
+    overall_points = []
+    for time_label, model_rates in sorted_minutes:
+        hr = model_rates.get("整体")
+        if hr is not None:
+            overall_points.append({
+                "time": time_label,
+                "hit_rate": round(hr * 100, 2) if hr < 1 else round(hr, 2),
+            })
+
+    # 构建整体 stats
+    overall_stats = _compute_stats(overall_points)
+
+    # 构建模型级 data points 和 stats
+    models = {}
+    for model_name in model_list:
+        m_points = []
+        for time_label, model_rates in sorted_minutes:
+            hr = model_rates.get(model_name)
+            if hr is not None:
+                m_points.append({
+                    "time": time_label,
+                    "hit_rate": round(hr * 100, 2) if hr < 1 else round(hr, 2),
+                })
+        if m_points:
+            models[model_name] = {
+                "points": m_points,
+                "stats": _compute_stats(m_points),
+            }
+
+    # 计算 data_status
+    total_minutes = int(range_seconds / 60)
+    filled_minutes = len(overall_points)
+    coverage_pct = round(filled_minutes / total_minutes * 100, 1) if total_minutes > 0 else 0
+    latest_minute = sorted_minutes[-1][0] if sorted_minutes else None
+
+    return {
+        "scenarios": {
+            scenario: {
+                "points": overall_points,
+                "stats": overall_stats,
+                "models": models,
+                "data_status": {
+                    "total_minutes": total_minutes,
+                    "filled_minutes": filled_minutes,
+                    "coverage_pct": coverage_pct,
+                    "latest_minute": latest_minute,
+                },
+            }
+        },
+        "time_range": time_range,
+    }
+
+
+@router.get("/kv/realtime/status", summary="获取实时 Worker 存活状态")
+async def kv_realtime_status():
+    """
+    检查 realtime Worker 是否存活。
+    通过 worker_heartbeat 文件的最后修改时间判断（心跳间隔 30s）。
+    同时返回队列积压和最新数据时间。
+    """
+    heartbeat_file = os.path.join(_REALTIME_DIR, "worker_heartbeat")
+    alive = False
+    last_heartbeat = None
+
+    if os.path.exists(heartbeat_file):
+        try:
+            mtime = os.path.getmtime(heartbeat_file)
+            last_heartbeat = datetime.fromtimestamp(mtime, BJT).strftime("%Y-%m-%d %H:%M:%S")
+            # 心跳超过 120 秒视为失活
+            alive = (time.time() - mtime) < 120
+        except Exception:
+            pass
+
+    # 队列积压
+    queue_pending = len(glob.glob(os.path.join(_REALTIME_DIR, "queue", "pending", "*.json")))
+    queue_running = len(glob.glob(os.path.join(_REALTIME_DIR, "queue", "running", "*.json")))
+    queue_failed = len(glob.glob(os.path.join(_REALTIME_DIR, "queue", "failed", "*.json")))
+
+    # 最新数据时间
+    cfg = _load_realtime_config()
+    scenario = cfg.get("scenario", "全场景_各模型")
+    latest_minute = None
+    scenario_dir = os.path.join(_REALTIME_DIR, scenario)
+    if os.path.isdir(scenario_dir):
+        daily_files = sorted(
+            [f for f in os.listdir(scenario_dir) if f.endswith(".json")],
+            reverse=True,
+        )
+        for df in daily_files[:2]:  # 只检查最近 2 天
+            try:
+                with open(os.path.join(scenario_dir, df), "r", encoding="utf-8") as f:
+                    data = json.load(f).get("data", {})
+                if data:
+                    minutes = sorted(data.keys(), reverse=True)
+                    if minutes:
+                        latest_minute = f"{df[:-5]} {minutes[0]}"
+                        break
+            except Exception:
+                continue
+
+    return {
+        "alive": alive,
+        "last_heartbeat": last_heartbeat,
+        "queue": {
+            "pending": queue_pending,
+            "running": queue_running,
+            "failed": queue_failed,
+        },
+        "latest_minute": latest_minute,
+    }
 
 
 @router.get("/kv/models", summary="获取可用模型列表（热加载）")

@@ -1,7 +1,7 @@
 import logging
 import os
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler, RotatingFileHandler
 
 from app.conf.config import settings
 from app.core.request_context import ctx_get_username, ctx_get_trace_id
@@ -56,13 +56,8 @@ class _PollingFilter(logging.Filter):
 
 
 def setup_logging() -> None:
-    """配置日志，单个日志文件不超过 5MB，滚动备份，文件名带日期时间戳。"""
+    """配置日志：app.log 按天轮转，es_query.log 按大小轮转。"""
     os.makedirs(settings.log_dir, exist_ok=True)
-
-    # 日志文件增加日期前缀，例如 20260115_1917_app.log
-    date_prefix = datetime.now().strftime("%Y%m%d_%H%M")
-    log_file_name = f"{date_prefix}_{settings.log_file_name}"
-    log_path = os.path.join(settings.log_dir, log_file_name)
 
     log_format = (
         "%(asctime)s | %(levelname)s | "
@@ -73,32 +68,29 @@ def setup_logging() -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(settings.log_level)
 
-    # 文件轮转
-    file_handler = RotatingFileHandler(
+    # ---- App 日志：按天轮转 ----
+    log_path = os.path.join(settings.log_dir, settings.log_file_name)
+    file_handler = TimedRotatingFileHandler(
         log_path,
-        maxBytes=settings.log_max_bytes,
-        backupCount=settings.log_backup_count,
+        when="midnight",
+        backupCount=30,
         encoding="utf-8",
     )
     file_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
-    file_handler.addFilter(_ScrollFilter())  # scroll 日志不写 app.log
+    file_handler.addFilter(_ScrollFilter())
 
     # 清理旧 handler，避免重复
     if root_logger.handlers:
         for h in list(root_logger.handlers):
             root_logger.removeHandler(h)
-
     root_logger.addHandler(file_handler)
 
-    # ---- ES 查询专用日志 ----
+    # ---- ES 查询专用日志：按大小轮转 ----
     os.makedirs(settings.es_log_dir, exist_ok=True)
-    es_log_file = os.path.join(
-        settings.es_log_dir,
-        f"{date_prefix}_{settings.es_log_file_name}",
-    )
+    es_log_file = os.path.join(settings.es_log_dir, settings.es_log_file_name)
     es_logger = logging.getLogger("es_query")
     es_logger.setLevel(logging.DEBUG)
-    es_logger.propagate = False          # 不向 root 冒泡，避免重复写入 app.log
+    es_logger.propagate = False
 
     es_file_handler = RotatingFileHandler(
         es_log_file,
@@ -107,13 +99,11 @@ def setup_logging() -> None:
         encoding="utf-8",
     )
     es_file_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
-
-    # 清理旧 handler
     for h in list(es_logger.handlers):
         es_logger.removeHandler(h)
     es_logger.addHandler(es_file_handler)
 
-    # elasticsearch 库日志：scroll 日志直接丢弃（_ScrollFilter），其余写入 es_logs + app.log
+    # elasticsearch 库日志
     es_lib_logger = logging.getLogger("elasticsearch")
     es_lib_handler = RotatingFileHandler(
         es_log_file,
@@ -122,15 +112,12 @@ def setup_logging() -> None:
         encoding="utf-8",
     )
     es_lib_handler.setFormatter(ContextFormatter(log_format, datefmt=datefmt))
-    es_lib_handler.addFilter(_ScrollFilter())  # scroll 日志也不写 es_logs
+    es_lib_handler.addFilter(_ScrollFilter())
     es_lib_logger.addHandler(es_lib_handler)
 
-    # ---- 使用统计日志 (格式兼容 legacy: {time} | {user} | {scenario} | {action}) ----
+    # ---- 使用统计日志（长期追加，按大小轮转）----
     os.makedirs(settings.usage_log_dir, exist_ok=True)
-    usage_log_file = os.path.join(
-        settings.usage_log_dir,
-        settings.usage_log_file_name,      # 不带日期前缀，长期追加便于 dashboard 读取
-    )
+    usage_log_file = os.path.join(settings.usage_log_dir, settings.usage_log_file_name)
     usage_logger = logging.getLogger("usage")
     usage_logger.setLevel(logging.INFO)
     usage_logger.propagate = False
@@ -141,9 +128,7 @@ def setup_logging() -> None:
         backupCount=settings.usage_log_backup_count,
         encoding="utf-8",
     )
-    # 纯消息格式，不带 level/module 等前缀；时间 + 内容由调用方拼装
     usage_handler.setFormatter(logging.Formatter("%(message)s"))
-
     for h in list(usage_logger.handlers):
         usage_logger.removeHandler(h)
     usage_logger.addHandler(usage_handler)

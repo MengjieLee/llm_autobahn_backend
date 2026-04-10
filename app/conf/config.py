@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     UNMODIFIABLE_GROUP: str = "official"
 
     # 日志
-    log_dir: str = "logs"
+    log_dir: str = "logs/app"
     log_file_name: str = "app.log"
     log_max_bytes: int = 100 * 1024 * 1024  # 100MB
     log_backup_count: int = 10
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     es_log_backup_count: int = 5
 
     # 使用统计日志（格式兼容 legacy，独立于 app 日志）
-    usage_log_dir: str = "logs"
+    usage_log_dir: str = "logs/app"
     usage_log_file_name: str = "usage.log"
     usage_log_max_bytes: int = 100 * 1024 * 1024  # 100MB
     usage_log_backup_count: int = 10

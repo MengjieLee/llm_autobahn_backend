@@ -35,5 +35,5 @@
   "notify_im_bot_toid": [12716154],
   "daily_report_im_bot_url": "http://apiin.im.baidu.com/api/msg/groupmsgsend?access_token=d9f717192cd263087188cc7eee8b8c4d1",
   "daily_report_im_bot_toid": [12692473],
-  "daily_report_detail_url": "https://vortex.n.baidu-int.com/olap/kv"
+  "daily_report_detail_url": "https://vortex.n.baidu-int.com/olap/dashboard"
 }

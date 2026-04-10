@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "scenario": "全场景_各模型",
+  "models": "glm-5,kimi-k2.5,minimax-m2.5,deepseek-v3.2",
+  "delay_minutes": 5,
+  "retention_days": 30,
+
+  "_comment_pipeline": "实时 pipeline 独立并发配置（不与日报 pipeline 共用）",
+  "pipeline_fetch_concurrency": 5,
+  "pipeline_fetch_window_concurrency": 12,
+  "pipeline_es_scroll_workers": 60,
+  "pipeline_tokenize_concurrency": 5,
+  "pipeline_tokenize_workers": 6,
+  "pipeline_tokenize_batch_size": 10000,
+  "pipeline_es_scroll_size": 10000,
+  "pipeline_block_size": 16,
+  "pipeline_cache_size": 200000000,
+
+  "_comment_k8s": "实时kv_cache_全场景_各模型",
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.5",
+  "k8s_cpu_request": "28",
+  "k8s_cpu_limit": "28",
+  "k8s_memory_request": "110Gi",
+  "k8s_memory_limit": "110Gi",
+  "k8s_namespace": "cache-hit-rate-tokenizer",
+  "k8s_working_dir": "/mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend",
+  "k8s_cfs_host_path": "/mnt/cfs_bj_mt",
+  "k8s_cfs_mount_path": "/mnt/cfs_bj_mt"
+}

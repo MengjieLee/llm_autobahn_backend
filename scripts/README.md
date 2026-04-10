@@ -65,9 +65,11 @@
                   ┌──────────────▼──────────────┐
                   │  compute_trend.py            │
                   │                              │
-                  │  对每个 model 的每个时间片     │
-                  │  独立调用 cache_calc          │
-                  │  提取 per-slice hit_rate      │
+                  │  对每个 model，合并所有时间片   │
+                  │  插入 __SECTION__ 分段标记    │
+                  │  一次调用 cache_calc          │
+                  │  LRU Cache 状态跨分钟保持     │
+                  │  → per-section hit_rate      │
                   │  → 按时间排序 + 整体聚合       │
                   │                              │
                   │  产出: hit_rate_trend.json    │
@@ -90,8 +92,8 @@ olap.py (_run_pipeline) / run_pipeline.py
   │     └→ cache_pipeline.py → merge_input_files() → cache_calc
   │
   └─ Stage 4: compute_trend.py (ThreadPoolExecutor)
-        └→ _calc_single_file() → cache_calc -f <txt>
-              └→ hit_rate_trend.json
+        └→ _calc_model_shared_cache() → cache_calc -f <merged_with_sections>
+              → parse section output → hit_rate_trend.json
 ```
 
 ---
@@ -371,13 +373,29 @@ python scripts/es_model_stats.py -s "2026-03-28 00:00:00" -e "2026-03-29 00:00:0
 
 **被谁调用**：`run_pipeline.py` 的 `_run_trend_stage()` (asyncio.to_thread)，也可 CLI 独立回填。
 
-**职责**：对每个模型的每个时间片独立调用 `cache_calc`，提取 per-slice `hit_rate`，按时间排序后计算整体维度的 mean/max/min 统计，生成趋势曲线数据。
+**职责**：对每个模型的所有时间片文件，合并后插入 `__SECTION__` 分段标记，一次调用 `cache_calc`，LRU Cache 状态跨分钟保持（避免冷启动误差），提取 per-section `hit_rate`，按时间排序后计算整体维度的 mean/max/min 统计。
+
+**共享 LRU Cache 设计**：
+
+之前每分钟独立运行 cache_calc（冷启动，cache 每次从空开始），导致 hit_rate 偏低、波动大。现在：
+1. 将同一模型的所有 per-minute input_ids 文件按时间排序合并
+2. 每个文件之间插入 `__SECTION__:<time_label>` 分段标记
+3. 一次运行 cache_calc，LRU Cache 状态跨 section 保持
+4. cache_calc 在每个 section 边界输出段统计（section_adds/hits/hit_rate），然后重置段计数器
+5. 解析所有 section 输出得到 per-minute hit_rate
+
+效果（样本任务验证）：
+
+| 指标 | 旧（冷启动） | 新（共享 cache） |
+|------|-------------|-----------------|
+| max | 87.77% | 99.75% |
+| min | 14.78% | 57.02% |
+| mean | 58.37% | 90.03% |
 
 **核心优化**：
-- **单一共享 ThreadPoolExecutor**：所有模型的文件统一提交到一个线程池并行处理（默认 max_workers=8）
-- **去重复用**：加载已有 `hit_rate_trend.json`，对 `(model, time_label)` 已存在结果跳过 cache_calc 调用，重试/恢复场景只计算增量
+- **单一共享 ThreadPoolExecutor**：所有模型并行处理（默认 max_workers=8），每个模型一次 cache_calc 调用
+- **去重复用**：加载已有 `hit_rate_trend.json`，对已全部完成的模型跳过计算
 - **O(T×M) 聚合**：用 dict 替代嵌套循环计算"整体"维度的平均命中率
-- **关键节点日志**：开始/去重统计/每 20 文件进度/完成耗时，通过 `logging.getLogger("compute_trend")` 输出
 
 **两种使用方式**：
 
@@ -387,7 +405,7 @@ from scripts.compute_trend import compute_trend
 result = compute_trend(task_data_dir, cache_calc_path, cache_size, block_size, model_outputs)
 
 # 2) 命令行回填已完成任务
-python scripts/compute_trend.py --status-dir olap_database/status --data-dir olap_database/data
+python scripts/compute_trend.py --status-dir olap_database/status --data-dir olap_database/data --force
 ```
 
 | 参数 (CLI) | 说明 | 默认值 |
@@ -416,10 +434,10 @@ python scripts/compute_trend.py --status-dir olap_database/status --data-dir ola
 
 **日志输出示例**：
 ```
-[INFO] [trend] 开始计算: 6 模型, 144 文件, max_workers=8
-[INFO] [trend] 去重: 0 已有结果复用, 144 文件需计算
-[INFO] [trend] 进度: 20/144 文件完成
-[INFO] [trend] 完成: 6 模型, 144 数据点, 耗时 149.0s (复用 0, 计算 144)
+[INFO] [trend] 开始计算 (shared cache): 1 模型, 120 文件, max_workers=8
+[INFO] [trend] 需计算 1 个模型 (workers=1): ['glm-5']
+[INFO] [trend] glm-5: shared cache 120 files -> 120 points (5.6s)
+[INFO] [trend] 完成: 1 模型, 120 数据点, 耗时 6.0s (跳过 0, 计算 1)
 ```
 
 ---
@@ -591,6 +609,34 @@ python scripts/daily_cache_plan.py --base-url http://your-api:8739
 # cache_size: 200000000  total_adds: 799851  hit_count: 312345  hit_rate: 0.3905
 ```
 
+### 分段标记（Section Markers）
+
+cache_calc 支持在输入文件中插入 `__SECTION__:<name>` 分段标记。遇到标记时：
+1. 输出当前段的统计（section_adds, section_hits, section_hit_rate）
+2. **重置段计数器，但保留 LRU Cache 状态**
+3. 继续处理后续数据
+
+这允许在一次 cache_calc 运行中获取 per-minute hit_rate，同时保持 cache 状态跨分钟复用（避免冷启动误差）。
+
+**输入文件示例**：
+```
+__SECTION__:04-08 03:00
+'input_ids': [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]
+'input_ids': [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 17]
+__SECTION__:04-08 03:01
+'input_ids': [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]
+```
+
+**输出格式**：
+```
+section: 04-08 03:00	cache_size: 12500000	section_adds: 105300	section_hits: 60044	section_hit_rate: 0.570218
+section: 04-08 03:01	cache_size: 12500000	section_adds: 72635	section_hits: 55494	section_hit_rate: 0.764012
+entries: 162, tokens: 3597720
+cache_size: 12500000	total_adds: 224935	hit_count: 150270	hit_rate: 0.66806
+```
+
+段统计行（`section:`）和全局统计行（`cache_size:`）同时输出，向后兼容。
+
 ---
 
 ## 数据目录结构
@@ -689,10 +735,13 @@ olap_database/
 |------|------|---------|
 | `tokenize_script.py` | Token 序列化（核心 CPU 计算） | `kv_pipeline.py` (legacy 模式) |
 | `tokenize_daemon.py` | Token 序列化（常驻 daemon，tokenizer 一次加载复用） | `kv_pipeline.py` (daemon 模式，默认) |
-| `kv_pipeline.py` | 序列化调度 + 模型过滤 + 汇总 | `run_pipeline.py` Stage 2 |
+| `kv_pipeline.py` | 序列化调度 + 模型过滤 + 汇总 | `run_pipeline.py` Stage 2 / `realtime_worker.py` |
 | `cache_pipeline.py` | 合并 txt + 调度模拟 | `run_pipeline.py` Stage 3 |
 | `cache_simulation.py` | 调用 cache_calc + 生成 JSON 报告 | `cache_pipeline.py` |
-| `compute_trend.py` | 分钟级命中率趋势计算 | `run_pipeline.py` Stage 4 / CLI 回填 |
+| `compute_trend.py` | 分钟级命中率趋势计算（共享 LRU Cache） | `run_pipeline.py` Stage 4 / CLI 回填 |
+| `realtime_worker.py` | 实时 KV Cache 分析常驻 Worker | K8s Deployment 常驻运行 |
+| `realtime_scheduler.py` | 实时任务调度器（每分钟 cron） | crontab 定时执行 |
+| `deploy_realtime.py` | K8s Deployment 部署脚本 | 手动执行 |
 | `run_pipeline.py` | K8s Job 完整 Pipeline 入口 | K8s Job Pod entrypoint |
 | `daily_report.py` | 每日命中率日报推送 | crontab 定时执行 |
 | `daily_cache_plan.py` | 每日分析任务分阶段调度 | crontab 定时执行 |

@@ -129,14 +129,40 @@ static std::vector<LogEntry> read_all_entries(const std::string& filename,
 }
 
 // ============================================================
+// 段标记常量
+// ============================================================
+static const char* SECTION_PREFIX = "__SECTION__:";
+
+// ============================================================
+// 输出所有 cache 的段统计（遇到段边界时调用）
+// ============================================================
+static void emit_section_stats(const std::string& section_name,
+                                std::vector<lru::LRUCache<uint64_t>>& caches) {
+    for (const auto& cache : caches) {
+        if (cache.getSectionAdds() == 0) continue;
+        std::cout << "section: " << section_name
+                  << "\tcache_size: " << cache.getCapacity()
+                  << "\tsection_adds: " << cache.getSectionAdds()
+                  << "\tsection_hits: " << cache.getSectionHits()
+                  << "\tsection_hit_rate: " << cache.getSectionHitRate()
+                  << std::endl;
+    }
+}
+
+// ============================================================
 // 流式处理单个文件（不需要排序时，逐行读取 + 处理，不占额外内存）
+// 支持 __SECTION__:<name> 分段标记：
+//   标记表示新段的开始，此前累积的数据属于上一段。
+//   输出上一段统计，重置段计数器，保留 LRU 状态。
 // ============================================================
 static void stream_process_file(const std::string& filename,
                                  const Config& cfg,
                                  std::vector<lru::LRUCache<uint64_t>>& caches,
                                  std::atomic<size_t>& total_tokens,
                                  std::atomic<size_t>& current_tokens,
-                                 std::atomic<size_t>& entry_count) {
+                                 std::atomic<size_t>& entry_count,
+                                 std::string& current_section,
+                                 bool& has_sections) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: cannot open file " << filename << std::endl;
@@ -144,6 +170,21 @@ static void stream_process_file(const std::string& filename,
     }
     std::string line;
     while (std::getline(file, line)) {
+        // 检查段标记
+        if (line.find(SECTION_PREFIX) == 0) {
+            std::string new_section = line.substr(strlen(SECTION_PREFIX));
+            has_sections = true;
+            // 输出上一段的统计（如果有的话）
+            if (!current_section.empty()) {
+                emit_section_stats(current_section, caches);
+            }
+            // 重置段计数器（保留 LRU cache 状态）
+            for (auto& cache : caches) {
+                cache.resetSection();
+            }
+            current_section = std::move(new_section);
+            continue;
+        }
         auto ids = parse_input_ids(line);
         if (ids.empty()) continue;
         total_tokens += ids.size();
@@ -227,6 +268,8 @@ int main(int argc, char* argv[]) {
     std::atomic<size_t> current_tokens(0);
     std::atomic<size_t> entry_count(0);
     std::atomic<bool>   done(false);
+    std::string         current_section;
+    bool                has_sections = false;
 
     // 启动进度线程
     std::thread progress_thr(progress_thread_func,
@@ -275,7 +318,8 @@ int main(int argc, char* argv[]) {
         // 流式处理：逐文件逐行，内存友好
         for (const auto& path : cfg.file_paths) {
             stream_process_file(path, cfg, caches,
-                                total_tokens, current_tokens, entry_count);
+                                total_tokens, current_tokens, entry_count,
+                                current_section, has_sections);
         }
         std::cout << "entries: " << entry_count.load()
                   << ", tokens: " << total_tokens.load() << std::endl;
@@ -284,7 +328,12 @@ int main(int argc, char* argv[]) {
     done.store(true, std::memory_order_relaxed);
     progress_thr.join();
 
-    // 输出结果
+    // 输出最后一段的统计
+    if (has_sections && !current_section.empty()) {
+        emit_section_stats(current_section, caches);
+    }
+
+    // 输出结果（全局统计，向后兼容）
     for (const auto& cache : caches) {
         std::cout << "cache_size: " << cache.getCapacity()
                   << "\ttotal_adds: " << cache.getTotalAdds()

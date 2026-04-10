@@ -193,132 +193,6 @@ def _set_failed(task_id: str, stage: str, error_msg: str):
 
 
 # ============================================================
-# 分钟级子切片：将大 JSONL 文件按 @timestamp 拆分
-# ============================================================
-_TS_RE = re.compile(rb'"@timestamp"\s*:\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
-_BJT_OFFSET = timedelta(hours=8)
-
-
-def _extract_timestamp_bjt(line: bytes):
-    """从 JSONL 行中快速提取 @timestamp 并转为 BJT datetime（不做 json.loads）。"""
-    m = _TS_RE.search(line)
-    if not m:
-        return None
-    return datetime.strptime(m.group(1).decode(), "%Y-%m-%dT%H:%M:%S") + _BJT_OFFSET
-
-
-def _split_jsonl_by_time(
-    hourly_file: str,
-    hour_start: datetime,
-    hour_end: datetime,
-    slice_minutes: int,
-    task_data_dir: str,
-) -> list:
-    """
-    将已按 @timestamp 升序排列的 JSONL 文件拆分为多个子切片文件。
-
-    返回: [{"file": path, "start": dt, "end": dt, "line_count": n}, ...]
-    空子切片不写文件、不返回。
-
-    性能优化（针对 CFS 网络文件系统）：
-    - 读写均使用 128MB 缓冲区，大幅减少网络 I/O 次数
-    - 预编译时间边界为 epoch 秒数，避免每行创建 datetime 对象
-    - 时间戳提取用 int 算术代替 datetime.strptime
-    """
-    # 生成时间边界
-    boundaries = []
-    cur = hour_start
-    while cur < hour_end:
-        nxt = min(cur + timedelta(minutes=slice_minutes), hour_end)
-        boundaries.append((cur, nxt))
-        cur = nxt
-
-    if len(boundaries) <= 1:
-        # 不需要拆分
-        return []
-
-    # 预计算边界的 epoch 秒数（用 int 比较代替 datetime 比较，快 ~5x）
-    _EPOCH = datetime(1970, 1, 1)
-    boundary_ends_epoch = [int((b[1] - _EPOCH).total_seconds()) for b in boundaries]
-
-    # 预编译子切片文件名
-    sub_files = []
-    for s_start, s_end in boundaries:
-        s_tag_start = s_start.strftime("%Y%m%d_%H%M%S")
-        s_tag_end = s_end.strftime("%Y%m%d_%H%M%S")
-        sub_files.append(os.path.join(task_data_dir, f"kv_{s_tag_start}_{s_tag_end}.jsonl"))
-
-    # 快速时间戳提取：返回 epoch 秒数（int），避免 datetime 对象创建
-    # @timestamp 格式: "2026-04-06T12:34:56" (UTC)，+8h 转 BJT
-    _ts_re = _TS_RE
-    _BJT_SECS = 8 * 3600
-
-    def _extract_epoch(line: bytes) -> int:
-        """提取 @timestamp 并返回 BJT epoch 秒数，失败返回 -1。"""
-        m = _ts_re.search(line)
-        if not m:
-            return -1
-        raw = m.group(1)  # b"2026-04-06T12:34:56"
-        # 手动解析避免 strptime 开销（占原逻辑 ~60% 时间）
-        yr = int(raw[0:4])
-        mo = int(raw[5:7])
-        dy = int(raw[8:10])
-        hr = int(raw[11:13])
-        mi = int(raw[14:16])
-        sc = int(raw[17:19])
-        # 简化 days 计算（2000-2099 范围内精确）
-        # days from epoch (1970-01-01)
-        y = yr - 1
-        days = y * 365 + y // 4 - y // 100 + y // 400 - 719162  # days from 0000 to epoch
-        _MONTH_DAYS = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
-        days += _MONTH_DAYS[mo - 1] + (dy - 1)
-        if mo > 2 and (yr % 4 == 0 and (yr % 100 != 0 or yr % 400 == 0)):
-            days += 1
-        return days * 86400 + hr * 3600 + mi * 60 + sc + _BJT_SECS
-
-    # 128MB 缓冲区：大幅减少 CFS 上的 read/write 系统调用次数
-    _BUF_SIZE = 128 * 1024 * 1024
-
-    handles = [None] * len(boundaries)
-    counts = [0] * len(boundaries)
-    slot = 0  # 前向游标
-    n_boundaries = len(boundaries)
-
-    logger.info(f"[split] 开始拆分 {os.path.basename(hourly_file)} -> {n_boundaries} 个子切片 (buf={_BUF_SIZE // (1024*1024)}MB)")
-
-    with open(hourly_file, "rb", buffering=_BUF_SIZE) as f_in:
-        for line in f_in:
-            if len(line) <= 1:
-                continue  # 跳过空行（\n 或空）
-
-            ts_epoch = _extract_epoch(line)
-            if ts_epoch >= 0:
-                # 前向推进游标（用 int 比较）
-                while slot < n_boundaries - 1 and ts_epoch >= boundary_ends_epoch[slot]:
-                    slot += 1
-
-            if handles[slot] is None:
-                handles[slot] = open(sub_files[slot], "wb", buffering=_BUF_SIZE)
-
-            handles[slot].write(line)
-            counts[slot] += 1
-
-    # 关闭所有句柄，收集结果
-    results = []
-    for i, (s_start, s_end) in enumerate(boundaries):
-        if handles[i] is not None:
-            handles[i].close()
-            results.append({
-                "file": sub_files[i],
-                "start": s_start,
-                "end": s_end,
-                "line_count": counts[i],
-            })
-            logger.info(f"[split] 子切片 {os.path.basename(sub_files[i])}: {counts[i]} 行")
-
-    logger.info(f"[split] {os.path.basename(hourly_file)} -> {len(results)} 个子切片 (完成)")
-    return results
-
 
 # ============================================================
 # Stage 1+2: fetch → tokenize (streaming pipeline)
@@ -430,11 +304,9 @@ async def _run_streaming_fetch_tokenize(
     async def _fetch_slice(idx: int, h_start: datetime, h_end: datetime):
         h_start_str = h_start.strftime("%Y-%m-%d %H:%M:%S")
         h_end_str = h_end.strftime("%Y-%m-%d %H:%M:%S")
-        h_start_tag = h_start.strftime("%Y%m%d_%H%M%S")
-        h_end_tag = h_end.strftime("%Y%m%d_%H%M%S")
-        base_name = f"kv_{h_start_tag}_{h_end_tag}"
-        incomplete_file = os.path.join(task_data_dir, f"{base_name}.jsonl.incomplete")
-        final_file = os.path.join(task_data_dir, f"{base_name}.jsonl")
+        hour_dir_name = h_start.strftime("%H")
+        hour_dir = os.path.join(task_data_dir, hour_dir_name)
+        os.makedirs(hour_dir, exist_ok=True)
 
         max_scroll_retries = 8
         for scroll_attempt in range(max_scroll_retries + 1):
@@ -448,47 +320,29 @@ async def _run_streaming_fetch_tokenize(
                     _progress_dirty[0] = True
 
                 try:
-                    hour_count = await es.query_to_file(
-                        h_start_str, h_end_str, incomplete_file, status_callback=_cb,
+                    result = await es.query_to_dir(
+                        h_start_str, h_end_str, hour_dir, status_callback=_cb,
                         window_concurrency=cfg.get("pipeline_fetch_window_concurrency", 24)
                     )
-                    os.rename(incomplete_file, final_file)
+                    hour_count = result["total_count"]
                     fetch_total_count[0] += hour_count
                     fetch_done_count[0] += 1
-                    fetch_results.append({
-                        "file": final_file,
-                        "hour": f"{h_start_str}~{h_end_str}",
-                        "count": hour_count
-                    })
-                    _update_fetch_progress()
 
-                    if hour_count > 0:
-                        # 优先读取 per-task 配置的 slice_minutes
-                        task_status = _read_status(task_id)
-                        slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
-                        if slice_minutes < 60:
-                            # 拆分为子切片并分别提交 tokenize
-                            sub_slices = await asyncio.to_thread(
-                                _split_jsonl_by_time, final_file, h_start, h_end, slice_minutes, task_data_dir
-                            )
-                            if sub_slices:
-                                for sub in sub_slices:
-                                    t = asyncio.create_task(
-                                        _tokenize_single_with_tracking(sub["file"], output_dir, task_id)
-                                    )
-                                    tokenize_tasks.append(t)
-                            else:
-                                # 拆分返回空（slice_minutes >= 整段时长），走原逻辑
-                                t = asyncio.create_task(
-                                    _tokenize_single_with_tracking(final_file, output_dir, task_id)
-                                )
-                                tokenize_tasks.append(t)
-                        else:
+                    # 收集 per-minute 文件并提交 tokenize
+                    for fi in result["files"]:
+                        fetch_results.append({
+                            "file": fi["file"],
+                            "hour": f"{h_start_str}~{h_end_str}",
+                            "minute": fi["minute"],
+                            "count": fi["count"]
+                        })
+                        if fi["count"] > 0 and os.path.exists(fi["file"]):
                             t = asyncio.create_task(
-                                _tokenize_single_with_tracking(final_file, output_dir, task_id)
+                                _tokenize_single_with_tracking(fi["file"], output_dir, task_id)
                             )
                             tokenize_tasks.append(t)
 
+                    _update_fetch_progress()
                     es.close()
                     return  # 成功，退出重试循环
 
@@ -497,7 +351,7 @@ async def _run_streaming_fetch_tokenize(
                     err_msg = str(e)
                     is_scroll_err = "too many scroll contexts" in err_msg.lower() or "Trying to create too many scroll contexts" in err_msg
                     if is_scroll_err and scroll_attempt < max_scroll_retries:
-                        wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                        wait_secs = min(60 * (scroll_attempt + 1), 300)
                         logger.warning(
                             f"[fetch] slice {h_start_str}~{h_end_str} scroll limit hit "
                             f"(attempt {scroll_attempt + 1}/{max_scroll_retries}), "
@@ -505,37 +359,26 @@ async def _run_streaming_fetch_tokenize(
                         )
                         _cb_msg[0] = f"[{idx + 1}/{total_slices}] scroll 超限，等待 {wait_secs}s 后重试 ({scroll_attempt + 1}/{max_scroll_retries})..."
                         _progress_dirty[0] = True
-                        # 释放 fetch_sem（退出 async with），等待后重新进入循环
-                        break  # break 出 async with，然后 await sleep 在外面
+                        break
 
-                    # 非 scroll 错误或重试耗尽，走失败路径
-                    if not os.path.exists(incomplete_file):
-                        with open(incomplete_file, 'w') as _f:
-                            pass
                     fetch_done_count[0] += 1
                     fetch_incomplete.append({
-                        "file": f"{base_name}.jsonl.incomplete",
                         "hour": f"{h_start_str}~{h_end_str}",
                         "error": str(e)[:200]
                     })
                     logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} failed: {e}")
                     _update_fetch_progress()
-                    return  # 失败，退出重试循环
-            # end async with fetch_sem — semaphore released
+                    return
+            # end async with fetch_sem
 
-            # scroll limit 重试等待（在 semaphore 外等待，不占位）
             if scroll_attempt < max_scroll_retries:
-                wait_secs = min(60 * (scroll_attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s, 300s, ...
+                wait_secs = min(60 * (scroll_attempt + 1), 300)
                 await asyncio.sleep(wait_secs)
-                continue  # 重新进入 for 循环获取 semaphore
+                continue
 
         # 所有重试用尽仍失败
-        if not os.path.exists(incomplete_file):
-            with open(incomplete_file, 'w') as _f:
-                pass
         fetch_done_count[0] += 1
         fetch_incomplete.append({
-            "file": f"{base_name}.jsonl.incomplete",
             "hour": f"{h_start_str}~{h_end_str}",
             "error": f"scroll context limit exceeded after {max_scroll_retries} retries"
         })
@@ -569,7 +412,7 @@ async def _run_streaming_fetch_tokenize(
         "status": "completed",
         "message": f"查询完成，共 {fetch_total_count[0]} 条",
         "total_count": fetch_total_count[0],
-        "result_files": fetch_results,
+        "total_files": len(fetch_results),
     }
     if fetch_incomplete:
         fetch_status["incomplete_count"] = len(fetch_incomplete)
@@ -1082,16 +925,24 @@ async def _run_simulate_stage(task_id: str):
 async def _run_tokenize_only(task_id: str):
     """
     fetch 已完成时的 tokenize 恢复入口。
-    读取 status 中的 result_files，对每个已有 .jsonl 重跑 daemon tokenize。
+    从磁盘扫描 {task_data_dir}/{HH}/*.jsonl 获取待 tokenize 文件列表。
     用于任务中断后无需重新拉取数据的快速恢复。
     """
-    existing_status = _read_status(task_id)
-    fetch_stage = existing_status.get("pipeline", {}).get("stages", {}).get("fetch", {})
-    result_files = fetch_stage.get("result_files", [])
+    task_data_dir = _task_dir(task_id)
+
+    # 从磁盘扫描 per-minute jsonl 文件（新格式: {HH}/kv_*.jsonl）
+    # 同时兼容旧格式: task_data_dir/kv_*.jsonl
+    result_files = []
+    for pattern in [os.path.join(task_data_dir, "*", "kv_*.jsonl"),
+                    os.path.join(task_data_dir, "kv_*.jsonl")]:
+        for f in sorted(glob.glob(pattern)):
+            if f.endswith(".incomplete"):
+                continue
+            result_files.append({"file": f})
 
     if not result_files:
-        logger.error("[resume] fetch 已完成但无 result_files，无法恢复 tokenize")
-        _set_failed(task_id, "tokenize", "resume 失败：fetch 无 result_files")
+        logger.error("[resume] fetch 已完成但未找到任何 .jsonl 文件，无法恢复 tokenize")
+        _set_failed(task_id, "tokenize", "resume 失败：未找到数据文件")
         return
 
     cfg = _load_olap_config()
@@ -1119,35 +970,15 @@ async def _run_tokenize_only(task_id: str):
     }, "tokenize")
     _update_stage(task_id, "simulate", {"status": "pending", "message": "等待 tokenize..."})
 
-    # 子切片：如果 slice_minutes < 60，对每个小时文件先拆分
-    # 优先读取 per-task 配置的 slice_minutes
-    task_status = _read_status(task_id)
-    slice_minutes = (task_status or {}).get("config", {}).get("slice_minutes", cfg.get("pipeline_slice_minutes", 60))
-    task_data_dir = _task_dir(task_id)
-    tokenize_file_list = []  # 最终要 tokenize 的文件列表
+    # 新版：result_files 已是 per-minute 文件列表，无需拆分
+    # 旧版兼容：如果是整小时文件（没有 minute 字段），直接 tokenize
+    tokenize_file_list = []
+    for fi in result_files:
+        input_file = fi.get("file") if isinstance(fi, dict) else fi
+        if input_file and os.path.exists(input_file):
+            tokenize_file_list.append({"file": input_file})
 
-    if slice_minutes < 60:
-        for fi in result_files:
-            input_file = fi["file"]
-            if not os.path.exists(input_file):
-                continue
-            # 从文件名解析时间范围
-            fname = os.path.basename(input_file)
-            m = re.match(r'kv_(\d{8}_\d{6})_(\d{8}_\d{6})\.jsonl$', fname)
-            if not m:
-                tokenize_file_list.append({"file": input_file})
-                continue
-            h_start = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
-            h_end = datetime.strptime(m.group(2), "%Y%m%d_%H%M%S")
-            sub_slices = _split_jsonl_by_time(input_file, h_start, h_end, slice_minutes, task_data_dir)
-            if sub_slices:
-                for sub in sub_slices:
-                    tokenize_file_list.append({"file": sub["file"]})
-            else:
-                tokenize_file_list.append({"file": input_file})
-        logger.info(f"[resume] 子切片拆分完成，共 {len(tokenize_file_list)} 个文件待 tokenize")
-    else:
-        tokenize_file_list = [{"file": fi["file"]} for fi in result_files]
+    logger.info(f"[resume] 共 {len(tokenize_file_list)} 个文件待 tokenize")
 
     total_tokenize_files = len(tokenize_file_list)
 

@@ -258,12 +258,14 @@ class ESIndexClient:
         )
 
     def _sync_query_to_file_appender(self, body: dict, f,
-                                      status_callback: Callable, base_count: int) -> int:
+                                      status_callback: Callable, base_count: int,
+                                      scroll_size: int = None) -> int:
         """
         流式查询并追加写入到已打开的文件句柄（用于多窗口拼接，JSONL 格式）
         """
         scroll_time = "10m"
-        scroll_size = _get_scroll_size()
+        if scroll_size is None:
+            scroll_size = _get_scroll_size()
         window_count = 0
         scroll_id = None
         t0 = time.time()
@@ -318,7 +320,9 @@ class ESIndexClient:
         return window_count
 
     async def query_to_file_appender(self, body: dict, f,
-                                      status_callback: Callable = None, base_count: int = 0) -> int:
+                                      status_callback: Callable = None,
+                                      base_count: int = 0,
+                                      scroll_size: int = None) -> int:
         """
         异步流式查询并追加写入到文件句柄（JSONL 格式，用于多窗口拼接）
         """
@@ -326,5 +330,5 @@ class ESIndexClient:
         return await loop.run_in_executor(
             _executor,
             self._sync_query_to_file_appender,
-            body, f, status_callback, base_count
+            body, f, status_callback, base_count, scroll_size
         )

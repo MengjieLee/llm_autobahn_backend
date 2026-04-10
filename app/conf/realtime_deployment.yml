@@ -1,0 +1,78 @@
+# 实时 Worker K8s Deployment 模板
+# 修改 realtime_config.json 后需手动重启: kubectl rollout restart deployment/realtime-worker -n ${NAMESPACE}
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realtime-worker
+  namespace: ${NAMESPACE}
+  labels:
+    app: realtime-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: realtime-worker
+  template:
+    metadata:
+      labels:
+        app: realtime-worker
+    spec:
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: ccr-registry
+      containers:
+        - name: worker
+          image: ${IMAGE}
+          command: ["python", "-u", "scripts/realtime_worker.py"]
+          workingDir: ${WORKING_DIR}
+          env:
+            - name: OLAP_BASE_DIR
+              value: "${MOUNT_PATH}"
+            - name: HF_HOME
+              value: "${WORKING_DIR}/local_workspace/hf_cache"
+            - name: HF_TOKEN
+              value: ""
+            - name: NO_PROXY
+              value: "127.0.0.1,localhost,local,.local,172.0.0.0/24,10.0.0.0/24,.baidu.com,.baidu-int.com,iregistry.baidu-int.com,.bcebos.com,.baidubce.com,.bdbl,.bjdd,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+            - name: no_proxy
+              value: "127.0.0.1,localhost,local,.local,172.0.0.0/24,10.0.0.0/24,.baidu.com,.baidu-int.com,iregistry.baidu-int.com,.bcebos.com,.baidubce.com,.bdbl,.bjdd,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+            - name: ALL_PROXY
+              value: "http://mt:mtstudio@10.8.17.48:8777"
+            - name: HTTP_PROXY
+              value: "http://mt:mtstudio@10.8.17.48:8777"
+            - name: HTTPS_PROXY
+              value: "http://mt:mtstudio@10.8.17.48:8777"
+            - name: http_proxy
+              value: "http://mt:mtstudio@10.8.17.48:8777"
+            - name: https_proxy
+              value: "http://mt:mtstudio@10.8.17.48:8777"
+          resources:
+            requests:
+              cpu: "${CPU_REQUEST}"
+              memory: "${MEMORY_REQUEST}"
+            limits:
+              cpu: "${CPU_LIMIT}"
+              memory: "${MEMORY_LIMIT}"
+          volumeMounts:
+            - name: cfs-workdir
+              mountPath: ${MOUNT_PATH}
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import os, time
+                  hb = 'olap_database/realtime/worker_heartbeat'
+                  assert os.path.exists(hb), 'heartbeat file missing'
+                  assert os.path.getmtime(hb) > time.time() - 120, 'heartbeat stale'
+            initialDelaySeconds: 300
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: cfs-workdir
+          hostPath:
+            path: ${HOST_PATH}
+            type: Directory

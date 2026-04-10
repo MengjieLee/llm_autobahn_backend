@@ -11,15 +11,18 @@ template<typename T>
 class LRUCache {
 public:
     explicit LRUCache(size_t cap)
-        : capacity_(cap), total_adds_(0), hit_count_(0) {}
+        : capacity_(cap), total_adds_(0), hit_count_(0),
+          section_adds_(0), section_hits_(0) {}
 
     // 添加元素，返回是否命中缓存
     bool Add(T key) {
         ++total_adds_;
+        ++section_adds_;
         auto it = index_.find(key);
         if (it != index_.end()) {
             // 命中：移到链表尾部（最近使用）
             ++hit_count_;
+            ++section_hits_;
             order_.splice(order_.end(), order_, it->second);
             return true;
         }
@@ -43,10 +46,24 @@ public:
         return static_cast<double>(hit_count_) / total_adds_;
     }
 
+    // 段级计数器（用于 per-minute / per-section 统计）
+    void resetSection() {
+        section_adds_ = 0;
+        section_hits_ = 0;
+    }
+    size_t getSectionAdds() const { return section_adds_; }
+    size_t getSectionHits() const { return section_hits_; }
+    double getSectionHitRate() const {
+        if (section_adds_ == 0) return 0.0;
+        return static_cast<double>(section_hits_) / section_adds_;
+    }
+
 private:
     size_t capacity_;
     size_t total_adds_;
     size_t hit_count_;
+    size_t section_adds_;
+    size_t section_hits_;
     std::list<T> order_;
     std::unordered_map<T, typename std::list<T>::iterator> index_;
 };

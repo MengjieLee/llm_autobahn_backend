@@ -22,19 +22,21 @@
     python scripts/daily_cache_plan.py --base-url http://...  # 指定 API 地址
 
 crontab 配置（crontab -e 添加）：
-    5 0 * * * /usr/bin/python3 /path/to/scripts/daily_cache_plan.py >> /path/to/logs/daily_cache_plan.log 2>&1
+    5 0 * * * /usr/bin/python3 /path/to/scripts/daily_cache_plan.py >> /path/to/logs/daily/daily_cache_plan_$(date +\%Y-\%m-\%d).log 2>&1
 """
 
 import argparse
 import json
 import sys
 import os
+import re
 import time
 import urllib.request
 import urllib.parse
 import urllib.error
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # ============================================================
 # 基础配置
@@ -54,6 +56,12 @@ DEFAULT_TASKS_JSON = os.path.join(_BASE_DIR, "local_workspace", "daily_tasks.jso
 # phase 间等待配置
 PHASE_POLL_INTERVAL = 30    # 轮询间隔（秒）
 PHASE_POLL_TIMEOUT = 7200   # 最长等待时间（秒）= 2 小时
+COMPLETE_POLL_INTERVAL = 60 # 等待全部 pipeline 完成的轮询间隔
+COMPLETE_POLL_TIMEOUT = 86400  # 最长等待 24 小时
+
+# daily_reports 目录
+STATUS_DIR = Path(_BASE_DIR) / "olap_database" / "status"
+DAILY_REPORTS_DIR = Path(_BASE_DIR) / "olap_database" / "daily_reports"
 
 
 # ============================================================
@@ -195,6 +203,145 @@ def wait_for_phase_fetch_complete(
 # ============================================================
 # 主逻辑
 # ============================================================
+
+def extract_scenario_name(task_name: str, target_date: str) -> str | None:
+    """
+    从 task_name 提取场景名。
+    "04-08_全场景_各模型" → "全场景_各模型"
+    "【v9】04-0804-08_全场景_各模型" → "全场景_各模型"
+    """
+    if target_date not in task_name:
+        return None
+    name = re.sub(r"^【[^】]+】", "", task_name)
+    target_mm, target_dd = target_date.split("-")
+    patterns = [
+        rf"^{re.escape(target_date)}_(.+)",
+        rf"^{target_mm}{target_dd}_(.+)",
+        rf"^{re.escape(target_date)}{target_mm}{target_dd}_(.+)",
+        rf"^{re.escape(target_date)}{re.escape(target_date)}_(.+)",
+    ]
+    for pat in patterns:
+        m = re.match(pat, name)
+        if m:
+            return m.group(1) if m.group(1) else None
+    return None
+
+
+def poll_task_done(base_url: str, token: str, task_id: str) -> dict | None:
+    """查询任务完整状态，返回 status data dict 或 None"""
+    url = f"{base_url.rstrip('/')}{STATUS_API_PATH}/{task_id}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+            return body.get("data", body)
+    except Exception:
+        return None
+
+
+def wait_and_save_daily_report(
+    base_url: str, token: str, all_task_ids: list[str], date_label: str, dry_run: bool
+):
+    """
+    等待所有任务 pipeline 完成（done/failed），然后写入 daily_reports/{date_label}.json。
+    """
+    if dry_run or not all_task_ids:
+        print("\n  [DRY-RUN] 跳过等待完成和写入 daily_reports")
+        return
+
+    print(f"\n{'─'*60}")
+    print(f"等待 {len(all_task_ids)} 个任务 pipeline 完成...")
+    print(f"{'─'*60}")
+
+    pending = set(all_task_ids)
+    t0 = time.time()
+    done_tasks = []
+
+    while pending and (time.time() - t0) < COMPLETE_POLL_TIMEOUT:
+        time.sleep(COMPLETE_POLL_INTERVAL)
+        elapsed = int(time.time() - t0)
+
+        for tid in list(pending):
+            data = poll_task_done(base_url, token, tid)
+            stage = data.get("pipeline", {}).get("current_stage", "") if data else ""
+            if stage in ("done", "failed"):
+                pending.discard(tid)
+                print(f"  [{elapsed}s] {tid} → {stage}")
+                if stage == "done" and data.get("result") and isinstance(data["result"], dict):
+                    done_tasks.append(data)
+
+        if pending:
+            hrs = (time.time() - t0) / 3600
+            print(f"  [{elapsed}s] 仍有 {len(pending)} 个任务运行中... ({hrs:.1f}h)")
+
+    if pending:
+        print(f"  [WARN] 等待超时，{len(pending)} 个任务未完成")
+
+    if not done_tasks:
+        print(f"  没有已完成的任务，跳过 daily_reports 写入")
+        return
+
+    # 写入 daily_reports
+    DAILY_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = DAILY_REPORTS_DIR / f"{date_label}.json"
+
+    existing = {}
+    if filepath.exists():
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+
+    scenarios = existing.get("scenarios", {})
+    written = 0
+
+    for task in done_tasks:
+        task_name = task.get("task_name", "")
+        result = task.get("result", {})
+        scenario = extract_scenario_name(task_name, date_label)
+        if not scenario or scenario in scenarios:
+            continue
+
+        total_hit = sum(r.get("hit_count", 0) for r in result.values())
+        total_queries = sum(r.get("total_queries", 0) for r in result.values())
+        total_tokens = sum(r.get("total_tokens", 0) for r in result.values())
+        hit_rate_pct = round((total_hit / total_queries * 100), 2) if total_queries > 0 else 0
+
+        scenarios[scenario] = {
+            "hit_rate_percent": hit_rate_pct,
+            "hit_count": total_hit,
+            "total_queries": total_queries,
+            "total_tokens": total_tokens,
+            "models": {
+                model: {
+                    "hit_rate_percent": stats.get("hit_rate_percent", 0),
+                    "hit_count": stats.get("hit_count", 0),
+                    "total_queries": stats.get("total_queries", 0),
+                    "total_tokens": stats.get("total_tokens", 0),
+                }
+                for model, stats in result.items()
+            },
+            "updated_at": task.get("updated_at", ""),
+        }
+        written += 1
+
+    if written > 0:
+        existing.update({
+            "date": date_label,
+            "updated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+            "scenarios": scenarios,
+        })
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        print(f"  ✓ 写入 {filepath}，新增 {written} 个场景（共 {len(scenarios)} 个）")
+    else:
+        print(f"  无新增场景，跳过写入")
+
+
 def main():
     parser = argparse.ArgumentParser(description="每日 Cache 分析计划表调度")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
@@ -298,6 +445,12 @@ def main():
         "tasks": results,
     }
     print(f"\n[SUMMARY] {json.dumps(summary, ensure_ascii=False)}")
+
+    # 等待所有任务完成并写入 daily_reports
+    all_task_ids = [r["task_id"] for r in results if r.get("ok") and r.get("task_id") and r["task_id"] != "dry-run"]
+    if all_task_ids:
+        mm_dd = yesterday.strftime("%m-%d")
+        wait_and_save_daily_report(args.base_url, args.token, all_task_ids, mm_dd, args.dry_run)
 
     sys.exit(0 if failed == 0 else 1)
 

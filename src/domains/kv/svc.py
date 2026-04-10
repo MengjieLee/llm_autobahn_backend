@@ -160,7 +160,8 @@ class ESIndexService:
 
     async def _query_window_adaptive(self, win_start: datetime, win_end: datetime,
                                       f, status_callback: Callable,
-                                      base_count: int, win_label: str) -> int:
+                                      base_count: int, win_label: str,
+                                      scroll_size: int = None) -> int:
         """
         对单个窗口执行查询，遇到 2GB 错误时自动降档重试。
 
@@ -178,7 +179,8 @@ class ESIndexService:
         body = self._build_query_body(win_start, win_end)
         es = self._get_es_for_date(win_start.strftime("%Y-%m-%d"))
         try:
-            count = await es.query_to_file_appender(body, f, status_callback, base_count)
+            count = await es.query_to_file_appender(body, f, status_callback, base_count,
+                                                     scroll_size=scroll_size)
             return count
         except Exception as e:
             if not _is_2gb_error(e):
@@ -204,7 +206,8 @@ class ESIndexService:
                 sub_es = self._get_es_for_date(sw_start.strftime("%Y-%m-%d"))
                 try:
                     c = await sub_es.query_to_file_appender(
-                        sub_body, f, status_callback, base_count + sub_count
+                        sub_body, f, status_callback, base_count + sub_count,
+                        scroll_size=scroll_size
                     )
                     sub_count += c
                 except Exception as sub_e:
@@ -233,6 +236,210 @@ class ESIndexService:
         end_dt = self._parse_datetime(end_time)
         body = self._build_query_body(start_dt, end_dt)
         return await self.es.query(body)
+
+    async def query_to_dir(self, start_time: str, end_time: str, output_dir: str,
+                           status_callback: Callable = None,
+                           window_concurrency: int = 10,
+                           scroll_size: int = None) -> dict:
+        """
+        流式查询并按窗口分别写入 output_dir（每个窗口一个 .jsonl 文件）。
+        无需 merge 步骤，每个 1 分钟窗口直接写入最终文件。
+
+        :param start_time: 开始时间（北京时间），格式 HH:MM:SS 或 YYYY-MM-DD HH:MM:SS
+        :param end_time: 结束时间（北京时间），格式同上
+        :param output_dir: 输出目录，按窗口写入 kv_{start}_{end}.jsonl
+        :param status_callback: 状态回调函数 (count, message)
+        :param window_concurrency: 窗口内并发数（默认 10）
+        :return: {"total_count": int, "files": [{"file": path, "minute": int, "count": int}, ...]}
+        """
+        start_dt = self._parse_datetime(start_time)
+        end_dt = self._parse_datetime(end_time)
+        windows = self._split_time_windows(start_dt, end_dt)
+
+        n_windows = len(windows)
+
+        # 单窗口：直接写文件
+        if n_windows <= 1:
+            total_count = 0
+            files_info = []
+            for win_idx, (win_start, win_end) in enumerate(windows):
+                win_start_str = win_start.strftime("%Y%m%d_%H%M%S")
+                win_end_str = win_end.strftime("%Y%m%d_%H%M%S")
+                final_file = os.path.join(output_dir, f"kv_{win_start_str}_{win_end_str}.jsonl")
+                incomplete_file = final_file + ".incomplete"
+
+                win_label = f"窗口 {win_idx + 1}/{n_windows}"
+                if status_callback:
+                    status_callback(total_count, f"正在查询{win_label}，已获取 {total_count} 条...")
+
+                with open(incomplete_file, 'w', encoding='utf-8', buffering=16 * 1024 * 1024) as f:
+                    window_count = await self._query_window_adaptive(
+                        win_start, win_end, f, status_callback, total_count, win_label,
+                        scroll_size=scroll_size
+                    )
+                    total_count += window_count
+
+                if os.path.exists(incomplete_file):
+                    os.rename(incomplete_file, final_file)
+                files_info.append({
+                    "file": final_file,
+                    "minute": win_start.minute,
+                    "count": window_count,
+                })
+
+            if status_callback:
+                status_callback(total_count, f"查询完成，共 {total_count} 条记录")
+            return {"total_count": total_count, "files": files_info}
+
+        # 多窗口：并行 fetch 直写目录（无 merge）
+        return await self._query_parallel_to_dir(
+            windows, output_dir, status_callback, window_concurrency,
+            scroll_size=scroll_size
+        )
+
+    async def _query_parallel_to_dir(self, windows: list, output_dir: str,
+                                     status_callback: Callable,
+                                     window_concurrency: int,
+                                     scroll_size: int = None) -> dict:
+        """
+        多窗口并行查询，每个窗口直接写入 output_dir 中的独立文件。
+        遇到 scroll context 超限时自动降低并发重试（最多 3 次）。
+        """
+        max_retries = 3
+        current_concurrency = window_concurrency
+
+        for attempt in range(max_retries + 1):
+            try:
+                return await self._do_parallel_fetch_to_dir(
+                    windows, output_dir, status_callback, current_concurrency,
+                    scroll_size=scroll_size
+                )
+            except Exception as e:
+                if _is_scroll_limit_error(e) and attempt < max_retries:
+                    old_concurrency = current_concurrency
+                    current_concurrency = max(1, current_concurrency // 2)
+                    logger.warning(
+                        f"[fetch] scroll context 超限 (attempt {attempt + 1}/{max_retries})，"
+                        f"并发从 {old_concurrency} 降至 {current_concurrency}，等待 30s 后重试..."
+                    )
+                    if status_callback:
+                        status_callback(0, f"scroll context 超限，并发降至 {current_concurrency}，等待重试...")
+                    await asyncio.sleep(30)
+                    self._cleanup_incomplete_files(output_dir, windows)
+                    continue
+                raise
+
+        raise RuntimeError("scroll context 重试次数用尽")
+
+    def _cleanup_incomplete_files(self, output_dir: str, windows: list):
+        """清理并行查询产生的 .incomplete 文件"""
+        for win_start, win_end in windows:
+            s_tag = win_start.strftime("%Y%m%d_%H%M%S")
+            e_tag = win_end.strftime("%Y%m%d_%H%M%S")
+            incomplete_file = os.path.join(output_dir, f"kv_{s_tag}_{e_tag}.jsonl.incomplete")
+            try:
+                if os.path.exists(incomplete_file):
+                    os.remove(incomplete_file)
+            except OSError:
+                pass
+
+    async def _do_parallel_fetch_to_dir(self, windows: list, output_dir: str,
+                                        status_callback: Callable,
+                                        window_concurrency: int,
+                                        scroll_size: int = None) -> dict:
+        """执行一次并行 fetch，每个窗口直接写入独立 .jsonl 文件（无 merge）"""
+        n_windows = len(windows)
+        logger.info(f"[fetch] 并行直写模式: {n_windows} 个窗口, 并发={window_concurrency}")
+        sem = asyncio.Semaphore(window_concurrency)
+        window_results = [None] * n_windows  # (incomplete_file, final_file, count) or None
+
+        _progress_lock = threading.Lock()
+        _shared_count = [0]
+        _done_windows = [0]
+
+        async def _fetch_window(idx: int, win_start: datetime, win_end: datetime):
+            async with sem:
+                s_tag = win_start.strftime("%Y%m%d_%H%M%S")
+                e_tag = win_end.strftime("%Y%m%d_%H%M%S")
+                final_file = os.path.join(output_dir, f"kv_{s_tag}_{e_tag}.jsonl")
+                incomplete_file = final_file + ".incomplete"
+
+                win_start_str = win_start.strftime("%Y-%m-%d %H:%M:%S")
+                win_end_str = win_end.strftime("%Y-%m-%d %H:%M:%S")
+                win_label = f"窗口 {idx + 1}/{n_windows} ({win_start_str}~{win_end_str})"
+
+                def _win_callback(count, msg):
+                    if status_callback:
+                        with _progress_lock:
+                            status_callback(
+                                _shared_count[0],
+                                f"[{_done_windows[0]}/{n_windows}完成] {win_label}: {msg}"
+                            )
+
+                with open(incomplete_file, 'w', encoding='utf-8', buffering=16 * 1024 * 1024) as f:
+                    count = await self._query_window_adaptive(
+                        win_start, win_end, f, _win_callback, 0, win_label,
+                        scroll_size=scroll_size
+                    )
+
+                gc.collect()
+                _malloc_trim()
+
+                with _progress_lock:
+                    _shared_count[0] += count
+                    _done_windows[0] += 1
+
+                window_results[idx] = (incomplete_file, final_file, count)
+                logger.info(f"[fetch] {win_label} 完成: {count} 条 (累计 {_shared_count[0]})")
+
+        tasks = [
+            asyncio.create_task(_fetch_window(i, ws, we))
+            for i, (ws, we) in enumerate(windows)
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for wr in window_results:
+                if wr is not None:
+                    try:
+                        if os.path.exists(wr[0]):
+                            os.remove(wr[0])
+                    except OSError:
+                        pass
+            raise
+
+        # 重命名 .incomplete → .jsonl（替代 merge）
+        total_count = 0
+        files_info = []
+        for idx in range(n_windows):
+            if window_results[idx] is None:
+                continue
+            incomplete_file, final_file, count = window_results[idx]
+            total_count += count
+            if os.path.exists(incomplete_file):
+                os.rename(incomplete_file, final_file)
+            elif count == 0:
+                # 零记录窗口：确保空文件存在
+                open(final_file, 'w').close()
+            win_start = windows[idx][0]
+            files_info.append({
+                "file": final_file,
+                "minute": win_start.minute,
+                "count": count,
+            })
+
+        logger.info(f"[fetch] 直写完成: {total_count} 条, {len(files_info)} 个文件")
+        if status_callback:
+            status_callback(total_count, f"查询完成，共 {total_count} 条记录")
+
+        return {"total_count": total_count, "files": files_info}
+
+    # ---- 旧版 query_to_file（保留供非 k8s 模式使用） ----
 
     async def query_to_file(self, start_time: str, end_time: str, output_file: str,
                             status_callback: Callable = None,
