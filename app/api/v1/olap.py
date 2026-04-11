@@ -1871,7 +1871,7 @@ async def kv_realtime(
         if hr is not None:
             overall_points.append({
                 "time": time_label,
-                "hit_rate": round(hr * 100, 2) if hr < 1 else round(hr, 2),
+                "hit_rate": round(hr * 100, 2) if hr <= 1 else round(hr, 2),
             })
 
     # 构建整体 stats
@@ -1886,7 +1886,7 @@ async def kv_realtime(
             if hr is not None:
                 m_points.append({
                     "time": time_label,
-                    "hit_rate": round(hr * 100, 2) if hr < 1 else round(hr, 2),
+                    "hit_rate": round(hr * 100, 2) if hr <= 1 else round(hr, 2),
                 })
         if m_points:
             models[model_name] = {
