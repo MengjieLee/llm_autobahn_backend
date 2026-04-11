@@ -359,6 +359,9 @@ async def _process_task(task: dict, daemon_client) -> dict:
                 _migrate_legacy_cache_state(model_state_dir)
                 merged_file = os.path.join(model_state_dir, "merged.txt")
 
+                # 2. 先裁剪旧 section（在追加新数据前执行，防止文件无限增长）
+                _trim_merged_file(merged_file, max_sections=720)
+
                 with open(merged_file, "a", encoding="utf-8") as mf:
                     mf.write(f"__SECTION__:{minute_str}\n")
                     for txt_file in txt_files:
@@ -390,11 +393,6 @@ async def _process_task(task: dict, daemon_client) -> dict:
                         m = _re.search(r'section_hit_rate:\s*([\d.]+)', line)
                         if m:
                             last_hit_rate = float(m.group(1))
-
-                # 4. 裁剪旧 section：保留最近 720 分钟（12 小时），
-                #    200M cache 约 6 小时填满，12 小时足够保持 cache 热度，
-                #    同时防止文件无限增长
-                _trim_merged_file(merged_file, max_sections=720)
 
                 return model, last_hit_rate
             except Exception as e:

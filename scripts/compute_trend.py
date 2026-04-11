@@ -159,7 +159,7 @@ def _calc_model_shared_cache(
         points = []
         for line in result.stdout.strip().split("\n"):
             if line.startswith("section:"):
-                m = re.match(r'section:\s*(\S+)\s+.*section_hit_rate:\s*([\d.]+)', line)
+                m = re.match(r'section:\s*([^\t]+).*section_hit_rate:\s*([\d.]+)', line)
                 if m:
                     time_label = m.group(1)
                     hit_rate = float(m.group(2))
