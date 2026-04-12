@@ -57,6 +57,8 @@ spec:
           volumeMounts:
             - name: cfs-workdir
               mountPath: ${MOUNT_PATH}
+            - name: checkpoint-tmpfs
+              mountPath: ${CHECKPOINT_TMPFS_DIR}
           livenessProbe:
             exec:
               command:
@@ -76,3 +78,7 @@ spec:
           hostPath:
             path: ${HOST_PATH}
             type: Directory
+        - name: checkpoint-tmpfs
+          emptyDir:
+            medium: Memory
+            sizeLimit: ${CHECKPOINT_TMPFS_SIZE}

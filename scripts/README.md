@@ -598,16 +598,150 @@ python scripts/daily_cache_plan.py --base-url http://your-api:8739
 ### cache_calc 命令行
 
 ```bash
-# 直接调用（脚本一般不需要手动执行）
+# 基本用法（无 checkpoint，全量处理）
 ./src/domains/kv/cache_hit_rate/cache_calc \
     -f merged_input_ids.txt \
     -s 200000000 \
     -b 16
 
+# 带 checkpoint（增量处理，实时场景推荐）
+./src/domains/kv/cache_hit_rate/cache_calc \
+    -f current_section.txt \
+    -s 200000000 \
+    -b 16 \
+    -c cache_checkpoint.bin
+
 # 输出格式:
 # entries: 799851, tokens: 1234567890
 # cache_size: 200000000  total_adds: 799851  hit_count: 312345  hit_rate: 0.3905
 ```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-f <file>` | 输入文件路径（可重复指定多文件） | 必填 |
+| `-s <size>` | LRU cache 容量（block 数量，0=无限，可重复指定多个） | 必填 |
+| `-b <size>` | block 大小（token/block） | `64` |
+| `-p <bool>` | 启用前缀哈希 | `true` |
+| `-t <bool>` | 按时间戳排序（多文件时生效） | `false` |
+| **`-c <path>`** | **Checkpoint 文件路径（新增）** | 无 |
+
+### Checkpoint 增量模式（`-c` 参数）
+
+#### 背景
+
+离线 pipeline（日报/用户任务）每次调用 `cache_calc` 时使用**临时合并文件**，处理完即删，无状态累积问题。
+
+实时 pipeline 则需要 **LRU cache 状态跨分钟保持**（模拟持续运行的缓存），旧方案将所有历史 section 累积到一个 `merged.txt` 文件中，每分钟全量重跑。当 `merged.txt` 膨胀到 45GB（glm-5 模型每 section ~937MB），CFS 上读取需要 30~75 分钟，导致 Worker 心跳超时、Pod 反复重启。
+
+#### 原理
+
+`-c <path>` 让 `cache_calc` 在**处理完输入数据后，将 LRU cache 的完整状态保存到二进制文件**；下次运行时**先加载 checkpoint 恢复 cache 状态，再处理新的输入数据**。
+
+```
+旧模式（全量，O(N)）：
+  每分钟: cache_calc -f merged.txt           ← 包含全部 N 个 section
+  → 从第 1 行开始读，重跑所有历史数据以重建 LRU cache
+  → 计算量随 section 数线性增长
+
+新模式（增量，O(1)）：
+  第 1 次: cache_calc -f section_0847.txt -c cp.bin   ← 空 cache → 处理 → 保存 checkpoint
+  第 2 次: cache_calc -f section_0848.txt -c cp.bin   ← 加载 checkpoint → 处理新 section → 保存
+  第 N 次: cache_calc -f section_XXXX.txt -c cp.bin   ← 每次只处理 1 个 section
+  → 计算量恒定，与历史 section 数无关
+```
+
+**两种模式的 `section_hit_rate` 结果完全一致**（已验证），因为 checkpoint 恢复后的 LRU cache 状态与从头处理等价。
+
+#### Checkpoint 文件格式
+
+```
+偏移    大小      字段
+0x00    4B       magic (0x4C525543 = "LRUC")
+0x04    4B       version (1)
+0x08    8B       capacity (cache 容量，必须与 -s 参数一致)
+0x10    8B       total_adds (历史总 add 数)
+0x18    8B       hit_count (历史总命中数)
+0x20    8B       num_keys (当前 LRU cache 中的 key 数)
+0x28    8B×N     keys（按 LRU 顺序，从最旧到最新）
+```
+
+- capacity 不匹配时跳过 checkpoint，从空 cache 开始（防止配置变更导致状态不一致）
+- 原子写入：先写 `.tmp` 临时文件，再 `rename` 替换
+- 对 200M block cache，checkpoint ~1.6GB
+
+#### 用法示例
+
+**示例 1：离线全量模式（无 checkpoint，向后兼容）**
+
+```bash
+# 准备含多个 section 的 merged 文件
+cat > merged.txt << 'EOF'
+__SECTION__:08:47
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+__SECTION__:08:48
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+'input_ids': [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+EOF
+
+./cache_calc -f merged.txt -s 1000 -b 16 -p true
+# 输出:
+# section: 08:47  cache_size: 1000  section_adds: 3  section_hits: 1  section_hit_rate: 0.333333
+# section: 08:48  cache_size: 1000  section_adds: 2  section_hits: 1  section_hit_rate: 0.5
+# entries: 5, tokens: 80
+# cache_size: 1000  total_adds: 5  hit_count: 2  hit_rate: 0.4
+```
+
+**示例 2：增量 checkpoint 模式（实时场景推荐）**
+
+```bash
+# 第 1 分钟：空 cache，处理 section 08:47
+cat > section_0847.txt << 'EOF'
+__SECTION__:08:47
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+EOF
+
+./cache_calc -f section_0847.txt -s 1000 -b 16 -p true -c cp.bin
+# stderr: [checkpoint] no valid checkpoint at cp.bin, starting from empty cache
+# stdout:
+# section: 08:47  cache_size: 1000  section_adds: 3  section_hits: 1  section_hit_rate: 0.333333
+# entries: 3, tokens: 48
+# cache_size: 1000  total_adds: 3  hit_count: 1  hit_rate: 0.333333
+# stderr: [checkpoint] saved: cp.bin (entries=2)
+
+# 第 2 分钟：从 checkpoint 恢复，只处理 section 08:48
+cat > section_0848.txt << 'EOF'
+__SECTION__:08:48
+'input_ids': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+'input_ids': [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+EOF
+
+./cache_calc -f section_0848.txt -s 1000 -b 16 -p true -c cp.bin
+# stderr: [checkpoint] loaded: cp.bin (cache_size=1000, entries=2, total_adds=3, hit_count=1)
+# stdout:
+# section: 08:48  cache_size: 1000  section_adds: 2  section_hits: 1  section_hit_rate: 0.5
+# entries: 2, tokens: 32
+# cache_size: 1000  total_adds: 5  hit_count: 2  hit_rate: 0.4
+# stderr: [checkpoint] saved: cp.bin (entries=3)
+```
+
+**结果对比**：
+
+| 模式 | 08:47 section_hit_rate | 08:48 section_hit_rate | total_adds | hit_rate |
+|------|----------------------|----------------------|------------|----------|
+| 全量（无 checkpoint） | 0.333333 | 0.5 | 5 | 0.4 |
+| 增量（checkpoint） | 0.333333 | 0.5 | 5 | 0.4 |
+
+**完全一致。**
+
+#### 两种模式的适用场景
+
+| 场景 | 推荐模式 | 原因 |
+|------|---------|------|
+| 离线 pipeline（日报/用户任务） | 无 checkpoint | 使用临时合并文件，跑完即删，无状态累积 |
+| 实时 pipeline（常驻 Worker） | **checkpoint** | 每分钟只处理新 section，O(1) 计算，避免 merged.txt 无限增长 |
+| CLI 手动回填趋势 | 无 checkpoint | 一次性全量计算，无需持久化 cache 状态 |
 
 ### 分段标记（Section Markers）
 
@@ -690,7 +824,7 @@ olap_database/
   "olap_qpd_limit": 100,
   "models": ["glm-5", "glm-4.7", "deepseek-v3.2", "kimi-k2.5", "minimax-m2.5", "minimax-m2.1"],
   "k8s_enabled": true,
-  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.5",
+  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.3.3",
   "k8s_job_cpu_request": "28",
   "k8s_job_memory_request": "110Gi"
 }

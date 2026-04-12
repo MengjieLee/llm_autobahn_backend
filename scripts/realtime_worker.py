@@ -85,6 +85,23 @@ logger = logging.getLogger("realtime_worker")
 # Graceful shutdown flag
 _shutdown_event = threading.Event()
 
+# Heartbeat thread control
+_heartbeat_stop = threading.Event()
+
+# Per-model simulate lock（防止并发 cache_calc 写坏同一 checkpoint）
+_simulate_locks: Dict[str, threading.Lock] = {}
+
+# Prefetch pipeline：overlap fetch+tokenize of next task with simulate of current
+_prefetch_cache: Dict[str, dict] = {}     # task_id → {"model_txt_files", "task_data_dir"}
+_active_prefetch = None                   # Optional[asyncio.Task]
+
+
+def _heartbeat_loop():
+    """后台心跳线程：独立于事件循环定期更新心跳文件，防止 liveness probe 误判"""
+    while not _heartbeat_stop.is_set():
+        _touch_heartbeat()
+        _heartbeat_stop.wait(15)
+
 
 def _now_bjt() -> str:
     return datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
@@ -207,47 +224,139 @@ def _migrate_legacy_cache_state(model_state_dir: str):
         logger.warning(f"[migrate] {model_state_dir}: 迁移失败: {e}")
 
 
-def _trim_merged_file(merged_file: str, max_sections: int = 720):
+def _trim_merged_file(merged_file: str, max_sections: int = 720, max_size_mb: int = 2048):
     """
     裁剪 merged 文件中的旧 section，保留最近 max_sections 个 section。
 
-    按行扫描找到所有 __SECTION__ 标记的位置，丢弃超过 max_sections 的旧 section。
+    使用流式扫描定位 __SECTION__ 标记（不将全文加载到内存）。
+    当 section 数超过 max_sections 或文件大小超过 max_size_mb 时触发裁剪。
     原子写入替换原文件。
     """
     try:
-        with open(merged_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        file_size = os.path.getsize(merged_file)
+    except OSError:
+        return
+
+    # 流式扫描 section 起始位置（不加载全文到内存）
+    section_offsets = []  # byte offset of each __SECTION__ line
+    try:
+        with open(merged_file, "rb") as f:
+            offset = 0
+            for line in f:
+                if line.startswith(b"__SECTION__:"):
+                    section_offsets.append(offset)
+                offset += len(line)
     except Exception:
         return
 
-    section_starts = []  # (line_index, section_name)
-    for i, line in enumerate(lines):
-        if line.startswith("__SECTION__:"):
-            section_starts.append(i)
-
-    if len(section_starts) <= max_sections:
+    need_trim = len(section_offsets) > max_sections or file_size > max_size_mb * 1024 * 1024
+    if not need_trim:
         return  # 无需裁剪
 
-    # 保留最后 max_sections 个 section（从 cut_index 开始）
-    cut_index = section_starts[-max_sections]
-    trimmed = lines[cut_index:]
-    removed = len(section_starts) - max_sections
+    # 确定裁剪的起始字节偏移
+    if len(section_offsets) > max_sections:
+        # 按 section 数量裁剪：保留最后 max_sections 个
+        cut_offset = section_offsets[-max_sections]
+    else:
+        # 按文件大小裁剪：逐步丢弃旧 section 直到满足大小限制
+        # 目标：删除最旧的 section，使剩余大小 <= max_size_mb
+        target_size = max_size_mb * 1024 * 1024
+        # 从最新 section 往前数，找到满足大小限制的最早 section
+        cut_idx = 0
+        for i in range(len(section_offsets)):
+            remaining = file_size - section_offsets[i]
+            if remaining <= target_size:
+                cut_idx = i
+                break
+        else:
+            cut_idx = len(section_offsets) - 1  # 至少保留最后一个 section
+        cut_offset = section_offsets[cut_idx]
 
-    # 原子写入
+    removed = sum(1 for o in section_offsets if o < cut_offset)
+
+    # 从 cut_offset 开始复制到新文件（流式，不加载全文）
     tmp_path = f"{merged_file}.{os.getpid()}.tmp"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.writelines(trimmed)
-            f.flush()
-            os.fsync(f.fileno())
+        with open(merged_file, "rb") as src, open(tmp_path, "wb") as dst:
+            src.seek(cut_offset)
+            shutil.copyfileobj(src, dst, length=64 * 1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
         os.replace(tmp_path, merged_file)
-        logger.debug(f"[trim] {merged_file}: 移除 {removed} 个旧 section，保留 {max_sections}")
+        logger.info(f"[trim] {merged_file}: 移除 {removed} 个旧 section，"
+                     f"大小 {file_size / (1024*1024):.0f}MB → {os.path.getsize(merged_file) / (1024*1024):.0f}MB")
     except Exception as e:
         logger.warning(f"[trim] {merged_file}: 裁剪失败: {e}")
         try:
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+def _get_checkpoint_path(model: str, cfg: dict) -> tuple:
+    """
+    返回 (primary_checkpoint_path, cfs_backup_path)。
+
+    当 tmpfs 可用时，主路径指向 tmpfs（快速），CFS 作为备份（持久）。
+    当 tmpfs 不可用时（本地开发），主路径直接指向 CFS，无需备份。
+    """
+    tmpfs_dir = cfg.get("checkpoint_tmpfs_dir", "")
+    cfs_dir = os.path.join(REALTIME_DIR, "_cache_state", model)
+    cfs_path = os.path.join(cfs_dir, "cache_checkpoint.bin")
+
+    if tmpfs_dir and os.path.isdir(tmpfs_dir):
+        primary = os.path.join(tmpfs_dir, model, "cache_checkpoint.bin")
+        return primary, cfs_path
+    else:
+        return cfs_path, None
+
+
+def _restore_checkpoints_from_cfs(models: list, cfg: dict):
+    """
+    Pod 重启后，从 CFS 备份恢复 checkpoint 到 tmpfs。
+    仅在 tmpfs 可用时执行；否则 checkpoint 已在 CFS 上，无需恢复。
+    """
+    tmpfs_dir = cfg.get("checkpoint_tmpfs_dir", "")
+    if not tmpfs_dir or not os.path.isdir(tmpfs_dir):
+        return
+
+    for model in models:
+        tmpfs_cp = os.path.join(tmpfs_dir, model, "cache_checkpoint.bin")
+        if os.path.exists(tmpfs_cp) and os.path.getsize(tmpfs_cp) > 0:
+            size_mb = os.path.getsize(tmpfs_cp) / (1024 * 1024)
+            logger.info(f"[restore] {model}: tmpfs checkpoint 已存在 ({size_mb:.0f}MB)，跳过")
+            continue
+
+        cfs_cp = os.path.join(REALTIME_DIR, "_cache_state", model, "cache_checkpoint.bin")
+        if os.path.exists(cfs_cp) and os.path.getsize(cfs_cp) > 0:
+            os.makedirs(os.path.dirname(tmpfs_cp), exist_ok=True)
+            try:
+                shutil.copy2(cfs_cp, tmpfs_cp)
+                size_mb = os.path.getsize(tmpfs_cp) / (1024 * 1024)
+                logger.info(f"[restore] {model}: 从 CFS 恢复 checkpoint ({size_mb:.0f}MB)")
+            except Exception as e:
+                logger.warning(f"[restore] {model}: 从 CFS 恢复失败: {e}")
+        else:
+            logger.info(f"[restore] {model}: 无 CFS 备份，将从空 cache 开始")
+
+
+def _backup_checkpoint_to_cfs(tmpfs_checkpoint_path: str, model: str):
+    """
+    备份 tmpfs checkpoint 到 CFS（后台线程调用）。
+    使用原子写入（.tmp → rename），防止备份期间读到不完整文件。
+    """
+    cfs_checkpoint_path = os.path.join(REALTIME_DIR, "_cache_state", model, "cache_checkpoint.bin")
+    try:
+        if not os.path.exists(tmpfs_checkpoint_path) or os.path.getsize(tmpfs_checkpoint_path) == 0:
+            return
+        os.makedirs(os.path.dirname(cfs_checkpoint_path), exist_ok=True)
+        tmp_path = f"{cfs_checkpoint_path}.{os.getpid()}.tmp"
+        shutil.copy2(tmpfs_checkpoint_path, tmp_path)
+        os.replace(tmp_path, cfs_checkpoint_path)
+        size_mb = os.path.getsize(cfs_checkpoint_path) / (1024 * 1024)
+        logger.info(f"[backup] {model}: checkpoint 已备份到 CFS ({size_mb:.0f}MB)")
+    except Exception as e:
+        logger.warning(f"[backup] {model}: 备份失败: {e}")
 
 
 # ============================================================
@@ -353,13 +462,67 @@ async def _process_task(task: dict, daemon_client) -> dict:
         def _calc_model_shared(item):
             model, txt_files = item
             try:
-                # 1. 迁移旧按天文件（如果存在）并追加到运行时 merged 文件
                 model_state_dir = os.path.join(REALTIME_DIR, "_cache_state", model)
                 os.makedirs(model_state_dir, exist_ok=True)
                 _migrate_legacy_cache_state(model_state_dir)
-                merged_file = os.path.join(model_state_dir, "merged.txt")
+                checkpoint_path, cfs_backup_path = _get_checkpoint_path(model, cfg)
 
-                # 2. 先裁剪旧 section（在追加新数据前执行，防止文件无限增长）
+                # 确保 checkpoint 目录存在
+                os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+                # 优先使用 checkpoint 模式（增量计算，O(1) 每分钟）
+                use_checkpoint = os.path.exists(cache_calc_path) and os.path.getsize(cache_calc_path) > 0
+
+                if use_checkpoint:
+                    # 构造 section 数据（header + txt 文件内容）
+                    section_data = f"__SECTION__:{minute_str}\n"
+                    for txt_file in txt_files:
+                        if os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
+                            with open(txt_file, "r", encoding="utf-8") as src:
+                                section_data += src.read()
+
+                    # stdin 管道模式：数据通过管道传给 cache_calc，不写 CFS section 文件
+                    cmd = [
+                        cache_calc_path, "-f", "-",
+                        "-s", str(cache_size),
+                        "-b", str(block_size),
+                        "-p", "true",
+                        "-c", checkpoint_path,
+                    ]
+                    import subprocess
+                    timeout = 600  # checkpoint 模式下数据量小，固定 10 分钟超时
+                    result = subprocess.run(
+                        cmd, input=section_data,
+                        capture_output=True, text=True, timeout=timeout,
+                    )
+
+                    if result.returncode != 0:
+                        logger.error(f"[{task_id}] trend cache_calc failed for {model}: {result.stderr[:200]}")
+                        return model, None
+
+                    # 解析 section_hit_rate
+                    last_hit_rate = None
+                    for line in result.stdout.strip().split("\n"):
+                        if line.startswith("section:"):
+                            import re as _re
+                            m = _re.search(r'section_hit_rate:\s*([\d.]+)', line)
+                            if m:
+                                last_hit_rate = float(m.group(1))
+
+                    logger.info(f"[{task_id}] trend {model} (checkpoint+stdin): hit_rate={last_hit_rate}")
+
+                    # 异步备份 checkpoint 到 CFS（不阻塞主流程）
+                    if cfs_backup_path:
+                        threading.Thread(
+                            target=_backup_checkpoint_to_cfs,
+                            args=(checkpoint_path, model),
+                            daemon=True,
+                        ).start()
+
+                    return model, last_hit_rate
+
+                # Fallback: 无 checkpoint 支持，回退到 merged.txt 全量模式
+                merged_file = os.path.join(model_state_dir, "merged.txt")
                 _trim_merged_file(merged_file, max_sections=720)
 
                 with open(merged_file, "a", encoding="utf-8") as mf:
@@ -369,7 +532,6 @@ async def _process_task(task: dict, daemon_client) -> dict:
                             with open(txt_file, "r", encoding="utf-8") as src:
                                 shutil.copyfileobj(src, mf)
 
-                # 2. 运行 cache_calc（共享 cache 状态跨分钟/跨天保持）
                 cmd = [
                     cache_calc_path, "-f", merged_file,
                     "-s", str(cache_size),
@@ -385,7 +547,7 @@ async def _process_task(task: dict, daemon_client) -> dict:
                     logger.error(f"[{task_id}] trend cache_calc failed for {model}: {result.stderr[:200]}")
                     return model, None
 
-                # 3. 解析最后一个 section 的 hit_rate
+                # 解析最后一个 section 的 hit_rate
                 last_hit_rate = None
                 for line in result.stdout.strip().split("\n"):
                     if line.startswith("section:"):
@@ -399,10 +561,16 @@ async def _process_task(task: dict, daemon_client) -> dict:
                 logger.error(f"[{task_id}] trend cache_calc failed for {model}: {e}")
                 return model, None
 
-        with ThreadPoolExecutor(max_workers=len(model_txt_files)) as pool:
-            for model, hr in pool.map(_calc_model_shared, model_txt_files.items()):
-                if hr is not None:
-                    model_hit_rates[model] = hr
+        def _calc_all_models(items):
+            """在线程池中并行计算所有模型的 hit_rate（不阻塞事件循环）"""
+            with ThreadPoolExecutor(max_workers=len(items)) as pool:
+                return list(pool.map(_calc_model_shared, items))
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, _calc_all_models, list(model_txt_files.items()))
+        for model, hr in results:
+            if hr is not None:
+                model_hit_rates[model] = hr
 
         if not model_hit_rates:
             logger.warning(f"[{task_id}] trend: 无有效 hit_rate")
@@ -498,9 +666,19 @@ async def _run_worker(once: bool = False, dry_run: bool = False):
     """Worker 主循环"""
     _ensure_dirs()
 
+    # 启动后台心跳线程（独立于事件循环，防止阻塞导致 liveness probe 失败）
+    _heartbeat_stop.clear()
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
+    _heartbeat_thread.start()
+    logger.info("心跳线程已启动 (间隔 15s)")
+
     # 启动 tokenize daemon
     cfg = _load_realtime_config()
     logger.info("正在启动 tokenize daemon...")
+
+    # 从 CFS 恢复 checkpoint 到 tmpfs（Pod 重启后）
+    models = [m.strip() for m in cfg.get("models", "").split(",") if m.strip()]
+    _restore_checkpoints_from_cfs(models, cfg)
 
     if _SCRIPT_DIR not in sys.path:
         sys.path.insert(0, _SCRIPT_DIR)
@@ -592,8 +770,6 @@ async def _run_worker(once: bool = False, dry_run: bool = False):
         gc.collect()
 
     while not _shutdown_event.is_set():
-        _touch_heartbeat()
-
         # 清理已完成的异步任务
         done = {t for t in active_tasks if t.done()}
         # 检查子任务异常
@@ -653,6 +829,10 @@ async def _run_worker(once: bool = False, dry_run: bool = False):
 
         if once and processed > 0:
             break
+
+    # 停止心跳线程
+    _heartbeat_stop.set()
+    _heartbeat_thread.join(timeout=5)
 
     # 关闭 daemon
     logger.info("正在关闭 tokenize daemon...")

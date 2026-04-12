@@ -36,7 +36,10 @@ logger = logging.getLogger("compute_trend")
 # ============================================================
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _BASE_DIR = os.path.dirname(_SCRIPT_DIR)
-_DEFAULT_CACHE_CALC = os.path.join(_BASE_DIR, "src/domains/kv/cache_hit_rate/cache_calc")
+# cache_calc 二进制路径：优先使用 Docker 镜像内的版本（与容器 GLIBC 兼容）
+_DOCKER_CACHE_CALC = "/workspace/src/domains/kv/cache_hit_rate/cache_calc"
+_CFS_CACHE_CALC = os.path.join(_BASE_DIR, "src/domains/kv/cache_hit_rate/cache_calc")
+_DEFAULT_CACHE_CALC = _DOCKER_CACHE_CALC if os.path.isfile(_DOCKER_CACHE_CALC) and os.access(_DOCKER_CACHE_CALC, os.X_OK) else _CFS_CACHE_CALC
 _DEFAULT_OLAP_CONFIG = os.path.join(_BASE_DIR, "app", "conf", "olap_config.json")
 
 BJT = timezone(timedelta(hours=8))
@@ -191,6 +194,110 @@ def _calc_model_shared_cache(
             pass
 
 
+def _calc_model_checkpoint(
+    model_files: List[str],
+    cache_calc_path: str,
+    cache_size: int,
+    block_size: int,
+    checkpoint_dir: str,
+) -> List[dict]:
+    """
+    checkpoint 增量模式：逐文件调用 cache_calc，LRU 状态通过 checkpoint 传递。
+
+    与 _calc_model_shared_cache 语义等价：
+    - 每个 slice 文件单独运行 cache_calc
+    - -c 参数自动在文件间保存/加载 LRU Cache 状态
+    - 解析每次输出的整体 hit_rate（= 合并模式下对应 section 的 section_hit_rate）
+    - 无需创建临时合并文件，避免大文件（640GB+）写入 /tmp 导致 ENOSPC
+    """
+    if not model_files:
+        return []
+
+    sorted_files = sorted(model_files, key=lambda f: _parse_time_from_filename(os.path.basename(f)))
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, "cache_checkpoint.bin")
+
+    # 如果 simulate 阶段已留下 checkpoint，可直接复用（跳过已处理的数据）
+    # 否则从空 cache 开始
+    has_existing_checkpoint = os.path.exists(checkpoint_path) and os.path.getsize(checkpoint_path) > 0
+    if has_existing_checkpoint:
+        logger.info("[trend] checkpoint: 复用已有 checkpoint %s", checkpoint_path)
+
+    points = []
+    t0 = _time.monotonic()
+    done_count = 0
+
+    for fpath in sorted_files:
+        fname = os.path.basename(fpath)
+        time_label = _parse_time_from_filename(fname)
+
+        try:
+            cmd = [
+                cache_calc_path, "-f", fpath,
+                "-s", str(cache_size),
+                "-b", str(block_size),
+                "-p", "true",
+                "-c", checkpoint_path,
+            ]
+            file_size_mb = os.path.getsize(fpath) / (1024 * 1024)
+            timeout = min(3600, max(60, int(file_size_mb / 100) + 60))
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            elapsed = _time.monotonic() - t0
+
+            if result.returncode != 0:
+                logger.warning(
+                    "[trend] checkpoint: cache_calc failed for %s (rc=%d, %.1fs): %s",
+                    fname, result.returncode, elapsed,
+                    (result.stderr or result.stdout or "")[:200],
+                )
+                continue
+
+            # 解析整体 hit_rate（非 section）
+            found = False
+            for line in result.stdout.strip().split("\n"):
+                if line.strip().startswith("cache_size:"):
+                    parts = re.findall(r'hit_rate:\s*([\d.]+)', line)
+                    if parts:
+                        hit_rate = float(parts[0])
+                        points.append({"time": time_label, "hit_rate": hit_rate})
+                        found = True
+                        break
+
+            if not found:
+                logger.warning(
+                    "[trend] checkpoint: no hit_rate for %s: %s",
+                    fname, result.stdout[:200],
+                )
+
+            done_count += 1
+            if done_count % 100 == 0 or done_count == len(sorted_files):
+                logger.info(
+                    "[trend] checkpoint 进度: %d/%d 文件, 耗时 %.1fs",
+                    done_count, len(sorted_files), _time.monotonic() - t0,
+                )
+
+        except subprocess.TimeoutExpired:
+            logger.error("[trend] checkpoint: TIMEOUT for %s after %.1fs", fname, timeout)
+        except Exception as e:
+            logger.error("[trend] checkpoint: exception for %s: %s", fname, e)
+
+    elapsed = _time.monotonic() - t0
+    if points:
+        logger.info(
+            "[trend] checkpoint: %d/%d slices -> %d points, %.1fs",
+            done_count, len(sorted_files), len(points), elapsed,
+        )
+    else:
+        logger.warning("[trend] checkpoint: 无有效结果 (%d files, %.1fs)", len(sorted_files), elapsed)
+
+    # 不清理 checkpoint：simulate 阶段创建的 checkpoint 包含完整 LRU 状态，
+    # trend 复用后 checkpoint 仍是最新状态，保留可供后续回填或重算复用。
+    # checkpoint 目录在任务数据目录下，随任务一起清理。
+
+    return points
+
+
 def _calc_stats(data_points: List[dict]) -> dict:
     """计算 mean / max / min"""
     rates = [d["hit_rate"] for d in data_points if d.get("hit_rate") is not None]
@@ -329,14 +436,26 @@ def compute_trend(
     )
 
     # ------------------------------------------------------------------
-    # 共享 LRU Cache 计算（每个模型运行一次 cache_calc）
+    # checkpoint 增量计算（每个模型逐文件运行 cache_calc -c，LRU 状态通过 checkpoint 传递）
     # ------------------------------------------------------------------
     if models_to_calc:
         workers = min(max_workers, len(models_to_calc))
 
         def _calc_model(item):
             model, files = item
-            points = _calc_model_shared_cache(files, cache_calc_path, cache_size, block_size)
+            # checkpoint 目录：与 cache_report.json 同级，P1 的 simulate 可复用
+            model_checkpoint_dir = os.path.join(task_data_dir, "report", model, "_checkpoint")
+            points = _calc_model_checkpoint(files, cache_calc_path, cache_size, block_size, model_checkpoint_dir)
+            # fallback：如果 checkpoint 模式无结果（如 cache_calc 不支持 -c），尝试合并模式
+            if not points and files:
+                try:
+                    total_size_mb = sum(os.path.getsize(f) for f in files) / (1024 * 1024)
+                    if total_size_mb < 5120:  # 合并文件 < 5GB 才走 fallback
+                        points = _calc_model_shared_cache(files, cache_calc_path, cache_size, block_size)
+                        if points:
+                            logger.warning("[trend] checkpoint 模式无结果，已回退到合并模式: %s", model)
+                except Exception as e:
+                    logger.warning("[trend] fallback 合并模式也失败: %s: %s", model, e)
             return model, points
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:

@@ -45,6 +45,12 @@ KV_STATUS_DIR = os.path.join(OLAP_DATABASE_DIR, "status")
 SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 OLAP_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "olap_config.json")
 
+# cache_calc 二进制路径：优先使用 Docker 镜像内的版本（与容器 GLIBC 兼容），
+# fallback 到 CFS 上的版本（本地/CLI 使用）
+_DOCKER_CACHE_CALC = "/workspace/src/domains/kv/cache_hit_rate/cache_calc"
+_CFS_CACHE_CALC = os.path.join(BASE_DIR, "src/domains/kv/cache_hit_rate/cache_calc")
+CACHE_CALC_PATH = _DOCKER_CACHE_CALC if os.path.isfile(_DOCKER_CACHE_CALC) and os.access(_DOCKER_CACHE_CALC, os.X_OK) else _CFS_CACHE_CALC
+
 BJT = timezone(timedelta(hours=8))
 
 logging.basicConfig(
@@ -242,6 +248,19 @@ async def _run_streaming_fetch_tokenize(
     tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
     tokenize_tasks = []
 
+    # ---- 流式 simulate 状态 ----
+    # tokenize 产出一个文件就立即 simulate，overlap 两个阶段
+    report_dir = os.path.join(task_data_dir, "report")
+    os.makedirs(report_dir, exist_ok=True)
+    cache_calc_path = CACHE_CALC_PATH
+    cache_size = cfg["pipeline_cache_size"]
+    block_size = cfg["pipeline_block_size"]
+    model_sim_queues: dict = {}   # model -> asyncio.Queue
+    model_sim_consumers: list = []  # asyncio.Task list
+    model_sim_results: dict = {}  # model -> {total_entries, total_tokens, total_adds, hit_count, file_count}
+    sim_started_models: set = set()
+    sim_done_count = [0]
+
     # 启动共享 tokenize daemon —— 整个 pipeline 生命周期内 tokenizer 只加载一次
     if SCRIPTS_DIR not in sys.path:
         sys.path.insert(0, SCRIPTS_DIR)
@@ -385,6 +404,92 @@ async def _run_streaming_fetch_tokenize(
         logger.warning(f"[fetch] slice {h_start_str}~{h_end_str} scroll limit retries exhausted")
         _update_fetch_progress()
 
+    # ---- 流式 simulate 消费者 ----
+    async def _sim_consumer(model: str, queue: asyncio.Queue):
+        """逐文件消费 tokenize 输出，用 checkpoint 增量计算 LRU 命中率"""
+        model_report_dir = os.path.join(report_dir, model)
+        os.makedirs(model_report_dir, exist_ok=True)
+        checkpoint_dir = os.path.join(model_report_dir, "_checkpoint")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, "cache_checkpoint.bin")
+
+        total_entries = 0
+        total_tokens = 0
+        total_adds = 0
+        hit_count = 0
+        file_count = 0
+
+        while True:
+            fpath = await queue.get()
+            if fpath is None:  # sentinel
+                break
+
+            file_count += 1
+            cmd = [
+                cache_calc_path, "-f", fpath,
+                "-s", str(cache_size),
+                "-b", str(block_size),
+                "-p", "true",
+                "-c", checkpoint_path,
+            ]
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=BASE_DIR,
+                )
+                output = await proc.stdout.read()
+                await proc.wait()
+
+                if proc.returncode != 0:
+                    continue
+
+                output_text = output.decode("utf-8", errors="replace")
+                for line in output_text.strip().split("\n"):
+                    line = line.strip()
+                    if line.startswith("entries:"):
+                        m = re.match(r'entries:\s*(\d+),\s*tokens:\s*(\d+)', line)
+                        if m:
+                            total_entries += int(m.group(1))
+                            total_tokens += int(m.group(2))
+                    elif line.startswith("cache_size:"):
+                        parts = re.findall(r'(\w+):\s*([\d.]+)', line)
+                        for key, val in parts:
+                            if key == "total_adds":
+                                total_adds += int(val)
+                            elif key == "hit_count":
+                                hit_count += int(val)
+
+                if file_count % 50 == 0:
+                    _update_stage(task_id, "simulate", {
+                        "status": "running",
+                        "message": f"[{model}] 流式模拟 {file_count} 文件已处理...",
+                    })
+
+            except Exception as e:
+                logger.warning("[sim-stream] cache_calc exception for %s: %s", os.path.basename(fpath), e)
+
+        model_sim_results[model] = {
+            "total_entries": total_entries,
+            "total_tokens": total_tokens,
+            "total_adds": total_adds,
+            "hit_count": hit_count,
+            "file_count": file_count,
+        }
+        sim_done_count[0] += 1
+
+    def _ensure_sim_consumer(model: str):
+        """确保模型有 simulate 消费者，首次看到该模型时启动"""
+        if model in sim_started_models:
+            return
+        sim_started_models.add(model)
+        model_sim_queues[model] = asyncio.Queue()
+        model_sim_consumers.append(
+            asyncio.create_task(_sim_consumer(model, model_sim_queues[model]))
+        )
+
     async def _tokenize_single_with_tracking(input_file: str, out_dir: str, tid: str):
         async with tokenize_sem:
                 _update_tokenize_progress()
@@ -394,6 +499,10 @@ async def _run_streaming_fetch_tokenize(
                 if result["status"] == "completed":
                     tokenize_total_lines[0] += result.get("lines", 0)
                     tokenize_total_seconds[0] += result.get("duration_seconds", 0.0)
+                    # 流式 simulate：tokenize 完成一个文件，立即推给 simulate 消费者
+                    for model, txt_file in result.get("outputs", {}).items():
+                        _ensure_sim_consumer(model)
+                        await model_sim_queues[model].put(txt_file)
                 _update_tokenize_progress()
 
     # 启动所有 fetch（并行，受信号量控制）
@@ -529,6 +638,94 @@ async def _run_streaming_fetch_tokenize(
         "all_detected_models": all_detected_models,
         "files": tokenize_results,
     })
+
+    # ---- 流式 simulate 收尾 ----
+    # 向所有 simulate 消费者发送停止信号
+    if model_sim_consumers:
+        _update_stage(task_id, "simulate", {"status": "running", "message": "流式模拟收尾中..."}, "simulate")
+        for model, queue in model_sim_queues.items():
+            await queue.put(None)  # sentinel
+        # 等待所有消费者完成
+        await asyncio.gather(*model_sim_consumers, return_exceptions=True)
+        logger.info("[sim-stream] 所有流式 simulate 消费者已完成 (%d 模型)", len(model_sim_results))
+
+        # 生成 per-model cache_report.json 并收集结果
+        sim_result = {}
+        for model, sim_data in model_sim_results.items():
+            total_adds_m = sim_data["total_adds"]
+            hit_count_m = sim_data["hit_count"]
+            hit_rate_m = hit_count_m / total_adds_m if total_adds_m > 0 else 0
+            total_entries_m = sim_data["total_entries"]
+            total_tokens_m = sim_data["total_tokens"]
+
+            model_report_dir = os.path.join(report_dir, model)
+            report_file = os.path.join(model_report_dir, "cache_report.json")
+            report = {
+                "meta": {
+                    "generated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+                    "algorithm": "LRU checkpoint incremental (streaming)",
+                },
+                "config": {
+                    "cache_sizes": [cache_size],
+                    "block_size": block_size,
+                    "use_prefix_hash": True,
+                    "algorithm": "LRU",
+                },
+                "summary": {
+                    "total_entries": total_entries_m,
+                    "total_tokens": total_tokens_m,
+                    "avg_tokens_per_entry": round(total_tokens_m / total_entries_m, 2) if total_entries_m > 0 else 0,
+                },
+                "results": [{
+                    "cache_size": cache_size,
+                    "cache_size_readable": f"{cache_size / 1e6:.1f}M" if cache_size >= 1_000_000 else str(cache_size),
+                    "total_queries": total_adds_m,
+                    "hit_count": hit_count_m,
+                    "miss_count": total_adds_m - hit_count_m,
+                    "hit_rate": hit_rate_m,
+                    "hit_rate_percent": round(hit_rate_m * 100, 2),
+                    "miss_rate": 1 - hit_rate_m,
+                    "miss_rate_percent": round((1 - hit_rate_m) * 100, 2),
+                }],
+                "analysis": {
+                    "recommendation": (
+                        f"命中率较高 ({hit_rate_m * 100:.2f}%)，缓存效果显著，推荐配置: cache_size={cache_size}"
+                        if hit_rate_m >= 0.5 else
+                        f"命中率一般 ({hit_rate_m * 100:.2f}%)，建议缓存大小设置为 {cache_size}"
+                    ),
+                },
+            }
+            with open(report_file, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+
+            sim_result[model] = {
+                "hit_rate": hit_rate_m,
+                "hit_rate_percent": round(hit_rate_m * 100, 2),
+                "hit_count": hit_count_m,
+                "total_queries": total_adds_m,
+                "total_tokens": total_tokens_m,
+                "total_entries": total_entries_m,
+                "input_files_count": sim_data["file_count"],
+            }
+
+        # 模型过滤：只保留用户选择的模型
+        if selected_models:
+            sim_result = {m: v for m, v in sim_result.items() if m in selected_models}
+
+        if sim_result:
+            completed_models = list(sim_result.keys())
+            msg_parts = [f"{m} {v['hit_rate_percent']:.2f}%" for m, v in sim_result.items()]
+            sim_msg = f"模拟完成 ({len(completed_models)} 模型): " + ", ".join(msg_parts)
+            _update_stage(task_id, "simulate", {
+                "status": "completed",
+                "message": sim_msg,
+                "models": completed_models,
+            })
+            # 将 simulate 结果暂存到 status（trend 之后才标记 done）
+            status = _read_status(task_id)
+            if status:
+                status["result"] = sim_result
+                _write_status(status)
 
     # 释放中间数据
     fetch_results.clear()
@@ -778,78 +975,133 @@ async def _run_simulate_stage(task_id: str):
     })
 
     sim_done_count = [0]
+    cfg = _load_olap_config()
+    cache_calc_path = CACHE_CALC_PATH
 
     async def _simulate_single_model(model: str, txt_files: list) -> dict:
         model_report_dir = os.path.join(report_dir, model)
         os.makedirs(model_report_dir, exist_ok=True)
+        checkpoint_dir = os.path.join(model_report_dir, "_checkpoint")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, "cache_checkpoint.bin")
 
         _update_stage(task_id, "simulate", {
             "status": "running",
-            "message": f"[{model}] 正在准备模拟 ({sim_done_count[0]}/{len(model_outputs)} 已完成)..."
+            "message": f"[{model}] 正在模拟 ({sim_done_count[0]}/{len(model_outputs)} 已完成)..."
         })
 
         report_file_final = os.path.join(model_report_dir, "cache_report.json")
+        cache_size = cfg["pipeline_cache_size"]
+        block_size = cfg["pipeline_block_size"]
 
-        cfg = _load_olap_config()
-        cmd = [
-            "python", "-u", os.path.join(SCRIPTS_DIR, "cache_pipeline.py"),
-            "-i", *sorted(txt_files),
-            "-o", model_report_dir,
-            "-s", str(cfg["pipeline_cache_size"]),
-            "-b", str(cfg["pipeline_block_size"])
-        ]
+        sorted_files = sorted(txt_files, key=lambda f: os.path.basename(f))
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=BASE_DIR
-        )
-
-        output_tail = deque(maxlen=30)
+        # checkpoint 增量模式：逐文件调用 cache_calc，LRU 状态通过 checkpoint 传递
+        # 无需创建 merged_input_ids.txt，节省 640GB+ CFS 写入
+        total_entries = 0
+        total_tokens = 0
+        total_adds = 0
+        hit_count = 0
+        file_idx = 0
         last_progress_update = 0
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            output_tail.append(line)
 
-            now = asyncio.get_event_loop().time()
-            if now - last_progress_update >= 2:
-                progress_msg = None
-                if "合并" in line and "个文件" in line:
-                    progress_msg = f"[{model}] 合并文件中..."
-                elif "Step" in line and "缓存模拟" in line:
-                    progress_msg = f"[{model}] 缓存模拟计算中..."
-                elif "执行命令" in line or "cache_calc" in line:
-                    progress_msg = f"[{model}] 执行 cache_calc..."
-                elif "流水线执行完成" in line:
-                    progress_msg = f"[{model}] 模拟完成，生成报告中..."
-                if progress_msg:
+        for fpath in sorted_files:
+            file_idx += 1
+            cmd = [
+                cache_calc_path, "-f", fpath,
+                "-s", str(cache_size),
+                "-b", str(block_size),
+                "-p", "true",
+                "-c", checkpoint_path,
+            ]
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=BASE_DIR,
+                )
+                output = await proc.stdout.read()
+                await proc.wait()
+
+                if proc.returncode != 0:
+                    logger.warning("[simulate] cache_calc failed for %s (rc=%d)",
+                                   os.path.basename(fpath), proc.returncode)
+                    continue
+
+                output_text = output.decode("utf-8", errors="replace")
+                for line in output_text.strip().split("\n"):
+                    line = line.strip()
+                    if line.startswith("entries:"):
+                        m = re.match(r'entries:\s*(\d+),\s*tokens:\s*(\d+)', line)
+                        if m:
+                            total_entries += int(m.group(1))
+                            total_tokens += int(m.group(2))
+                    elif line.startswith("cache_size:"):
+                        parts = re.findall(r'(\w+):\s*([\d.]+)', line)
+                        for key, val in parts:
+                            if key == "total_adds":
+                                total_adds += int(val)
+                            elif key == "hit_count":
+                                hit_count += int(val)
+
+                now = asyncio.get_event_loop().time()
+                if now - last_progress_update >= 5:
                     last_progress_update = now
                     _update_stage(task_id, "simulate", {
                         "status": "running",
-                        "message": progress_msg,
+                        "message": f"[{model}] checkpoint 增量模拟 {file_idx}/{len(sorted_files)} 文件...",
                     })
 
-        await proc.wait()
-        output_text = "\n".join(output_tail)
+            except Exception as e:
+                logger.warning("[simulate] cache_calc exception for %s: %s", os.path.basename(fpath), e)
+                continue
 
-        if proc.returncode != 0:
-            sim_done_count[0] += 1
-            return {
-                "model": model, "status": "failed",
-                "error": f"模拟失败 (rc={proc.returncode}): {output_text[-500:]}"
-            }
+        # 计算整体 hit_rate = 累计 hit_count / 累计 total_adds
+        hit_rate = hit_count / total_adds if total_adds > 0 else 0
 
-        if not os.path.exists(report_file_final):
-            sim_done_count[0] += 1
-            return {"model": model, "status": "failed", "error": "报告文件未生成"}
+        # 生成与 cache_pipeline.py 兼容的 cache_report.json
+        report = {
+            "meta": {
+                "generated_at": datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"),
+                "algorithm": "LRU checkpoint incremental",
+            },
+            "config": {
+                "cache_sizes": [cache_size],
+                "block_size": block_size,
+                "use_prefix_hash": True,
+                "algorithm": "LRU",
+            },
+            "summary": {
+                "total_entries": total_entries,
+                "total_tokens": total_tokens,
+                "avg_tokens_per_entry": round(total_tokens / total_entries, 2) if total_entries > 0 else 0,
+            },
+            "results": [{
+                "cache_size": cache_size,
+                "cache_size_readable": f"{cache_size / 1e6:.1f}M" if cache_size >= 1_000_000 else str(cache_size),
+                "total_queries": total_adds,
+                "hit_count": hit_count,
+                "miss_count": total_adds - hit_count,
+                "hit_rate": hit_rate,
+                "hit_rate_percent": round(hit_rate * 100, 2),
+                "miss_rate": 1 - hit_rate,
+                "miss_rate_percent": round((1 - hit_rate) * 100, 2),
+            }],
+            "analysis": {
+                "recommendation": (
+                    f"命中率较高 ({hit_rate * 100:.2f}%)，缓存效果显著，推荐配置: cache_size={cache_size}"
+                    if hit_rate >= 0.5 else
+                    f"命中率一般 ({hit_rate * 100:.2f}%)，建议缓存大小设置为 {cache_size}"
+                ),
+            },
+        }
 
-        with open(report_file_final, "r", encoding="utf-8") as f:
-            report = json.load(f)
+        with open(report_file_final, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
 
-        results_list = report.get("results", [])
-        summary = report.get("summary", {})
-        cr = results_list[0] if results_list else {}
+        # 保留 checkpoint 供 trend 阶段复用（trend 会从该状态继续计算 per-minute hit_rate）
 
         sim_done_count[0] += 1
         _update_stage(task_id, "simulate", {
@@ -859,12 +1111,12 @@ async def _run_simulate_stage(task_id: str):
 
         return {
             "model": model, "status": "completed",
-            "hit_rate": cr.get("hit_rate", 0),
-            "hit_rate_percent": cr.get("hit_rate_percent", 0),
-            "hit_count": cr.get("hit_count", 0),
-            "total_queries": cr.get("total_queries", 0),
-            "total_tokens": summary.get("total_tokens", 0),
-            "total_entries": summary.get("total_entries", 0),
+            "hit_rate": hit_rate,
+            "hit_rate_percent": round(hit_rate * 100, 2),
+            "hit_count": hit_count,
+            "total_queries": total_adds,
+            "total_tokens": total_tokens,
+            "total_entries": total_entries,
             "input_files_count": len(txt_files),
             "report_file": report_file_final
         }
@@ -1148,8 +1400,13 @@ async def run_pipeline(args):
             logger.info(f"Pipeline finished early (no data): {task_id}")
             return
 
-        # Stage 3
-        await _run_simulate_stage(task_id)
+        # Stage 3: simulate（如果流式 simulate 已完成则跳过）
+        status = _read_status(task_id)
+        sim_stage = (status or {}).get("pipeline", {}).get("stages", {}).get("simulate", {})
+        if sim_stage.get("status") == "completed":
+            logger.info(f"[pipeline] 流式 simulate 已完成，跳过独立 simulate 阶段: {task_id}")
+        else:
+            await _run_simulate_stage(task_id)
 
         # Stage 4: 分钟级命中率趋势
         await _run_trend_stage(task_id)

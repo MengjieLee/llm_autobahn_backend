@@ -21,6 +21,7 @@ struct Config {
     size_t                   block_size     = 64;
     bool                     proc_timestamp = false;
     bool                     prefix_hash    = true;
+    std::string              checkpoint_path;  // 空 = 不使用 checkpoint
 };
 
 // ============================================================
@@ -150,26 +151,21 @@ static void emit_section_stats(const std::string& section_name,
 }
 
 // ============================================================
-// 流式处理单个文件（不需要排序时，逐行读取 + 处理，不占额外内存）
+// 流式处理输入流（通用版本，支持文件和 stdin）
 // 支持 __SECTION__:<name> 分段标记：
 //   标记表示新段的开始，此前累积的数据属于上一段。
 //   输出上一段统计，重置段计数器，保留 LRU 状态。
 // ============================================================
-static void stream_process_file(const std::string& filename,
-                                 const Config& cfg,
-                                 std::vector<lru::LRUCache<uint64_t>>& caches,
-                                 std::atomic<size_t>& total_tokens,
-                                 std::atomic<size_t>& current_tokens,
-                                 std::atomic<size_t>& entry_count,
-                                 std::string& current_section,
-                                 bool& has_sections) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: cannot open file " << filename << std::endl;
-        return;
-    }
+static void stream_process_istream(std::istream& input,
+                                     const Config& cfg,
+                                     std::vector<lru::LRUCache<uint64_t>>& caches,
+                                     std::atomic<size_t>& total_tokens,
+                                     std::atomic<size_t>& current_tokens,
+                                     std::atomic<size_t>& entry_count,
+                                     std::string& current_section,
+                                     bool& has_sections) {
     std::string line;
-    while (std::getline(file, line)) {
+    while (std::getline(input, line)) {
         // 检查段标记
         if (line.find(SECTION_PREFIX) == 0) {
             std::string new_section = line.substr(strlen(SECTION_PREFIX));
@@ -195,6 +191,27 @@ static void stream_process_file(const std::string& filename,
 }
 
 // ============================================================
+// 流式处理单个文件（不需要排序时，逐行读取 + 处理，不占额外内存）
+// ============================================================
+static void stream_process_file(const std::string& filename,
+                                 const Config& cfg,
+                                 std::vector<lru::LRUCache<uint64_t>>& caches,
+                                 std::atomic<size_t>& total_tokens,
+                                 std::atomic<size_t>& current_tokens,
+                                 std::atomic<size_t>& entry_count,
+                                 std::string& current_section,
+                                 bool& has_sections) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: cannot open file " << filename << std::endl;
+        return;
+    }
+    stream_process_istream(file, cfg, caches,
+                            total_tokens, current_tokens, entry_count,
+                            current_section, has_sections);
+}
+
+// ============================================================
 // 进度打印线程
 // ============================================================
 static void progress_thread_func(const std::atomic<size_t>& current,
@@ -217,13 +234,14 @@ static void progress_thread_func(const std::atomic<size_t>& current,
 static void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " -f <file> [-f <file2> ...] -s <cache_size> [-s <size2> ...] "
-                 "[-b <block_size>] [-t true] [-p false]\n"
+                 "[-b <block_size>] [-t true] [-p false] [-c <checkpoint>]\n"
               << "\n"
-              << "  -f  input file path (repeatable for multi-file merge)\n"
+              << "  -f  input file path (repeatable for multi-file merge; '-' for stdin)\n"
               << "  -s  max block count for LRU cache; 0 = unlimited (repeatable)\n"
               << "  -b  block size in tokens (default: 64)\n"
               << "  -t  process timestamps for sorting (default: false)\n"
-              << "  -p  use prefix hash (default: true; -p 0 or -p false to disable)\n";
+              << "  -p  use prefix hash (default: true; -p 0 or -p false to disable)\n"
+              << "  -c  checkpoint file path for saving/loading LRU cache state\n";
 }
 
 // ============================================================
@@ -233,7 +251,7 @@ int main(int argc, char* argv[]) {
     Config cfg;
 
     int o;
-    const char* optstring = "f:s:t:p:b:h";
+    const char* optstring = "f:s:t:p:b:c:h";
     while ((o = getopt(argc, argv, optstring)) != -1) {
         switch (o) {
         case 'f': cfg.file_paths.push_back(optarg); break;
@@ -247,6 +265,7 @@ int main(int argc, char* argv[]) {
             if (strcmp(optarg, "0") == 0 || strcmp(optarg, "false") == 0)
                 cfg.prefix_hash = false;
             break;
+        case 'c': cfg.checkpoint_path = optarg; break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
@@ -262,6 +281,25 @@ int main(int argc, char* argv[]) {
     caches.reserve(cfg.cache_sizes.size());
     for (size_t sz : cfg.cache_sizes) {
         caches.emplace_back(sz);
+    }
+
+    // ---- 加载 checkpoint（如果指定且文件存在）----
+    if (!cfg.checkpoint_path.empty()) {
+        for (size_t i = 0; i < caches.size(); ++i) {
+            std::string cp_path = caches.size() == 1
+                ? cfg.checkpoint_path
+                : cfg.checkpoint_path + "." + std::to_string(i);
+            if (caches[i].loadCheckpoint(cp_path)) {
+                std::cerr << "[checkpoint] loaded: " << cp_path
+                          << " (cache_size=" << caches[i].getCapacity()
+                          << ", entries=" << caches[i].size()
+                          << ", total_adds=" << caches[i].getTotalAdds()
+                          << ", hit_count=" << caches[i].getHitCount() << ")" << std::endl;
+            } else {
+                std::cerr << "[checkpoint] no valid checkpoint at " << cp_path
+                          << ", starting from empty cache" << std::endl;
+            }
+        }
     }
 
     std::atomic<size_t> total_tokens(0);
@@ -316,10 +354,18 @@ int main(int argc, char* argv[]) {
         }
     } else {
         // 流式处理：逐文件逐行，内存友好
-        for (const auto& path : cfg.file_paths) {
-            stream_process_file(path, cfg, caches,
-                                total_tokens, current_tokens, entry_count,
-                                current_section, has_sections);
+        bool has_stdin = (cfg.file_paths.size() == 1 && cfg.file_paths[0] == "-");
+        if (has_stdin) {
+            // stdin 模式：从标准输入读取（配合管道使用，避免 CFS 文件往返）
+            stream_process_istream(std::cin, cfg, caches,
+                                    total_tokens, current_tokens, entry_count,
+                                    current_section, has_sections);
+        } else {
+            for (const auto& path : cfg.file_paths) {
+                stream_process_file(path, cfg, caches,
+                                    total_tokens, current_tokens, entry_count,
+                                    current_section, has_sections);
+            }
         }
         std::cout << "entries: " << entry_count.load()
                   << ", tokens: " << total_tokens.load() << std::endl;
@@ -341,5 +387,21 @@ int main(int argc, char* argv[]) {
                   << "\thit_rate: " << cache.getHitRate()
                   << std::endl;
     }
+
+    // ---- 保存 checkpoint（如果指定）----
+    if (!cfg.checkpoint_path.empty()) {
+        for (size_t i = 0; i < caches.size(); ++i) {
+            std::string cp_path = caches.size() == 1
+                ? cfg.checkpoint_path
+                : cfg.checkpoint_path + "." + std::to_string(i);
+            if (caches[i].saveCheckpoint(cp_path)) {
+                std::cerr << "[checkpoint] saved: " << cp_path
+                          << " (entries=" << caches[i].size() << ")" << std::endl;
+            } else {
+                std::cerr << "[checkpoint] ERROR: failed to save " << cp_path << std::endl;
+            }
+        }
+    }
+
     return 0;
 }

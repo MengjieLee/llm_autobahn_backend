@@ -1611,14 +1611,101 @@ def _aggregate_task_results_to_points(tasks: List[dict], year: int, cutoff_naive
     return overall_points, models_points
 
 
+def _aggregate_task_trends_to_points(tasks: List[dict], year: int, cutoff_naive: datetime, now_naive: datetime) -> tuple:
+    """
+    将多个任务的 hit_rate_trend.json 合并为统一分钟级时间序列。
+    每个任务产出分钟级数据点，多任务按 time 去重合并（后者覆盖前者）。
+
+    当某个任务没有 trend 数据时，回退到 task result 的单点数据。
+
+    返回: (overall_points, models_points)
+        overall_points: [{time, hit_rate}, ...]  hit_rate 为百分比 (0~100)
+        models_points: {model_name: {points: [...], stats: {...}}}
+    """
+    # 使用 dict 按 time 去重（同时间点后者覆盖前者）
+    overall_map: Dict[str, float] = {}             # time_str → hit_rate (百分比)
+    model_maps: Dict[str, Dict[str, float]] = {}   # model → {time_str → hit_rate}
+
+    for task in tasks:
+        task_id = task.get("task_id", "")
+        trend = _read_trend_for_task(task_id)
+
+        if trend and trend.get("series"):
+            # 优先使用 trend 分钟级数据
+            for s in trend["series"]:
+                model_name = s.get("model", "")
+                for p in s.get("data", []):
+                    raw_time = p.get("time", "")
+                    if not raw_time:
+                        continue
+                    time_str, pt = _parse_trend_time(raw_time, year)
+                    if pt is None:
+                        continue
+                    if not (cutoff_naive <= pt <= now_naive):
+                        continue
+                    hit_rate = p.get("hit_rate")
+                    if hit_rate is None:
+                        continue
+                    # trend 中的 hit_rate 是 0~1，转为百分比
+                    hr_pct = round(hit_rate * 100, 2)
+
+                    if model_name == "整体":
+                        overall_map[time_str] = hr_pct
+                    else:
+                        model_maps.setdefault(model_name, {})[time_str] = hr_pct
+        else:
+            # fallback: 无 trend 数据时用 task result 的单点
+            updated_str = task.get("updated_at", "")
+            if not updated_str:
+                continue
+            try:
+                updated_dt = datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if not (cutoff_naive <= updated_dt <= now_naive):
+                continue
+
+            time_str = updated_dt.strftime("%m-%d %H:%M")
+            result_data = task.get("result", {})
+            if not result_data:
+                continue
+
+            # 整体（加权平均）
+            total_hit = sum(r.get("hit_count", 0) for r in result_data.values())
+            total_queries = sum(r.get("total_queries", 0) for r in result_data.values())
+            if total_queries > 0:
+                overall_map[time_str] = round((total_hit / total_queries) * 100, 2)
+
+            # 各模型
+            for model_name, stats in result_data.items():
+                hit_count = stats.get("hit_count", 0)
+                total_q = stats.get("total_queries", 0)
+                if total_q > 0:
+                    model_maps.setdefault(model_name, {})[time_str] = round((hit_count / total_q) * 100, 2)
+
+    # 按时间排序构建 overall_points
+    overall_points = [{"time": t, "hit_rate": overall_map[t]} for t in sorted(overall_map.keys())]
+
+    # 按时间排序构建 models_points
+    models_points = {}
+    for model_name, time_map in model_maps.items():
+        m_pts = [{"time": t, "hit_rate": v} for t, v in sorted(time_map.items())]
+        if m_pts:
+            models_points[model_name] = {
+                "points": m_pts,
+                "stats": _compute_stats(m_pts),
+            }
+
+    return overall_points, models_points
+
+
 @router.get("/kv/dashboard", summary="获取命中率趋势数据（实时）")
 async def kv_dashboard(time_range: str = Query(default="1d", description="时间范围: 1h, 6h, 1d, 7d, 30d")):
     """
-    实时 Dashboard API。
-    对 8 个固定场景，分别读取已完成任务的趋势数据。
-    - 实时场景（全场景_各模型）：使用任务的分钟级 trend 数据
-    - 非实时场景：聚合时间范围内的多个任务，每个任务作为日级数据点
-    返回: {scenarios: {name: {task_id, points: [{time, hit_rate}], stats: {mean, max, min}}}}
+    Dashboard API：8 个固定场景的命中率趋势数据。
+    - 实时场景（全场景_各模型）：使用单个任务的分钟级 trend 数据
+    - 非实时场景：聚合时间范围内多个任务的 hit_rate_trend.json 分钟级数据
+    返回: {scenarios: {name: {task_id, points: [{time, hit_rate}], stats: {mean, max, min}, models}}}
     """
     if time_range not in _TIME_RANGE_MAP:
         raise HTTPException(status_code=400, detail=f"不支持的 time_range: {time_range}，可选: {list(_TIME_RANGE_MAP.keys())}")
@@ -1726,34 +1813,18 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
             latest_task = tasks[-1] if tasks else None
             task_id = latest_task.get("task_id", "") if latest_task else ""
 
-            # 将任务结果聚合为时间序列
-            overall_points, models_points = _aggregate_task_results_to_points(tasks, year, cutoff_naive, now_naive)
+            # 将任务 trend 数据聚合为分钟级时间序列
+            overall_points, models_points = _aggregate_task_trends_to_points(tasks, year, cutoff_naive, now_naive)
 
             if not overall_points:
                 result[scenario] = {"task_id": task_id, "points": [], "stats": {"mean": 0, "max": 0, "min": 0}, "models": {}}
                 continue
 
             # 计算统计数据
-            rates = [p["hit_rate"] for p in overall_points]
-            stats = {
-                "mean": round(sum(rates) / len(rates), 2) if rates else 0,
-                "max": max(rates) if rates else 0,
-                "min": min(rates) if rates else 0,
-            }
+            stats = _compute_stats(overall_points)
 
-            # 构建模型级数据
-            models = {}
-            for model_name, m_points in models_points.items():
-                if m_points:
-                    m_rates = [p["hit_rate"] for p in m_points]
-                    models[model_name] = {
-                        "points": m_points,
-                        "stats": {
-                            "mean": round(sum(m_rates) / len(m_rates), 2) if m_rates else 0,
-                            "max": max(m_rates) if m_rates else 0,
-                            "min": min(m_rates) if m_rates else 0,
-                        }
-                    }
+            # models_points 已包含 stats（由 _aggregate_task_trends_to_points 计算）
+            models = models_points
 
             result[scenario] = {
                 "task_id": task_id,

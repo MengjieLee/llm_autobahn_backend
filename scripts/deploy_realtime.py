@@ -63,6 +63,8 @@ def main():
         "${CPU_LIMIT}": cfg["k8s_cpu_limit"],
         "${MEMORY_REQUEST}": cfg["k8s_memory_request"],
         "${MEMORY_LIMIT}": cfg["k8s_memory_limit"],
+        "${CHECKPOINT_TMPFS_DIR}": cfg.get("checkpoint_tmpfs_dir", "/mnt/checkpoint_tmpfs"),
+        "${CHECKPOINT_TMPFS_SIZE}": cfg.get("k8s_checkpoint_tmpfs_size", "16Gi"),
     }
 
     for placeholder, value in var_map.items():
