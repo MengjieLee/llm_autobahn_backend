@@ -255,6 +255,10 @@ GET /kv/realtime 读取 → 前端渲染
   - `-c <path>` checkpoint 持久化（二进制格式，支持增量计算）
 - **输出**: `section: <name>\tsection_hit_rate: 0.xxxx`
 - **Checkpoint 格式**: `[magic:4B][version:4B][capacity:8B][total_adds:8B][hit_count:8B][num_keys:8B][keys...]`
+- **⚠️ 时序性约束**: cache_calc 是 LRU 模拟器，输入 token 序列的顺序决定缓存淘汰和命中结果。**数据必须严格按时间递增输入，不可乱序**。任何对输入数据的切分、并行处理、合并操作都必须保持原始时序。这意味着：
+  - 切片必须按时间连续分块（不可 Round-Robin 交叉）
+  - 多切片合并时必须按切片编号顺序拼接
+  - 跨分钟的 checkpoint 增量计算依赖于每分钟数据的时序正确性
 
 ### TokenizeDaemonClient
 

@@ -20,7 +20,7 @@ def _bjt_time(timestamp=None):
 class ContextFormatter(logging.Formatter):
     """自定义日志格式化器，自动从请求上下文提取 username 和 trace_id 并添加到日志消息中。"""
 
-    converter = _bjt_time  # 强制北京时间
+    converter = staticmethod(_bjt_time)  # 强制北京时间（必须 staticmethod，否则 self 会被当第一参数传入）
 
     def format(self, record: logging.LogRecord) -> str:
         """格式化日志记录，自动添加上下文信息。"""

@@ -77,7 +77,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logging.Formatter.converter = _bjt_time  # 全局强制北京时间
+logging.Formatter.converter = staticmethod(_bjt_time)  # 全局强制北京时间
 # 文件日志：按天轮转，写入 logs/realtime/
 _LOG_DIR = os.path.join(BASE_DIR, "logs", "realtime")
 os.makedirs(_LOG_DIR, exist_ok=True)
@@ -375,47 +375,76 @@ def _backup_checkpoint_to_cfs(tmpfs_checkpoint_path: str, model: str):
 # ============================================================
 def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
     """
-    预过滤 + 切片：用纯 regex 扫描 JSONL，只保留目标模型行，拆成 num_splits 个文件。
+    预过滤 + 按时序连续切片：只保留目标模型行，拆成 num_splits 个文件。
 
-    原理：qianfan_model:xxx 以文本形式嵌在每行 JSON 的 @raw 字段中，
-    无需 JSON 解析即可用 regex 快速匹配，~150万行/10秒。
+    ★ 保序性：cache_calc LRU 模拟要求输入严格按时间递增。
+    采用两遍扫描 + 连续分块（非 Round-Robin），确保：
+    - 每个切片内部保持源 JSONL 的时序
+    - 切片 0 的所有行 < 切片 1 的所有行（时间上严格连续）
+    - 合并切片结果时按编号顺序拼接即可还原完整时序
 
-    过滤后的行 Round-Robin 分配到 N 个切片文件，使 N 个 daemon 可并行 tokenize。
+    ★ 流式读写：全程逐行 for line in f，无整文件加载，无 OOM 风险。
+
+    两遍扫描：
+    - Pass 1: 统计匹配行数 → 计算每个切片的行数边界
+    - Pass 2: 流式过滤 + 连续写入各切片文件
     """
     import re
 
     escaped = [re.escape(m) for m in models]
     pattern = re.compile(r'qianfan_model:(' + '|'.join(escaped) + r')(?:[^a-zA-Z0-9._-]|$)')
 
-    split_files = []
-    split_fhs = []
-    for i in range(num_splits):
-        path = os.path.join(output_dir, f"_filtered_{i}.jsonl")
-        split_files.append(path)
-        split_fhs.append(open(path, "w", encoding="utf-8"))
+    # 筛选有效源文件
+    valid_files = [f for f in jsonl_files if os.path.exists(f) and os.path.getsize(f) > 0]
+    if not valid_files:
+        return []
 
-    kept = 0
-    total = 0
-    split_idx = 0
+    # ---- Pass 1: 统计匹配行数（纯 I/O，无内存压力）----
+    matched_count = 0
+    total_count = 0
+    for jf in valid_files:
+        with open(jf, "r", encoding="utf-8") as f:
+            for line in f:
+                total_count += 1
+                if pattern.search(line):
+                    matched_count += 1
+
+    if matched_count == 0:
+        logger.info(f"[{task_id}] prefilter: {total_count} 行扫描，0 匹配")
+        return []
+
+    chunk_size = -(-matched_count // num_splits)  # ceil division
+
+    # ---- Pass 2: 流式过滤 + 按时序连续切片 ----
+    split_files = []
+    chunk_idx = 0
+    written_in_chunk = 0
+    fh = None
 
     try:
-        for jsonl_file in jsonl_files:
-            if not os.path.exists(jsonl_file) or os.path.getsize(jsonl_file) == 0:
-                continue
-            with open(jsonl_file, "r", encoding="utf-8") as f:
+        for jf in valid_files:
+            with open(jf, "r", encoding="utf-8") as f:
                 for line in f:
-                    total += 1
-                    if pattern.search(line):
-                        split_fhs[split_idx].write(line)
-                        split_idx = (split_idx + 1) % num_splits
-                        kept += 1
+                    if not pattern.search(line):
+                        continue
+                    # 需要打开新切片？
+                    if fh is None or (written_in_chunk >= chunk_size and chunk_idx < num_splits - 1):
+                        if fh is not None:
+                            fh.close()
+                        path = os.path.join(output_dir, f"_filtered_{chunk_idx}.jsonl")
+                        split_files.append(path)
+                        fh = open(path, "w", encoding="utf-8")
+                        written_in_chunk = 0
+                        chunk_idx += 1
+                    fh.write(line)
+                    written_in_chunk += 1
     finally:
-        for fh in split_fhs:
+        if fh is not None:
             fh.close()
 
-    filter_pct = kept * 100 // max(total, 1)
-    logger.info(f"[{task_id}] prefilter: {total} → {kept} 条 ({filter_pct}%), "
-                f"拆分为 {num_splits} 个文件")
+    filter_pct = matched_count * 100 // max(total_count, 1)
+    logger.info(f"[{task_id}] prefilter: {total_count} → {matched_count} 条 ({filter_pct}%), "
+                f"连续切为 {len(split_files)} 个文件 (chunk_size={chunk_size})")
 
     return [f for f in split_files if os.path.exists(f) and os.path.getsize(f) > 0]
 
@@ -476,11 +505,15 @@ async def _process_task(task: dict, daemon_client) -> dict:
             return None
 
         # ---- Stage 1.5: Pre-filter & Split ----
+        # ★ 通过 run_in_executor 让出事件循环，避免阻塞其他任务的回调
         num_daemons = cfg.get("pipeline_tokenize_concurrency", 2)
         filtered_dir = os.path.join(task_data_dir, "filtered")
         os.makedirs(filtered_dir, exist_ok=True)
 
-        split_files = _prefilter_and_split(jsonl_files, models, num_daemons, filtered_dir, task_id)
+        loop = asyncio.get_event_loop()
+        split_files = await loop.run_in_executor(
+            None, _prefilter_and_split, jsonl_files, models, num_daemons, filtered_dir, task_id
+        )
 
         if not split_files:
             logger.warning(f"[{task_id}] prefilter: 过滤后无数据，跳过 tokenize")
@@ -488,7 +521,6 @@ async def _process_task(task: dict, daemon_client) -> dict:
 
         # ---- Stage 2: Tokenize (并行 N 个 daemon) ----
         logger.info(f"[{task_id}] tokenize: {len(split_files)} split files, models={models}")
-        model_txt_files: Dict[str, List[str]] = {}
 
         from concurrent.futures import ThreadPoolExecutor as _TPool
 
@@ -498,19 +530,26 @@ async def _process_task(task: dict, daemon_client) -> dict:
             os.makedirs(out_dir, exist_ok=True)
             return _tokenize_via_daemon(daemon_client, split_file, out_dir, base_name, models)
 
-        with _TPool(max_workers=len(split_files)) as pool:
-            future_map = {pool.submit(_tokenize_one_split, f): f for f in split_files}
-            for future in future_map:
-                split_file = future_map[future]
-                try:
-                    summary = future.result()
-                    if summary.get("status") == "completed":
-                        for model, info in summary.get("models", {}).items():
-                            txt_file = info.get("file", "")
-                            if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
-                                model_txt_files.setdefault(model, []).append(txt_file)
-                except Exception as e:
-                    logger.error(f"[{task_id}] tokenize failed for {split_file}: {e}")
+        def _run_tokenize_all():
+            """在线程池中并行 tokenize 所有 split 文件，返回 model_txt_files dict"""
+            result_map: Dict[str, List[str]] = {}
+            with _TPool(max_workers=len(split_files)) as pool:
+                future_map = {pool.submit(_tokenize_one_split, f): f for f in split_files}
+                for future in future_map:
+                    split_file = future_map[future]
+                    try:
+                        summary = future.result()
+                        if summary.get("status") == "completed":
+                            for model, info in summary.get("models", {}).items():
+                                txt_file = info.get("file", "")
+                                if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
+                                    result_map.setdefault(model, []).append(txt_file)
+                    except Exception as e:
+                        logger.error(f"[{task_id}] tokenize failed for {split_file}: {e}")
+            return result_map
+
+        # ★ 通过 run_in_executor 让出事件循环，避免阻塞其他任务
+        model_txt_files = await loop.run_in_executor(None, _run_tokenize_all)
 
         # 清理预过滤临时文件
         import shutil

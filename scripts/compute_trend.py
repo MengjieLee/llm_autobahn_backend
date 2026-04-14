@@ -697,7 +697,7 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logging.Formatter.converter = _bjt_time  # 全局强制北京时间
+    logging.Formatter.converter = staticmethod(_bjt_time)  # 全局强制北京时间
     parser = argparse.ArgumentParser(description="计算分钟级命中率趋势（回填已完成任务）")
     parser.add_argument("--status-dir", default=os.path.join(_BASE_DIR, "olap_database", "status"),
                         help="status 目录 (默认: olap_database/status)")

@@ -66,7 +66,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logging.Formatter.converter = _bjt_time  # 全局强制北京时间
+logging.Formatter.converter = staticmethod(_bjt_time)  # 全局强制北京时间
 logger = logging.getLogger("run_pipeline")
 
 # es_query logger 在 logging_config.py 中设置了 propagate=False，
