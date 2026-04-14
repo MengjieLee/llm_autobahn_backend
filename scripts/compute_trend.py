@@ -202,13 +202,12 @@ def _calc_model_checkpoint(
     checkpoint_dir: str,
 ) -> List[dict]:
     """
-    checkpoint 增量模式：逐文件调用 cache_calc，LRU 状态通过 checkpoint 传递。
+    checkpoint 增量模式：使用 -L 文件列表 + -c checkpoint 单进程流式计算。
 
-    与 _calc_model_shared_cache 语义等价：
-    - 每个 slice 文件单独运行 cache_calc
-    - -c 参数自动在文件间保存/加载 LRU Cache 状态
-    - 解析每次输出的整体 hit_rate（= 合并模式下对应 section 的 section_hit_rate）
-    - 无需创建临时合并文件，避免大文件（640GB+）写入 /tmp 导致 ENOSPC
+    与旧版逐文件调用语义等价，但只 fork 1 次子进程：
+    - cache_calc -L <filelist> -c <checkpoint> 自动按文件插入 __SECTION__ 标记
+    - 输出 per-section hit_rate（= 每分钟的命中率趋势）
+    - LRU cache 只需 load 1 次 + save 1 次，避免 1440 次子进程 + CFS 往返
     """
     if not model_files:
         return []
@@ -217,11 +216,87 @@ def _calc_model_checkpoint(
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "cache_checkpoint.bin")
 
-    # 如果 simulate 阶段已留下 checkpoint，可直接复用（跳过已处理的数据）
-    # 否则从空 cache 开始
+    # 写文件列表
+    filelist_path = os.path.join(checkpoint_dir, "_trend_filelist.txt")
+    with open(filelist_path, "w", encoding="utf-8") as f:
+        for fpath in sorted_files:
+            f.write(fpath + "\n")
+
+    points = []
+    t0 = _time.monotonic()
+
+    try:
+        cmd = [
+            cache_calc_path,
+            "-L", filelist_path,
+            "-s", str(cache_size),
+            "-b", str(block_size),
+            "-p", "true",
+            "-c", checkpoint_path,
+        ]
+        total_size_mb = sum(os.path.getsize(f) for f in sorted_files if os.path.exists(f)) / (1024 * 1024)
+        timeout = min(7200, max(120, int(total_size_mb / 50) + 120))
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        elapsed = _time.monotonic() - t0
+
+        if result.returncode != 0:
+            logger.warning(
+                "[trend] checkpoint: cache_calc -L failed (rc=%d, %.1fs): %s",
+                result.returncode, elapsed,
+                (result.stderr or result.stdout or "")[:200],
+            )
+            # fallback 到逐文件模式
+            return _calc_model_checkpoint_perfile(
+                sorted_files, cache_calc_path, cache_size, block_size, checkpoint_dir)
+
+        # 解析 section 行
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("section:"):
+                m = re.match(r'section:\s*([^\t]+).*section_hit_rate:\s*([\d.]+)', line)
+                if m:
+                    section_name = m.group(1).strip()
+                    hit_rate = float(m.group(2))
+                    time_label = _parse_time_from_filename(section_name)
+                    points.append({"time": time_label, "hit_rate": hit_rate})
+
+        if points:
+            logger.info(
+                "[trend] checkpoint: %d/%d slices -> %d points, %.1fs",
+                len(sorted_files), len(sorted_files), len(points), elapsed,
+            )
+        else:
+            logger.warning(
+                "[trend] checkpoint: no section results (%d files, %.1fs): %s",
+                len(sorted_files), elapsed, result.stdout[:200],
+            )
+
+    except subprocess.TimeoutExpired:
+        logger.error("[trend] checkpoint: TIMEOUT after %.1fs", _time.monotonic() - t0)
+    except Exception as e:
+        logger.error("[trend] checkpoint: exception: %s", e)
+
+    # 清理文件列表
+    try:
+        os.remove(filelist_path)
+    except OSError:
+        pass
+
+    return points
+
+
+def _calc_model_checkpoint_perfile(
+    sorted_files: List[str],
+    cache_calc_path: str,
+    cache_size: int,
+    block_size: int,
+    checkpoint_dir: str,
+) -> List[dict]:
+    """逐文件调用 cache_calc -c（旧版 fallback，-L 模式失败时使用）"""
+    checkpoint_path = os.path.join(checkpoint_dir, "cache_checkpoint.bin")
     has_existing_checkpoint = os.path.exists(checkpoint_path) and os.path.getsize(checkpoint_path) > 0
     if has_existing_checkpoint:
-        logger.info("[trend] checkpoint: 复用已有 checkpoint %s", checkpoint_path)
+        logger.info("[trend] checkpoint per-file: 复用已有 checkpoint %s", checkpoint_path)
 
     points = []
     t0 = _time.monotonic()
@@ -243,17 +318,15 @@ def _calc_model_checkpoint(
             timeout = min(3600, max(60, int(file_size_mb / 100) + 60))
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            elapsed = _time.monotonic() - t0
 
             if result.returncode != 0:
                 logger.warning(
-                    "[trend] checkpoint: cache_calc failed for %s (rc=%d, %.1fs): %s",
-                    fname, result.returncode, elapsed,
+                    "[trend] checkpoint per-file: cache_calc failed for %s (rc=%d): %s",
+                    fname, result.returncode,
                     (result.stderr or result.stdout or "")[:200],
                 )
                 continue
 
-            # 解析整体 hit_rate（非 section）
             found = False
             for line in result.stdout.strip().split("\n"):
                 if line.strip().startswith("cache_size:"):
@@ -265,35 +338,29 @@ def _calc_model_checkpoint(
                         break
 
             if not found:
-                logger.warning(
-                    "[trend] checkpoint: no hit_rate for %s: %s",
-                    fname, result.stdout[:200],
-                )
+                logger.warning("[trend] checkpoint per-file: no hit_rate for %s", fname)
 
             done_count += 1
             if done_count % 100 == 0 or done_count == len(sorted_files):
                 logger.info(
-                    "[trend] checkpoint 进度: %d/%d 文件, 耗时 %.1fs",
+                    "[trend] checkpoint per-file 进度: %d/%d, %.1fs",
                     done_count, len(sorted_files), _time.monotonic() - t0,
                 )
 
         except subprocess.TimeoutExpired:
-            logger.error("[trend] checkpoint: TIMEOUT for %s after %.1fs", fname, timeout)
+            logger.error("[trend] checkpoint per-file: TIMEOUT for %s", fname)
         except Exception as e:
-            logger.error("[trend] checkpoint: exception for %s: %s", fname, e)
+            logger.error("[trend] checkpoint per-file: exception for %s: %s", fname, e)
 
     elapsed = _time.monotonic() - t0
     if points:
         logger.info(
-            "[trend] checkpoint: %d/%d slices -> %d points, %.1fs",
+            "[trend] checkpoint per-file: %d/%d -> %d points, %.1fs",
             done_count, len(sorted_files), len(points), elapsed,
         )
     else:
-        logger.warning("[trend] checkpoint: 无有效结果 (%d files, %.1fs)", len(sorted_files), elapsed)
-
-    # 不清理 checkpoint：simulate 阶段创建的 checkpoint 包含完整 LRU 状态，
-    # trend 复用后 checkpoint 仍是最新状态，保留可供后续回填或重算复用。
-    # checkpoint 目录在任务数据目录下，随任务一起清理。
+        logger.warning("[trend] checkpoint per-file: 无有效结果 (%d files, %.1fs)",
+                       len(sorted_files), elapsed)
 
     return points
 

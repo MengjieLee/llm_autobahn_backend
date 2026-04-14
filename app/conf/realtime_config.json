@@ -1,12 +1,12 @@
 {
   "enabled": true,
   "scenario": "全场景_各模型",
-  "models": "glm-5,kimi-k2.5,minimax-m2.5,deepseek-v3.2",
+  "models": "glm-5,glm-5.1,kimi-k2.5,minimax-m2.5,deepseek-v3.2",
   "delay_minutes": 5,
   "retention_days": 30,
 
   "_comment_pipeline": "实时 pipeline 独立并发配置（不与日报 pipeline 共用）",
-  "pipeline_fetch_concurrency": 10,
+  "pipeline_fetch_concurrency": 2,
   "pipeline_fetch_window_concurrency": 12,
   "pipeline_es_scroll_workers": 60,
   "pipeline_tokenize_concurrency": 10,
@@ -20,7 +20,7 @@
   "checkpoint_tmpfs_dir": "/mnt/checkpoint_tmpfs",
 
   "_comment_k8s": "实时kv_cache_全场景_各模型",
-  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.3.3",
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.3.6",
   "k8s_cpu_request": "28",
   "k8s_cpu_limit": "28",
   "k8s_memory_request": "110Gi",

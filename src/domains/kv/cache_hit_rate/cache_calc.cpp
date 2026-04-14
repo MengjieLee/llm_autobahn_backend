@@ -17,7 +17,8 @@
 // ============================================================
 struct Config {
     std::vector<std::string> file_paths;
-    std::vector<size_t>      cache_sizes;   // 0 表示无限容量
+    std::string              file_list_path;  // -L: 文件列表，每行一个路径
+    std::vector<size_t>      cache_sizes;     // 0 表示无限容量
     size_t                   block_size     = 64;
     bool                     proc_timestamp = false;
     bool                     prefix_hash    = true;
@@ -234,9 +235,10 @@ static void progress_thread_func(const std::atomic<size_t>& current,
 static void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " -f <file> [-f <file2> ...] -s <cache_size> [-s <size2> ...] "
-                 "[-b <block_size>] [-t true] [-p false] [-c <checkpoint>]\n"
+                 "[-b <block_size>] [-t true] [-p false] [-c <checkpoint>] [-L <file_list>]\n"
               << "\n"
               << "  -f  input file path (repeatable for multi-file merge; '-' for stdin)\n"
+              << "  -L  file list path: each line is a file path, auto-insert __SECTION__ per file\n"
               << "  -s  max block count for LRU cache; 0 = unlimited (repeatable)\n"
               << "  -b  block size in tokens (default: 64)\n"
               << "  -t  process timestamps for sorting (default: false)\n"
@@ -251,7 +253,7 @@ int main(int argc, char* argv[]) {
     Config cfg;
 
     int o;
-    const char* optstring = "f:s:t:p:b:c:h";
+    const char* optstring = "f:s:t:p:b:c:L:h";
     while ((o = getopt(argc, argv, optstring)) != -1) {
         switch (o) {
         case 'f': cfg.file_paths.push_back(optarg); break;
@@ -266,9 +268,29 @@ int main(int argc, char* argv[]) {
                 cfg.prefix_hash = false;
             break;
         case 'c': cfg.checkpoint_path = optarg; break;
+        case 'L': cfg.file_list_path = optarg; break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
+    }
+
+    // 从 -L 文件列表加载路径
+    if (!cfg.file_list_path.empty()) {
+        std::ifstream list_file(cfg.file_list_path);
+        if (!list_file.is_open()) {
+            std::cerr << "Error: cannot open file list: " << cfg.file_list_path << std::endl;
+            return 1;
+        }
+        std::string line;
+        while (std::getline(list_file, line)) {
+            // 去除首尾空白
+            size_t start = line.find_first_not_of(" \t\r\n");
+            size_t end = line.find_last_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;  // 空行
+            cfg.file_paths.push_back(line.substr(start, end - start + 1));
+        }
+        std::cerr << "[filelist] loaded " << cfg.file_paths.size()
+                  << " files from " << cfg.file_list_path << std::endl;
     }
 
     if (cfg.file_paths.empty() || cfg.cache_sizes.empty()) {
@@ -361,10 +383,43 @@ int main(int argc, char* argv[]) {
                                     total_tokens, current_tokens, entry_count,
                                     current_section, has_sections);
         } else {
-            for (const auto& path : cfg.file_paths) {
+            // 多文件模式：每个文件自动插入 __SECTION__ 标记
+            // section 名 = 文件名（去掉目录和 _input_ids.txt 后缀）
+            for (size_t fi = 0; fi < cfg.file_paths.size(); ++fi) {
+                const auto& path = cfg.file_paths[fi];
+
+                // 从文件路径提取 section 名
+                std::string basename = path;
+                size_t slash = basename.find_last_of('/');
+                if (slash != std::string::npos) basename = basename.substr(slash + 1);
+                // 去掉 _input_ids.txt 后缀
+                const char* suffix = "_input_ids.txt";
+                size_t slen = strlen(suffix);
+                if (basename.size() > slen && basename.substr(basename.size() - slen) == suffix) {
+                    basename = basename.substr(0, basename.size() - slen);
+                }
+
+                // 触发上一段的统计输出（如果有）
+                if (!current_section.empty()) {
+                    emit_section_stats(current_section, caches);
+                }
+                // 重置段计数器
+                for (auto& cache : caches) {
+                    cache.resetSection();
+                }
+                current_section = basename;
+                has_sections = true;
+
+                // 流式处理该文件
                 stream_process_file(path, cfg, caches,
                                     total_tokens, current_tokens, entry_count,
                                     current_section, has_sections);
+
+                // 进度输出（每 100 个文件）
+                if ((fi + 1) % 100 == 0 || fi + 1 == cfg.file_paths.size()) {
+                    std::cerr << "[progress] " << (fi + 1) << "/" << cfg.file_paths.size()
+                              << " files processed" << std::endl;
+                }
             }
         }
         std::cout << "entries: " << entry_count.load()

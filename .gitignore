@@ -216,6 +216,7 @@ __marimo__/
 olap_database
 local_workspace
 .claude
+tests
 
 # 编译产物
 src/domains/kv/cache_hit_rate/cache_calc

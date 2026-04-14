@@ -179,29 +179,42 @@ def save_daily_report(date_label: str, tasks: List[dict]) -> int:
     return written
 
 
-def find_daily_overview_task(target_date: str) -> Optional[dict]:
+def find_daily_overview_tasks(target_date: str) -> List[dict]:
     """
-    查找指定日期的全场景各模型任务（兼容旧逻辑）
+    查找指定日期的所有全场景各模型任务（支持全天 + 时段限定任务）。
     target_date: "04-01" 格式
+
+    匹配规则：
+    - "04-11_全场景_各模型" → 全天任务
+    - "04-11_10~11_全场景_各模型" → 时段限定任务
+    - "【v9】04-0804-08_全场景_各模型" → 带前缀的全天任务
     """
     tasks = find_daily_tasks(target_date)
+    overview_tasks = []
     for task in tasks:
         task_name = task.get("task_name", "")
         if "全场景_各模型" in task_name:
-            return task
-    return None
+            overview_tasks.append(task)
+    return overview_tasks
 
 
-def format_report(task: dict, target_date: str, detail_url: str) -> str:
+def format_report(task: dict, target_date: str, detail_url: str, task_id: str = "") -> str:
     """
     格式化报告内容（Markdown）
     """
     result = task.get("result", {})
     query = task.get("query", {})
+    task_name = task.get("task_name", "")
 
     # 数据日期（只取年月日）
     start_dt = query.get("start_datetime", "")
     data_date = start_dt.split(" ")[0] if start_dt else target_date
+
+    # 提取时段（如 "10~11"），区分全天任务和时段限定任务
+    time_segment = ""
+    m = re.search(r"(\d{2}~\d{2})", task_name)
+    if m:
+        time_segment = f" ({m.group(1)}时段)"
 
     # 汇总整体命中率
     total_hit = 0
@@ -228,14 +241,14 @@ def format_report(task: dict, target_date: str, detail_url: str) -> str:
 
     overall_color = "green" if overall_rate >= 50 else ("orange" if overall_rate >= 20 else "red")
 
-    content = f"""##### 📊 KV Cache 模拟命中日报 (🗓️{data_date})
+    content = f"""##### 📊 KV Cache 模拟命中日报 (🗓️{data_date}{time_segment})
 
 **整体命中率 🎯**: <font color="{overall_color}">{overall_rate:.1f}%</font>  命中 {total_hit:,} / {total_queries:,} 次  tokens {total_tokens:,}
 
 **各模型命中率 🎯**
 {chr(10).join(model_lines)}
 
-[✨✨ 查看明细数据 ✨✨]({detail_url})"""
+[✨✨ 查看明细数据 ✨✨]({detail_url}/{task_id})"""
 
     return content
 
@@ -280,32 +293,36 @@ def main():
     else:
         print(f"[daily_report] 未找到 {target_date} 的已完成任务")
 
-    # 查找全场景任务推送 IM（兼容旧逻辑）
-    task = find_daily_overview_task(target_date)
-    if not task:
+    # 查找全场景任务推送 IM（支持全天 + 时段限定任务）
+    overview_tasks = find_daily_overview_tasks(target_date)
+    if not overview_tasks:
         print(f"[daily_report] 未找到 {target_date} 的全场景任务，跳过推送")
         return
 
-    print(f"[daily_report] 找到全场景任务: {task.get('task_name')}")
+    print(f"[daily_report] 找到 {len(overview_tasks)} 个全场景任务")
 
     # 加载配置（日报专用配置，fallback 到通用配置）
     config = load_config()
     bot_url = config.get("daily_report_im_bot_url") or config.get("notify_im_bot_url", "")
     bot_toid = config.get("daily_report_im_bot_toid") or config.get("notify_im_bot_toid", [])
-    detail_url = config.get("daily_report_detail_url", "https://vortex.n.baidu-int.com/olap/dashboard")
+    detail_url = config.get("daily_report_detail_url", "https://vortex.n.baidu-int.com/olap/discovery")
 
     if not bot_url or not bot_toid:
         print("[daily_report] 未配置 IM bot，跳过推送")
         return
 
-    # 格式化报告
-    content = format_report(task, target_date, detail_url)
-    print("[daily_report] 报告内容:")
-    print(content)
-    print()
+    # 逐个推送各时段的全场景报告
+    for task in overview_tasks:
+        task_name = task.get("task_name", "")
+        task_id = task.get("task_id", "")
+        print(f"[daily_report] 推送任务: {task_name}")
 
-    # 发送通知
-    send_im_notification(content, bot_url, bot_toid)
+        content = format_report(task, target_date, detail_url, task_id)
+        print("[daily_report] 报告内容:")
+        print(content)
+        print()
+
+        send_im_notification(content, bot_url, bot_toid)
 
 
 if __name__ == "__main__":
