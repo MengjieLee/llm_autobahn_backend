@@ -174,12 +174,14 @@ class ESIndexClient:
                     if status_callback:
                         status_callback(total_count, f"已处理 {total_count} 条记录...")
 
-                    # 立即释放当页数据，每 2 页强制 gc + malloc_trim 归还 OS
+                    # 立即释放当页数据，每 5 页强制 gc + malloc_trim 归还 OS
+                    # 权衡：每页 gc → 24h 全量约 46900 次 ≈ 39 分钟纯 GC 开销
+                    #       每 5 页 → ~9400 次 ≈ 8 分钟，碎片累积 ~500MB（10 线程 × 5 页 × 10MB）
                     res = None
                     results = None
-                    # if scroll_rounds % 2 == 0:
-                    gc.collect()
-                    _malloc_trim()
+                    if scroll_rounds % 5 == 0:
+                        gc.collect()
+                        _malloc_trim()
 
                     res = self.client.scroll(scroll_id=scroll_id, scroll=scroll_time)
                     scroll_id = res.get("_scroll_id")
@@ -293,12 +295,12 @@ class ESIndexClient:
                 if status_callback:
                     status_callback(base_count + window_count, f"已处理 {base_count + window_count} 条记录...")
 
-                # 立即释放当页数据，每 2 页强制 gc + malloc_trim 归还 OS
+                # 立即释放当页数据，每 5 页强制 gc + malloc_trim 归还 OS
                 res = None
                 results = None
-                # if scroll_rounds % 2 == 0:
-                gc.collect()
-                _malloc_trim()
+                if scroll_rounds % 5 == 0:
+                    gc.collect()
+                    _malloc_trim()
 
                 res = self.client.scroll(scroll_id=scroll_id, scroll=scroll_time)
                 scroll_id = res.get("_scroll_id")

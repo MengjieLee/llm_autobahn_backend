@@ -130,7 +130,48 @@ class TokenizerManager:
         warnings.filterwarnings("ignore", message=".*is not supported and can yield errors.*")
 
         from transformers import AutoTokenizer
-        return AutoTokenizer.from_pretrained(config, trust_remote_code=True)
+        try:
+            tok = AutoTokenizer.from_pretrained(config, trust_remote_code=True)
+        except (ValueError, AttributeError, OSError):
+            # 部分新模型（如 deepseek_v32）的 config.json 含有当前 transformers
+            # 版本不认识的架构字段，导致 AutoConfig 失败。
+            # 回退：用 PreTrainedTokenizerFast 直接加载 tokenizer 文件，跳过模型 config。
+            from transformers import PreTrainedTokenizerFast
+            tok = PreTrainedTokenizerFast.from_pretrained(config, trust_remote_code=True)
+
+        # PreTrainedTokenizerFast fallback 可能丢失 chat_template（跳过了 model config），
+        # 手动从 tokenizer_config.json 中读取补上。
+        if not getattr(tok, "chat_template", None):
+            tok.chat_template = self._load_chat_template_from_config(config)
+        return tok
+
+    @staticmethod
+    def _load_chat_template_from_config(config: str):
+        """从 HF cache 中的 tokenizer_config.json 读取 chat_template"""
+        try:
+            from huggingface_hub import hf_hub_download
+            import json as _json
+            path = hf_hub_download(config, "tokenizer_config.json")
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            tpl = data.get("chat_template")
+            if tpl:
+                return tpl
+        except Exception:
+            pass
+        # 兜底：DeepSeek V3 标准 chat template
+        return (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "<|begin▁of▁sentence|>{{ message['content'] }}"
+            "{% elif message['role'] == 'user' %}"
+            "<|User|>{{ message['content'] }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "<|Assistant|>{{ message['content'] }}"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|Assistant|>{% endif %}"
+        )
 
 
 # ============================================================

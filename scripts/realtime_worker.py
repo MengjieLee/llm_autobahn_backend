@@ -428,7 +428,7 @@ def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
                     if not pattern.search(line):
                         continue
                     # 需要打开新切片？
-                    if fh is None or (written_in_chunk >= chunk_size and chunk_idx < num_splits - 1):
+                    if fh is None or (written_in_chunk >= chunk_size and len(split_files) < num_splits):
                         if fh is not None:
                             fh.close()
                         path = os.path.join(output_dir, f"_filtered_{chunk_idx}.jsonl")

@@ -209,9 +209,65 @@ def _set_failed(task_id: str, stage: str, error_msg: str):
 
 
 # ============================================================
+# Stage 1.5: 逐文件原地预过滤（Fetch → Tokenize 之间）
+# ============================================================
+def _prefilter_inplace(jsonl_files, model_filter):
+    """
+    逐文件原地预过滤：只保留目标模型行，直接覆写原文件。
+
+    保留原始 kv_YYYYMMDD_HHMMSS 文件名 → trend 时间轴正常。
+    全程逐行流式处理，无整文件加载，无 OOM 风险。
+
+    :param jsonl_files: 原始 per-minute jsonl 文件路径列表
+    :param model_filter: 模型名集合，如 {"glm-5", "kimi-k2.5"}；为空则不过滤
+    :return: 过滤后非空文件路径列表（保留原始文件名）
+    """
+    import re as _re
+
+    if not model_filter:
+        return [f for f in jsonl_files if os.path.exists(f) and os.path.getsize(f) > 0]
+
+    escaped = [_re.escape(m) for m in model_filter]
+    pattern = _re.compile(r'qianfan_model:(' + '|'.join(escaped) + r')(?:[^a-zA-Z0-9._-]|$)')
+
+    total_count = 0
+    matched_count = 0
+    result_files = []
+
+    for jf in jsonl_files:
+        if not os.path.exists(jf) or os.path.getsize(jf) == 0:
+            continue
+        tmp_path = jf + ".tmp"
+        file_matched = 0
+        try:
+            with open(jf, "r", encoding="utf-8") as fin, \
+                 open(tmp_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024) as fout:
+                for line in fin:
+                    total_count += 1
+                    if pattern.search(line):
+                        fout.write(line)
+                        file_matched += 1
+            matched_count += file_matched
+            if file_matched > 0:
+                os.replace(tmp_path, jf)
+                result_files.append(jf)
+            else:
+                os.remove(tmp_path)
+                os.remove(jf)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    filter_pct = matched_count * 100 // max(total_count, 1)
+    logger.info(f"[prefilter] {total_count} → {matched_count} 条 ({filter_pct}%), "
+                f"保留 {len(result_files)} 个 per-minute 文件")
+
+    return result_files
+
 
 # ============================================================
-# Stage 1+2: fetch → tokenize (streaming pipeline)
+# Stage 1+2: fetch → prefilter → tokenize (streaming pipeline)
 # ============================================================
 async def _run_streaming_fetch_tokenize(
     task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
@@ -250,6 +306,7 @@ async def _run_streaming_fetch_tokenize(
     tokenize_done_count = [0]
     tokenize_total_lines = [0]
     tokenize_total_seconds = [0.0]
+    tokenize_total_submitted = [0]
     _cb_msg = [None]
     _progress_dirty = [False]
 
@@ -260,6 +317,13 @@ async def _run_streaming_fetch_tokenize(
 
     # simulate 不再流式逐文件执行（1440 次 -f -c 调用太慢），
     # 改为 tokenize 全部完成后由 _run_simulate_stage 统一走 -L 批量模式
+
+    # 预过滤使用的模型列表（与 tokenize daemon 一致）
+    _status_data = _read_status(task_id)
+    selected_models = (_status_data.get("query", {}).get("models", []) if _status_data else [])
+    if not selected_models:
+        selected_models = cfg.get("models", [])
+    prefilter_model_set = set(selected_models) if selected_models else set()
 
     # 启动共享 tokenize daemon —— 整个 pipeline 生命周期内 tokenizer 只加载一次
     if SCRIPTS_DIR not in sys.path:
@@ -290,21 +354,16 @@ async def _run_streaming_fetch_tokenize(
     def _update_tokenize_progress():
         if tokenize_done_count[0] == 0:
             return
+        total_tokenize_files = max(tokenize_total_submitted[0], 1)
         stage_data = {
             "status": "running",
-            "message": f"序列化进度 {tokenize_done_count[0]}/{len(fetch_results)}",
-            "progress": f"{tokenize_done_count[0]}/{len(fetch_results)}",
+            "message": f"序列化进度 {tokenize_done_count[0]}/{total_tokenize_files}",
+            "progress": f"{tokenize_done_count[0]}/{total_tokenize_files}",
             "total_lines": tokenize_total_lines[0],
         }
         if tokenize_total_seconds[0] > 0 and tokenize_total_lines[0] > 0:
             speed = tokenize_total_lines[0] / tokenize_total_seconds[0]
-            done_files = {r["file"] for r in tokenize_results if r.get("status") == "completed"}
-            remaining_records = sum(
-                fr["count"] for fr in fetch_results
-                if os.path.basename(fr["file"]) not in done_files
-            )
             stage_data["tokenize_speed"] = round(speed, 2)
-            stage_data["remaining_records"] = remaining_records
         _update_stage(task_id, "tokenize", stage_data)
 
     async def _progress_flusher():
@@ -347,7 +406,8 @@ async def _run_streaming_fetch_tokenize(
                     fetch_total_count[0] += hour_count
                     fetch_done_count[0] += 1
 
-                    # 收集 per-minute 文件并提交 tokenize
+                    # 收集本 hour 的 per-minute 文件
+                    hour_jsonl_files = []
                     for fi in result["files"]:
                         fetch_results.append({
                             "file": fi["file"],
@@ -356,8 +416,21 @@ async def _run_streaming_fetch_tokenize(
                             "count": fi["count"]
                         })
                         if fi["count"] > 0 and os.path.exists(fi["file"]):
+                            hour_jsonl_files.append(fi["file"])
+
+                    # ---- Stage 1.5: 逐文件原地预过滤 ----
+                    # 用 regex 过滤目标模型，去除 99%+ 无效记录，
+                    # 保留原始 per-minute 文件名（trend 时间轴依赖）
+                    if hour_jsonl_files:
+                        loop = asyncio.get_event_loop()
+                        filtered_files = await loop.run_in_executor(
+                            None, _prefilter_inplace,
+                            hour_jsonl_files, prefilter_model_set
+                        )
+                        for sf in filtered_files:
+                            tokenize_total_submitted[0] += 1
                             t = asyncio.create_task(
-                                _tokenize_single_with_tracking(fi["file"], output_dir, task_id)
+                                _tokenize_single_with_tracking(sf, output_dir, task_id)
                             )
                             tokenize_tasks.append(t)
 
@@ -465,7 +538,7 @@ async def _run_streaming_fetch_tokenize(
     # 等待所有 tokenize
     _update_stage(task_id, "tokenize", {
         "status": "running",
-        "message": f"等待序列化完成 ({tokenize_done_count[0]}/{len(fetch_results)})"
+        "message": f"等待序列化完成 ({tokenize_done_count[0]}/{tokenize_total_submitted[0]})"
     }, "tokenize")
 
     if tokenize_tasks:
