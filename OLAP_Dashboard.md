@@ -618,3 +618,359 @@ olap_database/realtime/_cache_state/
 - `realtime_worker.py`：`subprocess.run(cmd, input=section_data, ...)` 替代写文件+运行
 
 **收益**：省去 section 文件的 CFS 写+读，约 1-3s/分钟。
+
+## 实时 Pipeline 完整流程（端到端）
+
+### 整体时序
+
+```
+cron (每分钟)                    Worker Pod (常驻)
+    │                                │
+    ├─ realtime_scheduler.py         │
+    │  ├─ T = now - 5min             │
+    │  ├─ 幂等检查(queue+daily)      │
+    │  └─ 写 queue/pending/*.json    │
+    │                                │
+    │                           ┌────┴─────────────────────────────────────────┐
+    │                           │ _run_worker() 主循环 (每 5s 扫描)             │
+    │                           │                                              │
+    │                           │ 1. _scan_pending_tasks() → 取任务文件         │
+    │                           │ 2. _try_lock_task() → CFS 排他锁 (fcntl)     │
+    │                           │ 3. 幂等检查 → daily JSON 中已有则跳过         │
+    │                           │ 4. _move_task(pending → running)              │
+    │                           │                                              │
+    │                           │ 5. _process_task():                           │
+    │                           │    ┌──────────────────────────────────┐       │
+    │                           │    │ Stage 1: Fetch (ES)              │       │
+    │                           │    │  ESIndexService.query_to_dir()   │       │
+    │                           │    │  scroll_size=10000               │       │
+    │                           │    │  → 1 个 .jsonl 文件              │       │
+    │                           │    │  耗时: ~6-7 min (150万条)        │       │
+    │                           │    └──────────┬───────────────────────┘       │
+    │                           │               ▼                               │
+    │                           │    ┌──────────────────────────────────┐       │
+    │                           │    │ Stage 2: Tokenize               │       │
+    │                           │    │  daemon_client.submit() → RR    │       │
+    │                           │    │  daemon_client.wait(timeout=3600)│       │
+    │                           │    │  10 daemons × 3 workers each    │       │
+    │                           │    │  但只有 1 个 jsonl → 只用 1 daemon│       │
+    │                           │    │  150万条 × apply_chat_template  │       │
+    │                           │    │  ★ 瓶颈: >1h 超时 ★             │       │
+    │                           │    └──────────┬───────────────────────┘       │
+    │                           │               ▼                               │
+    │                           │    ┌──────────────────────────────────┐       │
+    │                           │    │ Stage 3: Trend (cache_calc)     │       │
+    │                           │    │  per-model 并行 (ThreadPool)     │       │
+    │                           │    │  checkpoint + stdin 管道         │       │
+    │                           │    │  耗时: <30s (checkpoint模式)     │       │
+    │                           │    └──────────┬───────────────────────┘       │
+    │                           │               ▼                               │
+    │                           │    ┌──────────────────────────────────┐       │
+    │                           │    │ Stage 4: Write daily JSON        │       │
+    │                           │    │  _write_to_daily() 文件锁+原子写 │       │
+    │                           │    │  耗时: <1s                       │       │
+    │                           │    └──────────────────────────────────┘       │
+    │                           │                                              │
+    │                           │ 6. _move_task(running → done/failed)          │
+    │                           │ 7. gc.collect()                               │
+    │                           └──────────────────────────────────────────────┘
+```
+
+### 各阶段耗时实测 (基于 2026-04-13~14 日志)
+
+| 阶段 | 耗时 | 数据量 | 状态 |
+|------|------|--------|------|
+| Fetch (ES scroll) | **6-7 min** | 1 分钟全流量 ~150 万条 | 正常 |
+| Tokenize | **>60 min → 超时** | 150 万条 × 5 模型 tokenize | **100% 失败** |
+| Trend (cache_calc) | <30s | checkpoint 增量模式 | 未能到达 |
+| Write daily JSON | <1s | 追加 1 条记录 | 未能到达 |
+
+### TokenizeDaemonClient 架构
+
+```
+realtime_worker.py
+    │
+    ├─ daemon_client = TokenizeDaemonClient(
+    │      workers=3,           ← 每个 daemon 的 multiprocessing.Pool 大小
+    │      batch_size=10000,    ← 每批提交给 Pool 的记录数
+    │      num_daemons=10,      ← daemon 子进程总数 (Round-Robin)
+    │  )
+    │
+    ├─ daemon_client.start(timeout=300)  ← 并行启动 10 个 daemon，加载 tokenizer
+    │
+    └─ _process_task():
+         └─ for jsonl_file in jsonl_files:     ← 只有 1 个文件
+              └─ _tokenize_via_daemon():
+                   ├─ daemon_client.submit()    ← RR 分配到 1 个 daemon
+                   └─ daemon_client.wait(3600)  ← 阻塞等待结果，超时1h
+
+                         daemon-0 (tokenize_daemon.py)
+                         ┌─────────────────────────────────┐
+                         │ _process_file_with_pool():       │
+                         │  ├─ 逐行读 jsonl                 │
+                         │  ├─ 每 10000 行 → pool.apply_async│
+                         │  ├─ max_pending = 3×2 = 6 批     │
+                         │  ├─ _flush_results() 阻塞等待全部│
+                         │  └─ 写 per-model _input_ids.txt  │
+                         │                                  │
+                         │  Pool workers (×3):              │
+                         │   _worker_process_batch():       │
+                         │    ├─ regex 预过滤 model          │
+                         │    ├─ json.loads()               │
+                         │    ├─ convert_record()           │
+                         │    └─ apply_chat_template() ★慢★ │
+                         └─────────────────────────────────┘
+
+问题：
+  10 个 daemon 只有 1 个在工作 → 9 个空闲
+  1 个 daemon 只有 3 个 Pool worker → 只有 3 并发 tokenize
+  150万条 × ~1-5ms/条 = 估算 25-125 分钟
+  实际: 100% 超过 60 分钟超时
+```
+
+## "等待 tokenize 结果超时" 瓶颈分析
+
+### 现象
+
+从 2026-04-13 日志看，**全天 84 个任务，零成功**。每个任务均在 tokenize 阶段等待 1 小时后超时：
+
+```
+[rt-20260413-193200] tokenize failed: 等待 tokenize 结果超时: task_23
+[rt-20260413-193400] tokenize failed: 等待 tokenize 结果超时: task_25
+... (全部 84 个任务均如此)
+```
+
+### 根因
+
+| 维度 | 现状 | 问题 |
+|------|------|------|
+| **数据量** | ~150 万条/分钟 (全流量) | ES 全场景无 app_id/path 过滤，数据量巨大 |
+| **有效数据** | 5 模型可能只占全流量 10-30% | 150 万条中大量为无关模型，但仍需逐条 regex 过滤 |
+| **daemon 利用率** | 10 个 daemon，1 个 jsonl 文件 | Round-Robin 只分配给 1 个 daemon，其余 9 个闲置 |
+| **Worker 并发** | 单 daemon 3 个 Pool worker | 只有 3 个 apply_chat_template 并发 |
+| **有效并发** | 28 CPU × 0 利用 | 总 28 核，实际只用 3 核 tokenize |
+| **单记录耗时** | apply_chat_template ~1-5ms | 对长对话可达 10-50ms |
+| **理论总耗时** | 150万 × 2ms / 3 worker = 1000s ≈ 17min | 含 regex 过滤 + I/O，实际更久 |
+| **wait 方式** | time.sleep(0.05) 轮询 | 非关键瓶颈，但浪费 CPU |
+
+### 瓶颈拆解
+
+```
+150 万条 JSONL 记录 (1 分钟全流量)
+    │
+    ├─ [快速] regex 预过滤: 跳过不在 model_filter 中的记录
+    │   ├─ 命中: ~15-45 万条 (5 模型的流量)
+    │   └─ 未命中: ~105-135 万条 (跳过，但仍需逐行读+regex)
+    │
+    ├─ [慢] json.loads() + convert_record() + apply_chat_template()
+    │   ├─ 每条 ~1-50ms (取决于对话长度)
+    │   ├─ 3 worker 并发
+    │   └─ 30万条 × 3ms / 3 worker ≈ 300s = 5min (理想)
+    │       45万条 × 5ms / 3 worker ≈ 750s = 12.5min (中等)
+    │       45万条 × 10ms / 3 worker ≈ 1500s = 25min (偶有长对话)
+    │
+    └─ [I/O] 写 per-model _input_ids.txt 到 CFS
+        └─ 占比较小，但 CFS 延迟累加
+```
+
+实际上 150 万条逐行读取 + regex 匹配本身也需要数分钟。加上 tokenize 处理，单 daemon 很难在 60 分钟内完成。
+
+## 解决方案对比
+
+### 方案 A: 提升 tokenize 并发度（改配置，不改代码）
+
+**原理**：增大单 daemon 的 Pool worker 数，充分利用 28 核 CPU。
+
+| 参数 | 当前值 | 调整值 | 说明 |
+|------|--------|--------|------|
+| `pipeline_tokenize_workers` | 3 | **20** | 单 daemon Pool 大小 |
+| `pipeline_tokenize_concurrency` | 10 | **2** | daemon 数（减少内存浪费） |
+| `pipeline_tokenize_batch_size` | 10000 | **2000** | 减小批次，降低尾延迟 |
+
+**预期效果**：
+- 有效并发从 3 → 20，理论速度提升 ~6.7x
+- 45 万条 × 5ms / 20 worker ≈ 112s ≈ **2 分钟**（理想）
+- 含 IO + regex 开销，估计 **5-10 分钟**
+
+**风险**：内存增加（20 个 fork 子进程 × tokenizer 内存），但 COW 机制下增量有限，110Gi 足够。
+
+**操作**：修改 `app/conf/realtime_config.json`，重启 Worker Pod。
+
+### 方案 B: 在 ES 层按 model 预过滤（改 ES 查询，不改 tokenize 代码）
+
+**原理**：在 ES 查询中增加 `qianfan_model` 过滤条件，只拉取 5 个目标模型的数据。
+
+**预期效果**：
+- 数据量从 150 万 → 15-45 万条（减少 70-90%）
+- fetch 耗时从 7min → 1-2min
+- tokenize 无需 regex 过滤无关记录
+- 总时间 **3-8 分钟**
+
+**风险**：
+- 需确认 ES 索引有 `qianfan_model` 字段且已建索引
+- 需改 `svc.py` 的 `query_to_dir()` 或传 model 过滤参数
+
+### 方案 C: 将单 JSONL 切分为 N 片，分发到 N 个 daemon 并行处理
+
+**原理**：fetch 完成后，将大 jsonl 按行数切分成 N 个小文件，每个文件分发到不同 daemon。
+
+**预期效果**：
+- 充分利用 10 个 daemon × 3 worker = 30 并发
+- 45 万条 / 10 daemon × 5ms / 3 worker ≈ **75s ≈ 1.3 分钟**
+
+**风险**：
+- 需要额外的 CFS I/O 写切片文件（或用内存分片）
+- 代码改动量较大
+
+### 方案对比总结
+
+| 维度 | 方案 A (加 Worker) | 方案 B (ES 预过滤) | 方案 C (预过滤+切片并行) |
+|------|-------|-------|-------|
+| 代码改动 | **零** (仅改配置) | ❌ **不可行** | 中等 (改 worker) |
+| 预期效果 | 5-10 min/任务 | N/A | **1-3 min/任务** |
+| 是否能追上 1 分钟/任务 | 不一定 | N/A | **可以** |
+| 实施难度 | 低 | N/A | 中 |
+| 状态 | ✅ 已实施 (workers=20) | ❌ 已排除 | ✅ **已实施** |
+
+**方案 B 排除原因**：`qianfan_model` 不是 ES 独立字段，而是嵌在 `@raw` 文本中（格式 `qianfan_model:xxx`），ES 层的 `terms` / `match_phrase` 查询均无法可靠过滤。
+
+**最终方案**：A + C 叠加。
+
+### 方案 C 实施详情（已完成）
+
+在 `realtime_worker.py` 的 Stage 1 (Fetch) 和 Stage 2 (Tokenize) 之间新增 **Stage 1.5: Pre-filter & Split**：
+
+```
+Stage 1: Fetch → ~150万条 JSONL files
+    ↓
+Stage 1.5: Pre-filter + Split（新增函数 _prefilter_and_split）
+    → 纯 Python regex 扫描每个 JSONL（无需 JSON 解析，~10秒）
+    → 仅保留匹配 5 个目标模型的行（qianfan_model:xxx）
+    → 过滤后的行 Round-Robin 写入 N 个切片文件（N = daemon 数量）
+    → 150万 → ~30-50万条，拆成 N 个文件
+    ↓
+Stage 2: Tokenize → N 个切片文件由 ThreadPoolExecutor 并发提交到 N 个 daemon
+    → 每个 daemon 20 workers 并行 tokenize
+    ↓
+清理 filtered/ 临时目录
+```
+
+**核心改动**：
+- 新增 `_prefilter_and_split()` 函数（~50行）
+- Stage 2 改为 `ThreadPoolExecutor` 并行提交 N 个切片文件
+- tokenize 完成后 `shutil.rmtree(filtered_dir)` 清理临时文件
+
+## 线上容器测试方案
+
+### 前置：进入 Worker Pod
+
+```bash
+# 找到 worker pod
+kubectl --kubeconfig app/conf/inner_cluster.kubeconfig \
+  -n cache-hit-rate-tokenizer get pods
+
+# 进入 pod
+kubectl --kubeconfig app/conf/inner_cluster.kubeconfig \
+  -n cache-hit-rate-tokenizer exec -it <pod-name> -- bash
+```
+
+### 测试 1: 验证当前瓶颈（观察 tokenize 耗时）
+
+在 Pod 内运行单次任务，观察各阶段耗时：
+
+```bash
+cd /mnt/cfs_bj_mt/workspace/limengjie03/tool_chain/llm_autobahn/llm_autobahn_backend
+
+# 单次执行（--once 处理 1 个任务后退出），先确保 queue/pending/ 中有任务
+python scripts/realtime_scheduler.py
+python scripts/realtime_worker.py --once 2>&1 | tee /tmp/test_baseline.log
+
+# 观察关键时间戳
+grep -E "fetch done|tokenize:|tokenize done|trend done|完成" /tmp/test_baseline.log
+```
+
+### 测试 2: 方案 A — 调整 tokenize 并发参数
+
+修改配置后重启 Worker：
+
+```bash
+# 备份原配置
+cp app/conf/realtime_config.json app/conf/realtime_config.json.bak
+
+# 修改参数（可用 python 或 sed）
+python3 -c "
+import json
+cfg = json.load(open('app/conf/realtime_config.json'))
+cfg['pipeline_tokenize_workers'] = 20      # 3 → 20
+cfg['pipeline_tokenize_concurrency'] = 2    # 10 → 2
+cfg['pipeline_tokenize_batch_size'] = 2000  # 10000 → 2000
+json.dump(cfg, open('app/conf/realtime_config.json', 'w'), indent=2, ensure_ascii=False)
+print('done:', {k:v for k,v in cfg.items() if 'tokenize' in k})
+"
+
+# 单次测试
+python scripts/realtime_scheduler.py
+python scripts/realtime_worker.py --once 2>&1 | tee /tmp/test_plan_a.log
+
+# 对比
+grep -E "fetch done|tokenize:|tokenize done|trend done|完成" /tmp/test_plan_a.log
+```
+
+**预期**：tokenize 从 >60min 超时降到 5-10 分钟完成。
+
+### 测试 3: 方案 A 激进版 — 进一步加大并发
+
+```bash
+python3 -c "
+import json
+cfg = json.load(open('app/conf/realtime_config.json'))
+cfg['pipeline_tokenize_workers'] = 24      # 接近 CPU 核数
+cfg['pipeline_tokenize_concurrency'] = 1    # 只用 1 个 daemon
+cfg['pipeline_tokenize_batch_size'] = 1000  # 更小的批次
+json.dump(cfg, open('app/conf/realtime_config.json', 'w'), indent=2, ensure_ascii=False)
+print('done:', {k:v for k,v in cfg.items() if 'tokenize' in k})
+"
+
+python scripts/realtime_scheduler.py
+python scripts/realtime_worker.py --once 2>&1 | tee /tmp/test_plan_a2.log
+
+grep -E "fetch done|tokenize:|tokenize done|trend done|完成" /tmp/test_plan_a2.log
+```
+
+### 测试 4: 监控资源使用
+
+在测试期间，在另一个终端监控 CPU 和内存：
+
+```bash
+# CPU 使用（每 5 秒采样）
+while true; do date; top -bn1 | head -5; sleep 5; done > /tmp/cpu_monitor.log &
+
+# 或用 mpstat 看 per-core
+mpstat -P ALL 5 > /tmp/mpstat.log &
+
+# 内存
+free -h && echo "---" && ps aux --sort=-rss | head -20
+```
+
+### 测试 5: 确认成功后的持久化部署
+
+```bash
+# 恢复或保留配置
+# 如果方案 A 验证通过，直接重启 deployment
+kubectl --kubeconfig app/conf/inner_cluster.kubeconfig \
+  -n cache-hit-rate-tokenizer rollout restart deployment/realtime-worker
+
+# 观察新 Pod 启动和处理情况
+kubectl --kubeconfig app/conf/inner_cluster.kubeconfig \
+  -n cache-hit-rate-tokenizer logs -f deployment/realtime-worker --tail=100
+```
+
+### 参数速查表
+
+| 参数 | 当前值 | 方案 A 保守 | 方案 A 激进 | 含义 |
+|------|--------|-------------|-------------|------|
+| `pipeline_tokenize_workers` | 3 | 20 | 24 | 每 daemon 的 Pool 进程数 |
+| `pipeline_tokenize_concurrency` | 10 | 2 | 1 | daemon 子进程总数 |
+| `pipeline_tokenize_batch_size` | 10000 | 2000 | 1000 | 每批记录数 |
+| **有效 tokenize 并发** | **3** | **20** | **24** | workers × 活跃 daemon |
+| **内存估算(fork COW)** | ~30G | ~35G | ~40G | 110Gi 充足 |

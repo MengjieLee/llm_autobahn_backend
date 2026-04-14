@@ -1,14 +1,26 @@
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from logging.handlers import TimedRotatingFileHandler, RotatingFileHandler
 
 from app.conf.config import settings
 from app.core.request_context import ctx_get_username, ctx_get_trace_id
 
+# 北京时间 (UTC+8)，供 Formatter.converter 使用
+_BJT = timezone(timedelta(hours=8))
+
+
+def _bjt_time(timestamp=None):
+    """将 UNIX 时间戳转换为北京时间 time.struct_time，替代 time.localtime"""
+    dt = datetime.fromtimestamp(timestamp or time.time(), tz=_BJT)
+    return dt.timetuple()
+
 
 class ContextFormatter(logging.Formatter):
     """自定义日志格式化器，自动从请求上下文提取 username 和 trace_id 并添加到日志消息中。"""
+
+    converter = _bjt_time  # 强制北京时间
 
     def format(self, record: logging.LogRecord) -> str:
         """格式化日志记录，自动添加上下文信息。"""

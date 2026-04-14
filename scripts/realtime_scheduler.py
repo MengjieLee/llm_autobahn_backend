@@ -140,7 +140,7 @@ def main():
         return
 
     scenario = cfg.get("scenario", "全场景_各模型")
-    models_str = cfg.get("models", "glm-5,kimi-k2.5,minimax-m2.5,deepseek-v3.2")
+    models_str = cfg.get("models", "glm-5,glm-5.1,kimi-k2.5,minimax-m2.5,deepseek-v3.2")
     models = [m.strip() for m in models_str.split(",") if m.strip()]
     delay_minutes = cfg.get("delay_minutes", args.delay_minutes)
     retention_days = cfg.get("retention_days", 30)

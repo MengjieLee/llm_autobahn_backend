@@ -53,11 +53,20 @@ CACHE_CALC_PATH = _DOCKER_CACHE_CALC if os.path.isfile(_DOCKER_CACHE_CALC) and o
 
 BJT = timezone(timedelta(hours=8))
 
+
+def _bjt_time(timestamp=None):
+    """将 UNIX 时间戳转换为北京时间 time.struct_time"""
+    import time as _time
+    dt = datetime.fromtimestamp(timestamp or _time.time(), tz=BJT)
+    return dt.timetuple()
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.Formatter.converter = _bjt_time  # 全局强制北京时间
 logger = logging.getLogger("run_pipeline")
 
 # es_query logger 在 logging_config.py 中设置了 propagate=False，
@@ -65,6 +74,7 @@ logger = logging.getLogger("run_pipeline")
 _es_logger = logging.getLogger("es_query")
 _es_logger.setLevel(logging.INFO)
 _es_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_es_fmt.converter = _bjt_time
 if not _es_logger.handlers:
     # stderr — kubectl logs 可见
     _es_stderr = logging.StreamHandler()

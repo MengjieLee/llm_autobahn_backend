@@ -64,11 +64,20 @@ REALTIME_CONFIG_JSON = os.path.join(BASE_DIR, "app", "conf", "realtime_config.js
 BJT = timezone(timedelta(hours=8))
 POLL_INTERVAL = 5  # 队列扫描间隔（秒）
 
+
+def _bjt_time(timestamp=None):
+    """将 UNIX 时间戳转换为北京时间 time.struct_time"""
+    import time as _time
+    dt = datetime.fromtimestamp(timestamp or _time.time(), tz=BJT)
+    return dt.timetuple()
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.Formatter.converter = _bjt_time  # 全局强制北京时间
 # 文件日志：按天轮转，写入 logs/realtime/
 _LOG_DIR = os.path.join(BASE_DIR, "logs", "realtime")
 os.makedirs(_LOG_DIR, exist_ok=True)
@@ -76,9 +85,11 @@ _file_handler = logging.handlers.TimedRotatingFileHandler(
     os.path.join(_LOG_DIR, "realtime_worker.log"),
     when="midnight", backupCount=30, encoding="utf-8",
 )
-_file_handler.setFormatter(logging.Formatter(
+_file_fmt = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
-))
+)
+_file_fmt.converter = _bjt_time
+_file_handler.setFormatter(_file_fmt)
 logging.getLogger().addHandler(_file_handler)
 logger = logging.getLogger("realtime_worker")
 
@@ -360,6 +371,56 @@ def _backup_checkpoint_to_cfs(tmpfs_checkpoint_path: str, model: str):
 
 
 # ============================================================
+# Stage 1.5: 预过滤 + 切片（Fetch → Tokenize 之间）
+# ============================================================
+def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
+    """
+    预过滤 + 切片：用纯 regex 扫描 JSONL，只保留目标模型行，拆成 num_splits 个文件。
+
+    原理：qianfan_model:xxx 以文本形式嵌在每行 JSON 的 @raw 字段中，
+    无需 JSON 解析即可用 regex 快速匹配，~150万行/10秒。
+
+    过滤后的行 Round-Robin 分配到 N 个切片文件，使 N 个 daemon 可并行 tokenize。
+    """
+    import re
+
+    escaped = [re.escape(m) for m in models]
+    pattern = re.compile(r'qianfan_model:(' + '|'.join(escaped) + r')(?:[^a-zA-Z0-9._-]|$)')
+
+    split_files = []
+    split_fhs = []
+    for i in range(num_splits):
+        path = os.path.join(output_dir, f"_filtered_{i}.jsonl")
+        split_files.append(path)
+        split_fhs.append(open(path, "w", encoding="utf-8"))
+
+    kept = 0
+    total = 0
+    split_idx = 0
+
+    try:
+        for jsonl_file in jsonl_files:
+            if not os.path.exists(jsonl_file) or os.path.getsize(jsonl_file) == 0:
+                continue
+            with open(jsonl_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    total += 1
+                    if pattern.search(line):
+                        split_fhs[split_idx].write(line)
+                        split_idx = (split_idx + 1) % num_splits
+                        kept += 1
+    finally:
+        for fh in split_fhs:
+            fh.close()
+
+    filter_pct = kept * 100 // max(total, 1)
+    logger.info(f"[{task_id}] prefilter: {total} → {kept} 条 ({filter_pct}%), "
+                f"拆分为 {num_splits} 个文件")
+
+    return [f for f in split_files if os.path.exists(f) and os.path.getsize(f) > 0]
+
+
+# ============================================================
 # Pipeline: fetch → tokenize → simulate → trend → 写入每日文件
 # ============================================================
 async def _process_task(task: dict, daemon_client) -> dict:
@@ -414,34 +475,46 @@ async def _process_task(task: dict, daemon_client) -> dict:
             logger.warning(f"[{task_id}] fetch: 无数据，跳过后续阶段")
             return None
 
-        # ---- Stage 2: Tokenize ----
-        logger.info(f"[{task_id}] tokenize: {len(jsonl_files)} files, models={models}")
+        # ---- Stage 1.5: Pre-filter & Split ----
+        num_daemons = cfg.get("pipeline_tokenize_concurrency", 2)
+        filtered_dir = os.path.join(task_data_dir, "filtered")
+        os.makedirs(filtered_dir, exist_ok=True)
+
+        split_files = _prefilter_and_split(jsonl_files, models, num_daemons, filtered_dir, task_id)
+
+        if not split_files:
+            logger.warning(f"[{task_id}] prefilter: 过滤后无数据，跳过 tokenize")
+            return None
+
+        # ---- Stage 2: Tokenize (并行 N 个 daemon) ----
+        logger.info(f"[{task_id}] tokenize: {len(split_files)} split files, models={models}")
         model_txt_files: Dict[str, List[str]] = {}
 
-        for jsonl_file in jsonl_files:
-            if not os.path.exists(jsonl_file) or os.path.getsize(jsonl_file) == 0:
-                continue
+        from concurrent.futures import ThreadPoolExecutor as _TPool
 
-            base_name = os.path.splitext(os.path.basename(jsonl_file))[0]
-            slice_output_dir = os.path.join(tokenized_dir, base_name)
-            os.makedirs(slice_output_dir, exist_ok=True)
+        def _tokenize_one_split(split_file):
+            base_name = os.path.splitext(os.path.basename(split_file))[0]
+            out_dir = os.path.join(tokenized_dir, base_name)
+            os.makedirs(out_dir, exist_ok=True)
+            return _tokenize_via_daemon(daemon_client, split_file, out_dir, base_name, models)
 
-            try:
-                loop = asyncio.get_event_loop()
-                summary = await loop.run_in_executor(
-                    None,
-                    lambda: _tokenize_via_daemon(
-                        daemon_client, jsonl_file, slice_output_dir,
-                        base_name, models,
-                    )
-                )
-                if summary.get("status") == "completed":
-                    for model, info in summary.get("models", {}).items():
-                        txt_file = info.get("file", "")
-                        if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
-                            model_txt_files.setdefault(model, []).append(txt_file)
-            except Exception as e:
-                logger.error(f"[{task_id}] tokenize failed for {jsonl_file}: {e}")
+        with _TPool(max_workers=len(split_files)) as pool:
+            future_map = {pool.submit(_tokenize_one_split, f): f for f in split_files}
+            for future in future_map:
+                split_file = future_map[future]
+                try:
+                    summary = future.result()
+                    if summary.get("status") == "completed":
+                        for model, info in summary.get("models", {}).items():
+                            txt_file = info.get("file", "")
+                            if txt_file and os.path.exists(txt_file) and os.path.getsize(txt_file) > 0:
+                                model_txt_files.setdefault(model, []).append(txt_file)
+                except Exception as e:
+                    logger.error(f"[{task_id}] tokenize failed for {split_file}: {e}")
+
+        # 清理预过滤临时文件
+        import shutil
+        shutil.rmtree(filtered_dir, ignore_errors=True)
 
         if not model_txt_files:
             logger.warning(f"[{task_id}] tokenize: 无有效输出")

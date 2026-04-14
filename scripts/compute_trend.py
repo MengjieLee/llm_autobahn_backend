@@ -45,6 +45,12 @@ _DEFAULT_OLAP_CONFIG = os.path.join(_BASE_DIR, "app", "conf", "olap_config.json"
 BJT = timezone(timedelta(hours=8))
 
 
+def _bjt_time(timestamp=None):
+    """将 UNIX 时间戳转换为北京时间 time.struct_time"""
+    dt = datetime.fromtimestamp(timestamp or _time.time(), tz=BJT)
+    return dt.timetuple()
+
+
 def _load_olap_config() -> dict:
     try:
         with open(_DEFAULT_OLAP_CONFIG, "r", encoding="utf-8") as f:
@@ -691,6 +697,7 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    logging.Formatter.converter = _bjt_time  # 全局强制北京时间
     parser = argparse.ArgumentParser(description="计算分钟级命中率趋势（回填已完成任务）")
     parser.add_argument("--status-dir", default=os.path.join(_BASE_DIR, "olap_database", "status"),
                         help="status 目录 (默认: olap_database/status)")
