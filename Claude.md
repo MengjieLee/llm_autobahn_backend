@@ -325,7 +325,7 @@ cache_calc section_hit_rate (0~1)
 | `checkpoint_tmpfs_dir` | /mnt/checkpoint_tmpfs | tmpfs 路径（内存盘，16Gi） |
 | `k8s_cpu_request/limit` | 28 | CPU 核数 |
 | `k8s_memory_request/limit` | 110Gi | 内存 |
-| `k8s_image` | ccr-...baidu.../llm_autobahn_backend:0.3.6 | 镜像 |
+| `k8s_image` | ccr-...baidu.../llm_autobahn_backend:0.4.0 | 镜像 |
 
 ### olap_config.json 要点
 

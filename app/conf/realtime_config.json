@@ -20,7 +20,7 @@
   "checkpoint_tmpfs_dir": "/mnt/checkpoint_tmpfs",
 
   "_comment_k8s": "实时kv_cache_全场景_各模型",
-  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.3.6",
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.4.0",
   "k8s_cpu_request": "28",
   "k8s_cpu_limit": "28",
   "k8s_memory_request": "110Gi",
