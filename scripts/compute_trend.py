@@ -421,7 +421,7 @@ def compute_trend(
     task_data_dir: str,
     cache_calc_path: str = _DEFAULT_CACHE_CALC,
     cache_size: int = 200000000,
-    block_size: int = 16,
+    block_size: int = 64,
     model_outputs: Optional[Dict[str, List[str]]] = None,
     max_workers: int = 8,
 ) -> dict:
@@ -594,7 +594,7 @@ def compute_and_save(
     task_data_dir: str,
     cache_calc_path: str = _DEFAULT_CACHE_CALC,
     cache_size: int = 200000000,
-    block_size: int = 16,
+    block_size: int = 64,
     model_outputs: Optional[Dict[str, List[str]]] = None,
     max_workers: int = 8,
 ) -> str:
@@ -624,7 +624,7 @@ def backfill(status_dir: str, data_dir: str, force: bool = False):
     """扫描所有已完成任务，生成趋势数据"""
     cfg = _load_olap_config()
     cache_size = cfg.get("pipeline_cache_size", 200000000)
-    block_size = cfg.get("pipeline_block_size", 16)
+    block_size = cfg.get("pipeline_block_size", 64)
 
     task_count = 0
     skip_count = 0

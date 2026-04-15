@@ -567,7 +567,7 @@ async def _process_task(task: dict, daemon_client) -> dict:
 
         cache_calc_path = os.path.join(BASE_DIR, "src/domains/kv/cache_hit_rate/cache_calc")
         cache_size = cfg.get("pipeline_cache_size", 200000000)
-        block_size = cfg.get("pipeline_block_size", 16)
+        block_size = cfg.get("pipeline_block_size", 64)
 
         model_hit_rates: Dict[str, float] = {}
 

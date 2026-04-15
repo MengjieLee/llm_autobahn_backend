@@ -44,7 +44,7 @@ KUBECONFIG_PATH = os.path.join(BASE_DIR, "app", "conf", "inner_cluster.kubeconfi
 # OLAP 热配置默认值（JSON 读取失败时的兜底）
 _OLAP_DEFAULTS = {
     "pipeline_default_model": "glm-5",
-    "pipeline_block_size": 16,
+    "pipeline_block_size": 64,
     "pipeline_cache_size": 200000000,
     "pipeline_tokenize_concurrency": 4,
     "pipeline_fetch_concurrency": 2,
@@ -433,7 +433,7 @@ async def _run_trend_stage(task_id: str):
 
         cfg = _load_olap_config()
         cache_size = cfg.get("pipeline_cache_size", 200000000)
-        block_size = cfg.get("pipeline_block_size", 16)
+        block_size = cfg.get("pipeline_block_size", 64)
 
         # 在线程池中执行（CPU 密集 + subprocess 调用）
         output_file = await asyncio.to_thread(
@@ -2390,7 +2390,7 @@ async def delete_task(task_id: str):
     - 已完成/失败: 直接标记 is_deleted
     - 运行中: 取消 asyncio.Task 后标记 is_deleted
     """
-    log_usage("delete_task", scenario="OLAP")
+    # log_usage("delete_task", scenario="OLAP")
     status = _read_status(task_id)
     if not status:
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")

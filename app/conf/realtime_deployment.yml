@@ -62,13 +62,11 @@ spec:
           livenessProbe:
             exec:
               command:
-                - python
+                - /bin/sh
                 - -c
                 - |
-                  import os, time
-                  hb = 'olap_database/realtime/worker_heartbeat'
-                  assert os.path.exists(hb), 'heartbeat file missing'
-                  assert os.path.getmtime(hb) > time.time() - 3000, 'heartbeat stale'
+                  test -f olap_database/realtime/worker_heartbeat && \
+                  [ $(( $(date +%s) - $(stat -c %Y olap_database/realtime/worker_heartbeat) )) -lt 3000 ]
             initialDelaySeconds: 300
             periodSeconds: 60
             timeoutSeconds: 10

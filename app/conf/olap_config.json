@@ -1,6 +1,6 @@
 {
   "pipeline_default_model": "glm-5",
-  "pipeline_block_size": 16,
+  "pipeline_block_size": 64,
   "pipeline_cache_size": 200000000,
   "pipeline_fetch_concurrency": 4,
   "pipeline_fetch_window_concurrency": 6,

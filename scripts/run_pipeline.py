@@ -104,7 +104,7 @@ def _now_bjt() -> str:
 
 _OLAP_DEFAULTS = {
     "pipeline_default_model": "glm-5",
-    "pipeline_block_size": 16,
+    "pipeline_block_size": 64,
     "pipeline_cache_size": 200000000,
     "pipeline_tokenize_concurrency": 4,
     "pipeline_fetch_concurrency": 2,
@@ -1010,6 +1010,15 @@ async def _run_simulate_stage(task_id: str):
 
     sim_done_count = [0]
     cfg = _load_olap_config()
+    # task 级 config 覆盖全局（支持 import_local_jsonl --block-size / --cache-size）
+    _task_status = _read_status(task_id)
+    _task_cfg = (_task_status or {}).get("config", {})
+    if _task_cfg.get("block_size"):
+        cfg["pipeline_block_size"] = _task_cfg["block_size"]
+        logger.info("[simulate] task config override: block_size=%s", _task_cfg["block_size"])
+    if _task_cfg.get("cache_size"):
+        cfg["pipeline_cache_size"] = _task_cfg["cache_size"]
+        logger.info("[simulate] task config override: cache_size=%s", _task_cfg["cache_size"])
     cache_calc_path = CACHE_CALC_PATH
 
     async def _simulate_single_model(model: str, txt_files: list) -> dict:
@@ -1442,8 +1451,11 @@ async def _run_trend_stage(task_id: str):
             return
 
         cfg = _load_olap_config()
-        cache_size = cfg.get("pipeline_cache_size", 200000000)
-        block_size = cfg.get("pipeline_block_size", 16)
+        # task 级 config 覆盖全局
+        _task_status = _read_status(task_id)
+        _task_cfg = (_task_status or {}).get("config", {})
+        cache_size = _task_cfg.get("cache_size") or cfg.get("pipeline_cache_size", 200000000)
+        block_size = _task_cfg.get("block_size") or cfg.get("pipeline_block_size", 64)
 
         output_file = await asyncio.to_thread(
             compute_and_save,
