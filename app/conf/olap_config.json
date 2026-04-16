@@ -23,7 +23,7 @@
   ],
   "namespace": "cache-hit-rate-tokenizer",
   "k8s_enabled": true,
-  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.3.6",
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.4.0",
   "k8s_job_cpu_request": "28",
   "k8s_job_cpu_limit": "28",
   "k8s_job_memory_request": "110Gi",
