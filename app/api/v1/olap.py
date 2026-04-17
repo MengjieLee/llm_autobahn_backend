@@ -2085,6 +2085,7 @@ async def kv_task_list(
     扫描 status/{username}/ 子目录，返回所有任务状态，按创建时间降序。
     支持按 username 精确过滤、按 task_name 模糊过滤。
     """
+    log_usage("kV-查阅任务", scenario="OLAP")
     tasks = []
     # 如果指定了 username，只扫描该用户目录；否则扫描全部
     if username:
@@ -2168,7 +2169,7 @@ async def es_fetch(
     提交全自动 pipeline 任务 (fetch → tokenize → simulate)。
     立即返回任务 ID，后台异步执行。
     """
-    log_usage("es_fetch", scenario="OLAP")
+    log_usage("KV-提交任务", scenario="OLAP")
     cfg = _load_olap_config()
 
     # path 默认值（热加载）
@@ -2390,7 +2391,7 @@ async def delete_task(task_id: str):
     - 已完成/失败: 直接标记 is_deleted
     - 运行中: 取消 asyncio.Task 后标记 is_deleted
     """
-    # log_usage("delete_task", scenario="OLAP")
+    log_usage("KV-中止任务", scenario="OLAP")
     status = _read_status(task_id)
     if not status:
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")

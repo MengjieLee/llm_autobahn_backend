@@ -2,8 +2,10 @@ import logging
 import os
 import glob
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
+
+_BJT = timezone(timedelta(hours=8))
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -362,7 +364,7 @@ async def usage_metrics(
     - timeline: 时间线趋势数据
     """
     # 计算起始时间
-    now = datetime.now()
+    now = datetime.now(_BJT)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     if start_date and end_date:
@@ -416,7 +418,7 @@ async def usage_users(
 
     返回每个用户的请求次数、最常用功能等信息
     """
-    now = datetime.now()
+    now = datetime.now(_BJT)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     if start_date and end_date:

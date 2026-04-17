@@ -1,5 +1,5 @@
 from app.conf.config import settings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import shutil
@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ===================== 模块级配置与常量（消除魔法值，提升可维护性）=====================
 logger = logging.getLogger(__name__)
+_BJT = timezone(timedelta(hours=8))  # 北京时间 UTC+8，与日志系统保持一致
 
 # 列相关常量
 ALLOW_COLUMNS = ["username", "token", "groups", "name", "created_at", "last_login", "is_active"]
@@ -160,9 +161,10 @@ async def add_or_update_user(token: str, username: str, groups_list: list, name:
     异步改造：文件I/O通过线程池执行，支持await调用
     :return: 用户字典 | None
     """
-    now = datetime.now()
+    now = datetime.now(_BJT)
     current_time = now.strftime(settings.TIME_FORMAT)
-    
+    is_new = False
+
     # 异步判断用户是否存在
     if await is_user_existed(token):
         # 异步更新用户信息（调用异步update_user）
@@ -209,9 +211,12 @@ async def add_or_update_user(token: str, username: str, groups_list: list, name:
             return None
         
         logger.info(f"👤 成功追加用户：{username} | 姓名：{name} | 状态：{'启用' if is_active==1 else '禁用'}")
-    
+        is_new = True
+
     # 异步返回用户完整数据
-    return await get_user(token)
+    user_data = await get_user(token)
+    user_data["is_new"] = is_new
+    return user_data
 
 async def is_user_existed(target_token: str) -> bool:
     """
@@ -245,8 +250,8 @@ async def is_user_valid(target_token: str) -> bool:
     
     # 校验登录是否过期
     try:
-        last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT)
-        if datetime.now() > last_login_time + timedelta(days=USER_LOGIN_VALID_DAYS):
+        last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT).replace(tzinfo=_BJT)
+        if datetime.now(_BJT) > last_login_time + timedelta(days=USER_LOGIN_VALID_DAYS):
             logger.warning(f"❌ 用户【{username}】已存在且未登录超过{USER_LOGIN_VALID_DAYS}天！请重新登录！")
             return False
     except ValueError as e:

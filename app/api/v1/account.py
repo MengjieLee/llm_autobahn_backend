@@ -54,7 +54,6 @@ async def login(
     request: Request,
     zt_authorization: ZtAuthorizationHeader = None
 ) -> StandardResponse[AccountResponseData]:
-    log_usage("login", scenario="AUTH")
     # 调试：打印收到的 headers
     logger.info(f"收到的所有 Headers: {dict(request.headers)}")
     logger.info(f"X-Zt-Authorization: {zt_authorization}")
@@ -82,6 +81,8 @@ async def login(
         groups=user_dict.get("groups"),
     ))
     logger.info(f"零信任网关验证结束.")
+    auth_msg = "老用户登录" if not user_dict.get("is_new", False) else "新用户注册"
+    log_usage(auth_msg, scenario="API", user=name or username)
     return StandardResponse[AccountResponseData](
         code=0,
         message="success",
