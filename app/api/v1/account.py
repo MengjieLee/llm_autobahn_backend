@@ -81,7 +81,7 @@ async def login(
         groups=user_dict.get("groups"),
     ))
     logger.info(f"零信任网关验证结束.")
-    auth_msg = "老用户登录" if not user_dict.get("is_new", False) else "新用户注册"
+    auth_msg = "老用户 re-login" if not user_dict.get("is_new", False) else "新用户注册"
     log_usage(auth_msg, scenario="API", user=name or username)
     return StandardResponse[AccountResponseData](
         code=0,

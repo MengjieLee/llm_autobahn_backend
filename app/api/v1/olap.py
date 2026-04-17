@@ -1736,7 +1736,7 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
 
             trend = _read_trend_for_task(task_id)
             if not trend or not trend.get("series"):
-                result[scenario] = {"task_id": task_id, "points": [], "stats": {"mean": 0, "max": 0, "min": 0}, "models": {}}
+                result[scenario] = {"task_id": task_id, "points": [], "stats": {"last": 0, "mean": 0, "max": 0, "min": 0}, "models": {}}
                 continue
 
             # 解析 trend 数据
@@ -1782,6 +1782,7 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
                     models[model_name] = {
                         "points": m_points,
                         "stats": {
+                            "last": round(m_rates[-1], 2) if m_rates else 0,
                             "mean": round(sum(m_rates) / len(m_rates), 2) if m_rates else 0,
                             "max": max(m_rates) if m_rates else 0,
                             "min": min(m_rates) if m_rates else 0,
@@ -1790,6 +1791,7 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
 
             rates = [p["hit_rate"] for p in points]
             stats = {
+                "last": round(rates[-1], 2) if rates else 0,
                 "mean": round(sum(rates) / len(rates), 2) if rates else 0,
                 "max": max(rates) if rates else 0,
                 "min": min(rates) if rates else 0,
@@ -1817,7 +1819,7 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
             overall_points, models_points = _aggregate_task_trends_to_points(tasks, year, cutoff_naive, now_naive)
 
             if not overall_points:
-                result[scenario] = {"task_id": task_id, "points": [], "stats": {"mean": 0, "max": 0, "min": 0}, "models": {}}
+                result[scenario] = {"task_id": task_id, "points": [], "stats": {"last": 0, "mean": 0, "max": 0, "min": 0}, "models": {}}
                 continue
 
             # 计算统计数据
@@ -1864,11 +1866,12 @@ def _load_realtime_daily(scenario: str, date_str: str) -> dict:
 
 
 def _compute_stats(data_points: list) -> dict:
-    """计算 mean / max / min"""
+    """计算 mean / max / min / last"""
     rates = [p["hit_rate"] for p in data_points if p.get("hit_rate") is not None]
     if not rates:
-        return {"mean": 0, "max": 0, "min": 0}
+        return {"last": 0, "mean": 0, "max": 0, "min": 0}
     return {
+        "last": round(rates[-1], 2),
         "mean": round(sum(rates) / len(rates), 2),
         "max": round(max(rates), 2),
         "min": round(min(rates), 2),

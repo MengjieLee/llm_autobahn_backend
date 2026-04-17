@@ -120,7 +120,7 @@ def _parse_log_line(line: str) -> Optional[Dict[str, Any]]:
             return None
 
         # 解析时间
-        log_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        log_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_BJT)
 
         return {
             "timestamp": log_time,
@@ -369,9 +369,9 @@ async def usage_metrics(
     today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     if start_date and end_date:
         try:
-            query_start = datetime.strptime(start_date, "%Y-%m-%d")
+            query_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=_BJT)
             query_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
-                hour=23, minute=59, second=59
+                hour=23, minute=59, second=59, tzinfo=_BJT
             )
         except ValueError:
             raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
@@ -423,9 +423,9 @@ async def usage_users(
     today_end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
     if start_date and end_date:
         try:
-            query_start = datetime.strptime(start_date, "%Y-%m-%d")
+            query_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=_BJT)
             query_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
-                hour=23, minute=59, second=59
+                hour=23, minute=59, second=59, tzinfo=_BJT
             )
         except ValueError:
             raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD")
