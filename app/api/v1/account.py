@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.conf.config import settings
 from app.core.api_schema import StandardResponse, ErrorResponse
 from app.core.request_context import log_usage
-from context.auth_client import add_or_update_user
+from context.auth_client import add_or_update_user, is_user_existed, is_user_valid, update_user, get_user
 
 
 logger = logging.getLogger(__name__)
@@ -89,3 +89,70 @@ async def login(
         data=data,
         trace_id=None
     )
+
+
+AuthorizationHeader = Annotated[
+    str | None,
+    Header(
+        alias="Authorization",
+        description="Vortex token 令牌，用于解析用户信息",
+    )
+]
+
+class TokenAuthResponseData(BaseModel):
+    token: str = Field(..., description="token")
+
+
+@router.get(
+    "/auth",
+    response_model=StandardResponse[TokenAuthResponseData],
+    summary="快速验证用户 token",
+    description="从 Header 中解析 authorization 返回当前应用的用户信息",
+)
+async def auth(
+    request: Request,
+    authorization: AuthorizationHeader = None
+) -> StandardResponse[TokenAuthResponseData]:
+    # 调试：打印收到的 headers
+    logger.info(f"收到的所有 Headers: {dict(request.headers)}")
+
+    logger.info(f"用户 token 验证开始.")
+
+    if not authorization:
+        logger.error(f"用户 token 校验失败: Header 中无有效的 authorization")
+        return ErrorResponse(
+            code=400,
+            message="用户 token 校验失败",
+            detail="Header 中无有效的 authorization"
+        )
+
+    token = authorization.replace("Bearer ", "")
+    is_existed = await is_user_existed(token)
+    if not is_existed:
+        logger.error(f"用户 token 校验失败: 用户不存在")
+        return ErrorResponse(
+            code=400,
+            message="用户不存在, 请前往零信任网关完成登录",
+            detail="用户不存在, 请前往零信任网关完成登录"
+        )
+    
+    user_dict = await get_user(token)
+    name = user_dict.get("name")
+    username = user_dict.get("username")
+
+    is_valid = await is_user_valid(token)
+    if not is_valid:
+        await update_user(token, "name", name)
+        await update_user(token, "last_login", current_time)
+        logger.info(f"👤 用户【{username}】已存在！更新最后一次登录时间")
+        log_usage("老用户", scenario="API", user=name or username)
+
+    logger.info(f"用户 token 验证结束.")
+    data = TokenAuthResponseData(token=token)
+    return StandardResponse[TokenAuthResponseData](
+        code=0,
+        message="success",
+        data=data,
+        trace_id=None
+    )
+

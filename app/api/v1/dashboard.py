@@ -93,6 +93,9 @@ async def users_metrics(
 # 需要忽略的无效值
 INVALID_VALUES = {"", "-", "unknown", "Unknown", "UNKNOWN", None}
 
+# 需要从统计中排除的用户名
+EXCLUDED_USERS = {"李梦杰"}
+
 
 def _is_valid_value(value: Optional[str]) -> bool:
     """检查值是否有效（非空、非 '-'、非 'unknown'）"""
@@ -182,6 +185,9 @@ def _read_all_usage_logs(
         if uf == LEGACY_LOG_FILE:
             continue  # 避免重复读取
         all_entries.extend(_read_log_entries(uf, start_date, end_date))
+
+    # 排除指定用户
+    all_entries = [e for e in all_entries if e.get("user") not in EXCLUDED_USERS]
 
     # 按时间排序
     all_entries.sort(key=lambda e: e["timestamp"])
