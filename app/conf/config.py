@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     ES_PASSWORD: str = Field(default="")
     ES_INDEX_PREFIX: str = "as-qianfan-online_"
     ES_WINDOW_MINUTES: int = 1                      # 单次 scroll 查询的时间窗口（分钟）
-    ES_DEFAULT_APP_ID: str = "app-3Lut8O2E"
+    ES_DEFAULT_APP_ID: str = ""
 
     # Pipeline / QPD 参数已迁移至 app/conf/olap_config.json（热更新，无需重启）
 
