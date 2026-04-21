@@ -10,7 +10,7 @@
 
 用法：
 - 手动执行: python scripts/daily_report.py
-- crontab:  0 10 * * * cd /path/to/backend && python scripts/daily_report.py >> logs/daily/daily_report_$(date +\%Y-\%m-\%d).log 2>&1
+- crontab:  0 10 * * * cd /path/to/backend && python scripts/daily_report.py >> logs/daily/daily_report_$(date +%%Y-%%m-%%d).log 2>&1
 
 配置读取 olap_config.json 中的:
 - notify_im_bot_url
@@ -142,10 +142,11 @@ def save_daily_report(date_label: str, tasks: List[dict]) -> int:
         if scenario in scenarios:
             continue
 
-        # 计算整体汇总
-        total_hit = sum(r.get("hit_count", 0) for r in result.values())
-        total_queries = sum(r.get("total_queries", 0) for r in result.values())
-        total_tokens = sum(r.get("total_tokens", 0) for r in result.values())
+        # 计算整体汇总（跳过非 dict 的值，如顶层汇总字段）
+        model_results = [r for r in result.values() if isinstance(r, dict)]
+        total_hit = sum(r.get("hit_count", 0) for r in model_results)
+        total_queries = sum(r.get("total_queries", 0) for r in model_results)
+        total_tokens = sum(r.get("total_tokens", 0) for r in model_results)
         hit_rate_pct = round((total_hit / total_queries * 100), 2) if total_queries > 0 else 0
 
         scenarios[scenario] = {
@@ -161,9 +162,11 @@ def save_daily_report(date_label: str, tasks: List[dict]) -> int:
                     "total_tokens": stats.get("total_tokens", 0),
                 }
                 for model, stats in result.items()
+                if isinstance(stats, dict)
             },
             "updated_at": task.get("updated_at", ""),
         }
+
         written += 1
 
     if written > 0:
@@ -221,6 +224,8 @@ def format_report(task: dict, target_date: str, detail_url: str, task_id: str = 
     total_queries = 0
     total_tokens = 0
     for stats in result.values():
+        if not isinstance(stats, dict):
+            continue
         total_hit += stats.get("hit_count", 0)
         total_queries += stats.get("total_queries", 0)
         total_tokens += stats.get("total_tokens", 0)
@@ -228,7 +233,9 @@ def format_report(task: dict, target_date: str, detail_url: str, task_id: str = 
 
     # 构建各模型明细
     model_lines = []
-    for model, stats in sorted(result.items(), key=lambda x: x[1].get("hit_rate_percent", 0), reverse=True):
+    for model, stats in sorted(result.items(), key=lambda x: x[1].get("hit_rate_percent", 0) if isinstance(x[1], dict) else 0, reverse=True):
+        if not isinstance(stats, dict):
+            continue
         rate = stats.get("hit_rate_percent", 0)
         hit = stats.get("hit_count", 0)
         total = stats.get("total_queries", 0)
