@@ -2083,14 +2083,18 @@ async def kv_qpd(request: Request):
 async def kv_task_list(
     username: Optional[str] = Query(default=None, description="按创建人 username 过滤"),
     task_name: Optional[str] = Query(default=None, description="按任务名模糊过滤"),
+    status: Optional[str] = Query(default=None, description="按 pipeline 阶段过滤: done/failed/cancelled/running 等"),
+    page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(default=20, ge=1, le=100, description="每页条数，默认 20"),
 ):
     """
-    扫描 status/{username}/ 子目录，返回所有任务状态，按创建时间降序。
-    支持按 username 精确过滤、按 task_name 模糊过滤。
+    扫描 status/{username}/ 子目录，返回任务状态，按创建时间降序。
+    支持按 username 精确过滤、按 task_name 模糊过滤、按 status 过滤、分页。
     """
     log_usage("kV-查阅任务", scenario="OLAP")
-    tasks = []
-    # 如果指定了 username，只扫描该用户目录；否则扫描全部
+
+    # ---------- 1. 收集所有候选 JSON 文件路径 ----------
+    file_paths = []
     if username:
         user_dirs = [os.path.join(KV_STATUS_DIR, username)]
     else:
@@ -2107,26 +2111,53 @@ async def kv_task_list(
         if not os.path.isdir(user_dir):
             continue
         for filename in os.listdir(user_dir):
-            if not filename.endswith(".json"):
-                continue
-            filepath = os.path.join(user_dir, filename)
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    task = json.load(f)
-            except Exception:
+            if filename.endswith(".json"):
+                file_paths.append(os.path.join(user_dir, filename))
+
+    # ---------- 2. 按文件修改时间降序排列（免解析 JSON 即可排序） ----------
+    file_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+    # ---------- 3. 流式读取 + 过滤 + 分页 ----------
+    TERMINAL_STAGES = {"done", "failed", "cancelled"}
+    tasks = []
+    total = 0
+    skip = (page - 1) * page_size
+
+    for filepath in file_paths:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                task = json.load(f)
+        except Exception:
+            continue
+
+        # 排除已删除任务
+        if task.get("is_deleted"):
+            continue
+        # 按 task_name 模糊过滤
+        if task_name and task_name not in task.get("task_name", ""):
+            continue
+        # 按 pipeline 阶段过滤
+        if status:
+            stage = (task.get("pipeline") or {}).get("current_stage", "")
+            if status == "running":
+                if stage in TERMINAL_STAGES or not stage:
+                    continue
+            elif stage != status:
                 continue
 
-            # 排除已删除任务
-            if task.get("is_deleted"):
-                continue
-            # 按 task_name 模糊过滤
-            if task_name and task_name not in task.get("task_name", ""):
-                continue
-
+        total += 1
+        # 仅收集当前页的数据
+        if total > skip and len(tasks) < page_size:
             tasks.append(task)
 
+    # 已按 mtime 降序遍历，但做一次精确排序确保一致性
     tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
-    return StandardResponse(code=0, message="success", data=tasks, trace_id=None)
+
+    return StandardResponse(
+        code=0, message="success",
+        data={"items": tasks, "total": total, "page": page, "page_size": page_size},
+        trace_id=None,
+    )
 
 
 @router.get("/kv/fetch", summary="提交ES查询任务（异步）")
