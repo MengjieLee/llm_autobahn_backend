@@ -255,6 +255,8 @@ def format_report(task: dict, target_date: str, detail_url: str, task_id: str = 
 **各模型命中率 🎯**
 {chr(10).join(model_lines)}
 
+**任务 ID 🏷**: `{task_id}`
+
 [✨✨ 查看明细数据 ✨✨]({detail_url}/{task_id})"""
 
     return content
