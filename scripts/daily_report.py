@@ -201,7 +201,24 @@ def find_daily_overview_tasks(target_date: str) -> List[dict]:
     return overview_tasks
 
 
-def format_report(task: dict, target_date: str, detail_url: str, task_id: str = "") -> str:
+def find_daily_intl_tasks(target_date: str) -> List[dict]:
+    """
+    查找指定日期的国际站任务。
+    target_date: "04-01" 格式
+
+    匹配规则：
+    - "04-11_国际站_全场景_glm+dsv32" → 国际站全场景任务
+    """
+    tasks = find_daily_tasks(target_date)
+    intl_tasks = []
+    for task in tasks:
+        task_name = task.get("task_name", "")
+        if "国际站" in task_name:
+            intl_tasks.append(task)
+    return intl_tasks
+
+
+def format_report(task: dict, target_date: str, detail_url: str, task_id: str = "", label: str = "") -> str:
     """
     格式化报告内容（Markdown）
     """
@@ -248,7 +265,9 @@ def format_report(task: dict, target_date: str, detail_url: str, task_id: str = 
 
     overall_color = "green" if overall_rate >= 50 else ("orange" if overall_rate >= 20 else "red")
 
-    content = f"""##### 📊 KV Cache 模拟命中日报 (🗓️{data_date}{time_segment})
+    label_str = f" - {label}" if label else ""
+
+    content = f"""##### 📊 KV Cache 模拟命中日报{label_str} (🗓️{data_date}{time_segment})
 
 **整体命中率 🎯**: <font color="{overall_color}">{overall_rate:.1f}%</font>  命中 {total_hit:,} / {total_queries:,} 次  tokens {total_tokens:,}
 
@@ -294,6 +313,30 @@ def main():
 
     print(f"[daily_report] 查找 {target_date} 的已完成任务...")
 
+    # 加载配置（日报专用配置，fallback 到通用配置）
+    config = load_config()
+    bot_url = config.get("daily_report_im_bot_url") or config.get("notify_im_bot_url", "")
+    bot_toid = config.get("daily_report_im_bot_toid") or config.get("notify_im_bot_toid", [])
+    detail_url = config.get("daily_report_detail_url", "https://vortex.n.baidu-int.com/olap/discovery")
+
+    # 查找国际站任务推送 IM
+    intl_tasks = find_daily_intl_tasks(target_date)
+    if intl_tasks:
+        print(f"[daily_report] 找到 {len(intl_tasks)} 个国际站任务")
+        for task in intl_tasks:
+            task_name = task.get("task_name", "")
+            task_id = task.get("task_id", "")
+            print(f"[daily_report] 推送国际站任务: {task_name}")
+
+            content = format_report(task, target_date, detail_url, task_id, label="国际站")
+            print("[daily_report] 报告内容:")
+            print(content)
+            print()
+
+            send_im_notification(content, bot_url, bot_toid)
+    else:
+        print(f"[daily_report] 未找到 {target_date} 的国际站任务")
+
     # 查找所有已完成任务并写入 daily_reports/
     tasks = find_daily_tasks(target_date)
     if tasks:
@@ -309,12 +352,6 @@ def main():
         return
 
     print(f"[daily_report] 找到 {len(overview_tasks)} 个全场景任务")
-
-    # 加载配置（日报专用配置，fallback 到通用配置）
-    config = load_config()
-    bot_url = config.get("daily_report_im_bot_url") or config.get("notify_im_bot_url", "")
-    bot_toid = config.get("daily_report_im_bot_toid") or config.get("notify_im_bot_toid", [])
-    detail_url = config.get("daily_report_detail_url", "https://vortex.n.baidu-int.com/olap/discovery")
 
     if not bot_url or not bot_toid:
         print("[daily_report] 未配置 IM bot，跳过推送")
@@ -332,7 +369,6 @@ def main():
         print()
 
         send_im_notification(content, bot_url, bot_toid)
-
 
 if __name__ == "__main__":
     main()
