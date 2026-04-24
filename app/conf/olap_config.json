@@ -10,7 +10,7 @@
   "pipeline_tokenize_batch_size": 1000,
   "pipeline_slice_minutes": 60,
   "pipeline_es_scroll_size": 2000,
-  "pipeline_default_path": "/v2/coding/chat/completions",
+  "pipeline_default_path": "",
   "olap_qpd_limit": 100,
   "models": [
     "glm-5",
