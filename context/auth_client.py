@@ -22,6 +22,9 @@ LAST_LOGIN_COLUMN_INDEX = 5
 USER_LOGIN_VALID_DAYS = 7
 IS_ACTIVE_VALID_VALUES = (0, 1)
 
+# 永久有效用户（不受 7 天登录过期限制，用于定时任务等服务场景）
+PERMANENT_USERS = {"v_limengjie03"}
+
 # 格式对齐常量（保留原有格式，统一维护）
 COLUMN_WIDTHS = {
     "username": 20,
@@ -242,12 +245,16 @@ async def is_user_valid(target_token: str) -> bool:
     username = target_columns[0]
     is_active = int(target_columns[IS_ACTIVE_COLUMN_INDEX])
     last_login_str = target_columns[LAST_LOGIN_COLUMN_INDEX]
-    
+
     # 校验账号是否激活
     if is_active == 0:
         logger.warning(f"❌ 用户【{username}】已存在且账号未激活！")
         return False
-    
+
+    # 永久用户跳过登录过期校验
+    if username.strip() in PERMANENT_USERS:
+        return True
+
     # 校验登录是否过期
     try:
         last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT).replace(tzinfo=_BJT)
