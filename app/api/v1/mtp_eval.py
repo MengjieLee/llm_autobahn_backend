@@ -236,6 +236,18 @@ async def cancel_task(
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
+@router.post("/tasks/{task_id}/continue", summary="继续评测任务")
+async def continue_task(
+    task_id: str,
+    service: MtpEvalService = Depends(get_service),
+) -> StandardResponse[dict]:
+    log_usage("mtp_eval_continue_task")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id 不能为空")
+    data = await service.continue_task(task_id)
+    return StandardResponse(code=0, message="success", data=data, trace_id=None)
+
+
 # ------------------------------------------------------------------
 # Statistics
 # ------------------------------------------------------------------

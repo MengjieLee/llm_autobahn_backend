@@ -21,7 +21,7 @@ class MtpEvalClient:
         headers = {
             "Vortex-API-PreAuth": "1",
             "fastmtp_eval_session": "76f3e7fcaa2a4c00ae790c45678bf9e8",
-            "Cookie": "fastmtp_eval_session=46f976146fb643ea93bef20c25728627",
+            "Cookie": "fastmtp_eval_session=523a2ef5650549fb99d769e389e9b9c9",
         }
         cookies = {}
         if auth_token:
@@ -147,6 +147,12 @@ class MtpEvalClient:
     def cancel_task(self, task_id: str) -> dict:
         logger.debug("请求取消评测任务，task_id=%s", task_id)
         response = self.client.post(f"/tasks/{task_id}/cancel")
+        response.raise_for_status()
+        return response.json()
+
+    def continue_task(self, task_id: str) -> dict:
+        logger.debug("请求继续评测任务，task_id=%s", task_id)
+        response = self.client.post(f"/tasks/{task_id}/continue")
         response.raise_for_status()
         return response.json()
 

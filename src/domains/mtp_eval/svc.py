@@ -130,6 +130,12 @@ class MtpEvalService:
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "取消评测任务")
 
+    async def continue_task(self, task_id: str) -> dict:
+        try:
+            return self.client.continue_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_error(exc, "继续评测任务")
+
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
