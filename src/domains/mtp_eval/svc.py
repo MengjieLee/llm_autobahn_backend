@@ -25,7 +25,7 @@ class MtpEvalService:
 
     async def list_benches(self) -> list:
         try:
-            return self.client.list_benches()
+            return await self.client.list_benches()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取基准测试列表")
 
@@ -35,19 +35,19 @@ class MtpEvalService:
 
     async def list_connectors(self) -> list:
         try:
-            return self.client.list_connectors()
+            return await self.client.list_connectors()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取连接器列表")
 
     async def create_connector(self, payload: dict) -> dict:
         try:
-            return self.client.create_connector(payload)
+            return await self.client.create_connector(payload)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "创建连接器")
 
     async def list_connector_presets(self) -> list:
         try:
-            return self.client.list_connector_presets()
+            return await self.client.list_connector_presets()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取连接器预设列表")
 
@@ -57,19 +57,19 @@ class MtpEvalService:
 
     async def list_service_profiles(self) -> list:
         try:
-            return self.client.list_service_profiles()
+            return await self.client.list_service_profiles()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取服务模板列表")
 
     async def create_service_profile(self, payload: dict) -> dict:
         try:
-            return self.client.create_service_profile(payload)
+            return await self.client.create_service_profile(payload)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "创建服务模板")
 
     async def list_service_presets(self) -> list:
         try:
-            return self.client.list_service_presets()
+            return await self.client.list_service_presets()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取服务预设列表")
 
@@ -79,7 +79,7 @@ class MtpEvalService:
 
     async def list_task_presets(self) -> list:
         try:
-            return self.client.list_task_presets()
+            return await self.client.list_task_presets()
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取任务预设列表")
 
@@ -89,7 +89,7 @@ class MtpEvalService:
 
     async def preview_service(self, payload: dict) -> dict:
         try:
-            return self.client.preview_service(payload)
+            return await self.client.preview_service(payload)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "预览服务部署脚本")
 
@@ -99,8 +99,7 @@ class MtpEvalService:
 
     async def list_tasks(self) -> list:
         try:
-            tasks = self.client.list_tasks()
-            # 按创建时间降序排列
+            tasks = await self.client.list_tasks()
             tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
             return tasks
         except Exception as exc:  # noqa: BLE001
@@ -108,31 +107,31 @@ class MtpEvalService:
 
     async def get_task(self, task_id: str) -> dict:
         try:
-            return self.client.get_task(task_id)
+            return await self.client.get_task(task_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取评测任务详情")
 
     async def get_task_launch_config(self, task_id: str) -> dict:
         try:
-            return self.client.get_task_launch_config(task_id)
+            return await self.client.get_task_launch_config(task_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取任务启动配置")
 
     async def launch_task(self, payload: dict) -> dict:
         try:
-            return self.client.launch_task(payload)
+            return await self.client.launch_task(payload)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "发起评测任务")
 
     async def cancel_task(self, task_id: str) -> dict:
         try:
-            return self.client.cancel_task(task_id)
+            return await self.client.cancel_task(task_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "取消评测任务")
 
     async def continue_task(self, task_id: str) -> dict:
         try:
-            return self.client.continue_task(task_id)
+            return await self.client.continue_task(task_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "继续评测任务")
 
@@ -142,7 +141,7 @@ class MtpEvalService:
 
     async def get_stats(self, hours: int = 24) -> dict:
         try:
-            return self.client.get_stats(hours)
+            return await self.client.get_stats(hours)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "获取统计数据")
 

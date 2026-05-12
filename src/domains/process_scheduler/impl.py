@@ -19,25 +19,25 @@ class ProcessSchedulerClient:
             raise ValueError("PROCESS_SCHEDULER_HOST 未配置")
 
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        self.client = httpx.Client(
+        self.client = httpx.AsyncClient(
             base_url=f"{host}/api/v1",
             headers=headers,
             timeout=20.0,
         )
 
-    def list_job(self, params: Optional[dict] = None) -> dict:
+    async def list_job(self, params: Optional[dict] = None) -> dict:
         logger.debug("请求列表任务，params=%s", params)
-        response = self.client.get("/jobs", params=params)
+        response = await self.client.get("/jobs", params=params)
         response.raise_for_status()
         return response.json()
 
-    def stop_job(self, job_id: str) -> dict:
+    async def stop_job(self, job_id: str) -> dict:
         logger.debug("请求停止任务，job_id=%s", job_id)
-        response = self.client.post(f"/jobs/{job_id}/stop")
+        response = await self.client.post(f"/jobs/{job_id}/stop")
         response.raise_for_status()
         return response.json()
 
-    def start_job(
+    async def start_job(
         self,
         pipeline_id: str,
         queue: str,
@@ -51,17 +51,17 @@ class ProcessSchedulerClient:
             "parameters": parameters,
         }
         logger.debug("请求启动任务，payload=%s", payload)
-        response = self.client.post("/jobs", json=payload)
+        response = await self.client.post("/jobs", json=payload)
         response.raise_for_status()
         return response.json()
 
-    def delete_job(self, job_id: str) -> dict:
+    async def delete_job(self, job_id: str) -> dict:
         logger.debug("请求删除任务，job_id=%s", job_id)
-        response = self.client.delete(f"/jobs/{job_id}")
+        response = await self.client.delete(f"/jobs/{job_id}")
         response.raise_for_status()
         return response.json()
 
-    def create_pipeline(
+    async def create_pipeline(
         self,
         pipeline_name: str,
         yaml_content: str,
@@ -86,7 +86,7 @@ class ProcessSchedulerClient:
 
         try:
             logger.debug("请求创建 pipeline，name=%s, files=%s", pipeline_name, files)
-            response = self.client.post("/pipelines", files=form_data)
+            response = await self.client.post("/pipelines", files=form_data)
             response.raise_for_status()
             return response.json()
         finally:
@@ -98,20 +98,20 @@ class ProcessSchedulerClient:
                 ):
                     value[1].close()
 
-    def list_pipeline(self, params: Optional[dict] = None) -> dict:
+    async def list_pipeline(self, params: Optional[dict] = None) -> dict:
         logger.debug("请求列表 pipeline，params=%s", params)
-        response = self.client.get("/pipelines", params=params)
+        response = await self.client.get("/pipelines", params=params)
         response.raise_for_status()
         return response.json()
 
-    def delete_pipeline(self, pipeline_id: str) -> dict:
+    async def delete_pipeline(self, pipeline_id: str) -> dict:
         logger.debug("请求删除 pipeline，pipeline_id=%s", pipeline_id)
-        response = self.client.delete(f"/pipelines/{pipeline_id}")
+        response = await self.client.delete(f"/pipelines/{pipeline_id}")
         response.raise_for_status()
         return response.json()
 
-    def get_pipeline_detail(self, pipeline_id: str) -> dict:
+    async def get_pipeline_detail(self, pipeline_id: str) -> dict:
         logger.debug("请求获取 pipeline 详情，pipeline_id=%s", pipeline_id)
-        response = self.client.get(f"/pipelines/{pipeline_id}")
+        response = await self.client.get(f"/pipelines/{pipeline_id}")
         response.raise_for_status()
         return response.json()

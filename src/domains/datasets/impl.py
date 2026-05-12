@@ -136,22 +136,20 @@ class DatasetsClient:
             raise ValueError("META_DATA_HOST 未配置")
 
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        self.client = httpx.Client(
+        self.client = httpx.AsyncClient(
             base_url=host,
             headers=headers,
             timeout=20.0,
         )
 
-    def list_datasets(self, filter: Optional[DatasetList] = None) -> List[Dict]:
+    async def list_datasets(self, filter: Optional[DatasetList] = None) -> List[Dict]:
         if filter:
-            # 在不动 mtdata 代码基础上而作的特判去适配 groups 为空列表的情况返回空的数据集
             filter_dict = filter.model_dump()
             if "groups" in filter_dict and not filter_dict["groups"]:
                 filter_dict["groups"] = ['']
             filter_dict = {k: v for k, v in filter_dict.items() if v is not None}
             logger.debug(f"filter: {filter_dict}")
-            resp = self.client.post(
-                # "/datasets/list", json=filter.model_dump(exclude_none=True)
+            resp = await self.client.post(
                 "/datasets/list", json=filter_dict
             )
             resp.raise_for_status()
@@ -162,10 +160,10 @@ class DatasetsClient:
                     dataset for dataset in resp
                     if filter_name in _normalize_name(dataset["name"])
                 ]
-            
+
             return resp
         else:
-            resp = self.client.get("/datasets")
+            resp = await self.client.get("/datasets")
             resp.raise_for_status()
             return resp.json()
 

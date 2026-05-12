@@ -21,7 +21,7 @@ class DatasetsService:
 
     async def list_datasets(self, filter: Optional[DatasetList] = None) -> list:
         try:
-            return self.client.list_datasets(filter)
+            return await self.client.list_datasets(filter)
         except Exception as exc:
             self._handle_error(exc, "查询数据集列表失败")
 

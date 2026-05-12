@@ -1,6 +1,5 @@
 import logging
 import os
-from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -26,15 +25,14 @@ class MtpEvalClient:
         cookies = {}
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
-        self.client = httpx.Client(
+        self.client = httpx.AsyncClient(
             base_url=f"{host}/api/v2",
             headers=headers,
             cookies=cookies,
             timeout=60.0,
             verify=False,
         )
-        # v1 客户端用于统计等接口
-        self.client_v1 = httpx.Client(
+        self.client_v1 = httpx.AsyncClient(
             base_url=f"{host}/api/v1",
             headers=headers,
             cookies=cookies,
@@ -46,9 +44,9 @@ class MtpEvalClient:
     # Benchmarks
     # ------------------------------------------------------------------
 
-    def list_benches(self) -> list:
+    async def list_benches(self) -> list:
         logger.debug("请求获取基准测试列表")
-        response = self.client.get("/benches")
+        response = await self.client.get("/benches")
         response.raise_for_status()
         return response.json()
 
@@ -56,21 +54,21 @@ class MtpEvalClient:
     # Connectors
     # ------------------------------------------------------------------
 
-    def list_connectors(self) -> list:
+    async def list_connectors(self) -> list:
         logger.debug("请求获取连接器列表")
-        response = self.client.get("/connectors")
+        response = await self.client.get("/connectors")
         response.raise_for_status()
         return response.json()
 
-    def create_connector(self, payload: dict) -> dict:
+    async def create_connector(self, payload: dict) -> dict:
         logger.debug("请求创建连接器，payload=%s", payload)
-        response = self.client.post("/connectors", json=payload)
+        response = await self.client.post("/connectors", json=payload)
         response.raise_for_status()
         return response.json()
 
-    def list_connector_presets(self) -> list:
+    async def list_connector_presets(self) -> list:
         logger.debug("请求获取连接器预设列表")
-        response = self.client.get("/connector-presets")
+        response = await self.client.get("/connector-presets")
         response.raise_for_status()
         return response.json()
 
@@ -78,21 +76,21 @@ class MtpEvalClient:
     # Service Profiles
     # ------------------------------------------------------------------
 
-    def list_service_profiles(self) -> list:
+    async def list_service_profiles(self) -> list:
         logger.debug("请求获取服务模板列表")
-        response = self.client.get("/service-profiles")
+        response = await self.client.get("/service-profiles")
         response.raise_for_status()
         return response.json()
 
-    def create_service_profile(self, payload: dict) -> dict:
+    async def create_service_profile(self, payload: dict) -> dict:
         logger.debug("请求创建服务模板，payload=%s", payload)
-        response = self.client.post("/service-profiles", json=payload)
+        response = await self.client.post("/service-profiles", json=payload)
         response.raise_for_status()
         return response.json()
 
-    def list_service_presets(self) -> list:
+    async def list_service_presets(self) -> list:
         logger.debug("请求获取服务预设列表")
-        response = self.client.get("/service-presets")
+        response = await self.client.get("/service-presets")
         response.raise_for_status()
         return response.json()
 
@@ -100,9 +98,9 @@ class MtpEvalClient:
     # Task Presets
     # ------------------------------------------------------------------
 
-    def list_task_presets(self) -> list:
+    async def list_task_presets(self) -> list:
         logger.debug("请求获取任务预设列表")
-        response = self.client.get("/task-presets")
+        response = await self.client.get("/task-presets")
         response.raise_for_status()
         return response.json()
 
@@ -110,9 +108,9 @@ class MtpEvalClient:
     # Service Preview
     # ------------------------------------------------------------------
 
-    def preview_service(self, payload: dict) -> dict:
+    async def preview_service(self, payload: dict) -> dict:
         logger.debug("请求预览服务部署脚本，payload=%s", payload)
-        response = self.client.post("/service-preview", json=payload)
+        response = await self.client.post("/service-preview", json=payload)
         response.raise_for_status()
         return response.json()
 
@@ -120,39 +118,39 @@ class MtpEvalClient:
     # Tasks
     # ------------------------------------------------------------------
 
-    def list_tasks(self) -> list:
+    async def list_tasks(self) -> list:
         logger.debug("请求获取评测任务列表")
-        response = self.client.get("/tasks")
+        response = await self.client.get("/tasks")
         response.raise_for_status()
         return response.json()
 
-    def get_task(self, task_id: str) -> dict:
+    async def get_task(self, task_id: str) -> dict:
         logger.debug("请求获取评测任务详情，task_id=%s", task_id)
-        response = self.client.get(f"/tasks/{task_id}")
+        response = await self.client.get(f"/tasks/{task_id}")
         response.raise_for_status()
         return response.json()
 
-    def get_task_launch_config(self, task_id: str) -> dict:
+    async def get_task_launch_config(self, task_id: str) -> dict:
         logger.debug("请求获取任务 launch config，task_id=%s", task_id)
-        response = self.client.get(f"/tasks/{task_id}/launch-config")
+        response = await self.client.get(f"/tasks/{task_id}/launch-config")
         response.raise_for_status()
         return response.json()
 
-    def launch_task(self, payload: dict) -> dict:
+    async def launch_task(self, payload: dict) -> dict:
         logger.debug("请求发起评测任务，payload=%s", payload)
-        response = self.client.post("/tasks/launch", json=payload)
+        response = await self.client.post("/tasks/launch", json=payload)
         response.raise_for_status()
         return response.json()
 
-    def cancel_task(self, task_id: str) -> dict:
+    async def cancel_task(self, task_id: str) -> dict:
         logger.debug("请求取消评测任务，task_id=%s", task_id)
-        response = self.client.post(f"/tasks/{task_id}/cancel")
+        response = await self.client.post(f"/tasks/{task_id}/cancel")
         response.raise_for_status()
         return response.json()
 
-    def continue_task(self, task_id: str) -> dict:
+    async def continue_task(self, task_id: str) -> dict:
         logger.debug("请求继续评测任务，task_id=%s", task_id)
-        response = self.client.post(f"/tasks/{task_id}/continue")
+        response = await self.client.post(f"/tasks/{task_id}/continue")
         response.raise_for_status()
         return response.json()
 
@@ -160,8 +158,8 @@ class MtpEvalClient:
     # Statistics (v1 API)
     # ------------------------------------------------------------------
 
-    def get_stats(self, hours: int = 24) -> dict:
+    async def get_stats(self, hours: int = 24) -> dict:
         logger.debug("请求获取统计数据，hours=%s", hours)
-        response = self.client_v1.get("/stats", params={"hours": hours})
+        response = await self.client_v1.get("/stats", params={"hours": hours})
         response.raise_for_status()
         return response.json()

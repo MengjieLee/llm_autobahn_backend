@@ -21,7 +21,7 @@ class ProcessSchedulerService:
 
     async def list_jobs(self, params: Optional[dict] = None) -> dict:
         try:
-            return self.client.list_job(params or {})
+            return await self.client.list_job(params or {})
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "查询任务列表失败")
 
@@ -34,7 +34,7 @@ class ProcessSchedulerService:
     ) -> dict:
         try:
             data = {}
-            response = self.client.start_job(
+            response = await self.client.start_job(
                 pipeline_id=pipeline_id,
                 queue=queue,
                 name=name,
@@ -49,13 +49,13 @@ class ProcessSchedulerService:
 
     async def stop_job(self, job_id: str) -> dict:
         try:
-            return self.client.stop_job(job_id)
+            return await self.client.stop_job(job_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "停止任务失败")
 
     async def delete_job(self, job_id: str) -> dict:
         try:
-            return self.client.delete_job(job_id)
+            return await self.client.delete_job(job_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "删除任务失败")
 
@@ -66,7 +66,7 @@ class ProcessSchedulerService:
         files: Optional[Dict[str, str]] = None,
     ) -> dict:
         try:
-            return self.client.create_pipeline(
+            return await self.client.create_pipeline(
                 pipeline_name=pipeline_name,
                 yaml_content=yaml_content,
                 files=files,
@@ -76,19 +76,19 @@ class ProcessSchedulerService:
 
     async def list_pipelines(self, params: Optional[dict] = None) -> dict:
         try:
-            return self.client.list_pipeline(params)
+            return await self.client.list_pipeline(params)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "查询 Pipeline 列表失败")
 
     async def delete_pipeline(self, pipeline_id: str) -> dict:
         try:
-            return self.client.delete_pipeline(pipeline_id)
+            return await self.client.delete_pipeline(pipeline_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "删除 Pipeline 失败")
 
     async def get_pipeline_detail(self, pipeline_id: str) -> dict:
         try:
-            return self.client.get_pipeline_detail(pipeline_id)
+            return await self.client.get_pipeline_detail(pipeline_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "查询 Pipeline 详情失败")
 
