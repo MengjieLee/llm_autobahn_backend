@@ -38,7 +38,11 @@ PUBLIC_PATH_PREFIXES = [
     "/api/v1/account",  # 登录相关路径
     "/api/v1/openapi",  # OpenAPI 文档相关路径
     "/api/v1/test",  # OpenAPI 文档相关路径
-    "/api/v1/mtp_eval/tasks",  # crontab 内部同步刷新
+]
+
+# GET 请求免鉴权的路径前缀（crontab 内部同步）
+PUBLIC_GET_PREFIXES = [
+    "/api/v1/mtp_eval/tasks",
 ]
 
 
@@ -92,7 +96,13 @@ async def auth_middleware(request: Request, call_next: Callable) -> Response:
     for prefix in PUBLIC_PATH_PREFIXES:
         if path.startswith(prefix):
             return await call_next(request)
-    
+
+    # GET 请求免鉴权前缀（crontab 同步用）
+    if request.method == "GET":
+        for prefix in PUBLIC_GET_PREFIXES:
+            if path.startswith(prefix):
+                return await call_next(request)
+
     # 提取 token
     token = extract_token(request)
     

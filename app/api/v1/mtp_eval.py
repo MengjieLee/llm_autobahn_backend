@@ -220,6 +220,7 @@ async def launch_task(
     owner = user_info.get("name") or user_info.get("username") or ""
     if owner:
         payload["owner"] = owner
+    logger.info("sd-eva launch_task payload: %s", payload)
     data = await service.launch_task(payload)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
