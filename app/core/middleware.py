@@ -38,6 +38,7 @@ PUBLIC_PATH_PREFIXES = [
     "/api/v1/account",  # 登录相关路径
     "/api/v1/openapi",  # OpenAPI 文档相关路径
     "/api/v1/test",  # OpenAPI 文档相关路径
+    "/api/v1/mtp_eval/tasks",  # crontab 内部同步刷新
 ]
 
 
