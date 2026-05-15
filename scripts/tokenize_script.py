@@ -35,6 +35,8 @@ MODEL_TOKENIZER_MAPPING = {
     "glm-5": "zai-org/GLM-5",
     "minimax-m2.5": "MiniMaxAI/MiniMax-M2.5",
     "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
     "glm-4.7": "zai-org/GLM-4.7",
     "minimax-m2.1": "MiniMaxAI/MiniMax-M2.1",
 }

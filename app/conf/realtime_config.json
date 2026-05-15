@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "scenario": "全场景_各模型",
-  "models": "glm-5,glm-5.1,kimi-k2.5,minimax-m2.5,deepseek-v3.2",
+  "models": "glm-5,glm-5.1,kimi-k2.5,minimax-m2.5,deepseek-v3.2,deepseek-v4-flash,deepseek-v4-pro",
   "delay_minutes": 5,
   "retention_days": 30,
 
