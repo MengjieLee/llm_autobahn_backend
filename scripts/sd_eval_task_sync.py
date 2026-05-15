@@ -11,6 +11,22 @@ import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+
+# 从 .env 中加载 # MTP Host 段的配置
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    _in_section = False
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+        _stripped = _line.strip()
+        if _stripped == "# MTP Host":
+            _in_section = True
+            continue
+        if _in_section and _stripped.startswith("#"):
+            break
+        if _in_section and _stripped and "=" in _stripped:
+            _k, _v = _stripped.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 API_BASE = os.environ.get("AUTOBAHN_API_BASE", "http://127.0.0.1:8739")
 MAX_WORKERS = int(os.environ.get("SYNC_MAX_WORKERS", "12"))

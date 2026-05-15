@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 MTP_EVAL_HOST = os.getenv("MTP_EVAL_HOST")
+MTP_EVAL_SESSION = os.getenv("MTP_EVAL_SESSION", "")
+MTP_EVAL_COOKIE = os.getenv("MTP_EVAL_COOKIE", "")
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +21,8 @@ class MtpEvalClient:
 
         headers = {
             "Vortex-API-PreAuth": "1",
-            "fastmtp_eval_session": "76f3e7fcaa2a4c00ae790c45678bf9e8",
-            "Cookie": "fastmtp_eval_session=523a2ef5650549fb99d769e389e9b9c9",
+            "fastmtp_eval_session": MTP_EVAL_SESSION,
+            "Cookie": f"fastmtp_eval_session={MTP_EVAL_COOKIE}",
         }
         cookies = {}
         if auth_token:
