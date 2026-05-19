@@ -2084,12 +2084,15 @@ async def kv_task_list(
     username: Optional[str] = Query(default=None, description="按创建人 username 过滤"),
     task_name: Optional[str] = Query(default=None, description="按任务名模糊过滤"),
     status: Optional[str] = Query(default=None, description="按 pipeline 阶段过滤: done/failed/cancelled/running 等"),
+    app_id: Optional[str] = Query(default=None, description="按客户 app_id 精确过滤，如 app-3Lut8O2E"),
+    date: Optional[str] = Query(default=None, description="按日期（天级）过滤，格式 YYYY-MM-DD，匹配时间范围覆盖该日期的任务"),
     page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(default=20, ge=1, le=100, description="每页条数，默认 20"),
 ):
     """
     扫描 status/{username}/ 子目录，返回任务状态，按创建时间降序。
-    支持按 username 精确过滤、按 task_name 模糊过滤、按 status 过滤、分页。
+    支持按 username 精确过滤、按 task_name 模糊过滤、按 status 过滤、
+    按 app_id 精确过滤、按 date 天级范围过滤、分页。
     """
     log_usage("kV-查阅任务", scenario="OLAP")
 
@@ -2133,6 +2136,15 @@ async def kv_task_list(
         # 排除已删除任务
         if task.get("is_deleted"):
             continue
+        # 按 app_id 精确过滤
+        if app_id and task.get("query", {}).get("app_id", "") != app_id:
+            continue
+        # 按日期（天级）过滤：任务时间范围需覆盖目标日期
+        if date:
+            start_date = task.get("query", {}).get("start_datetime", "")[:10]
+            end_date = task.get("query", {}).get("end_datetime", "")[:10]
+            if not (start_date and end_date and start_date <= date <= end_date):
+                continue
         # 按 task_name 模糊过滤
         if task_name and task_name not in task.get("task_name", ""):
             continue
