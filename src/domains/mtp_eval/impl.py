@@ -31,7 +31,7 @@ class MtpEvalClient:
             base_url=f"{host}/api/v2",
             headers=headers,
             cookies=cookies,
-            timeout=60.0,
+            timeout=120.0,
             verify=False,
         )
         self.client_v1 = httpx.AsyncClient(

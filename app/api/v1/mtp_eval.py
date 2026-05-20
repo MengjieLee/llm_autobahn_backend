@@ -1,4 +1,7 @@
+import hashlib
+import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -10,6 +13,38 @@ from src.domains.mtp_eval.svc import MtpEvalService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ---------- 防重复提交 ----------
+_DEDUP_WINDOW_SEC = 30  # 30秒内相同请求视为重复（异步长请求）
+_dedup_cache: Dict[str, tuple] = {}  # key -> (expire_time, response_data)
+
+
+def _dedup_key(payload: dict, owner: str) -> str:
+    """根据 payload + owner 生成去重 key."""
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False) + "|" + owner
+    return hashlib.md5(canonical.encode()).hexdigest()
+
+
+def _dedup_get(key: str):
+    """获取缓存结果，过期则清除返回 None."""
+    entry = _dedup_cache.get(key)
+    if entry is None:
+        return None
+    expire_time, data = entry
+    if time.time() > expire_time:
+        _dedup_cache.pop(key, None)
+        return None
+    return data
+
+
+def _dedup_set(key: str, data):
+    """写入缓存并清理过期条目."""
+    now = time.time()
+    # 惰性清理过期 key（防止内存泄漏）
+    expired = [k for k, (exp, _) in _dedup_cache.items() if now > exp]
+    for k in expired:
+        _dedup_cache.pop(k, None)
+    _dedup_cache[key] = (now + _DEDUP_WINDOW_SEC, data)
 
 
 def get_service(request: Request) -> MtpEvalService:
@@ -220,8 +255,17 @@ async def launch_task(
     owner = user_info.get("name") or user_info.get("username") or ""
     if owner:
         payload["owner"] = owner
+
+    # 防重复提交：30秒窗口内相同请求直接返回缓存结果
+    key = _dedup_key(payload, owner)
+    cached = _dedup_get(key)
+    if cached is not None:
+        logger.warning("sd-eva launch_task 重复请求被拦截, dedup_key=%s", key)
+        return StandardResponse(code=0, message="success", data=cached, trace_id=None)
+
     logger.info("sd-eva launch_task payload: %s", payload)
     data = await service.launch_task(payload)
+    _dedup_set(key, data)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
