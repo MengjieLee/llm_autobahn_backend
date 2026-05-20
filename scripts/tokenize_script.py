@@ -16,6 +16,7 @@
 import json
 import re
 import os
+import sys
 import argparse
 from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Any, Optional
@@ -35,11 +36,24 @@ MODEL_TOKENIZER_MAPPING = {
     "glm-5": "zai-org/GLM-5",
     "minimax-m2.5": "MiniMaxAI/MiniMax-M2.5",
     "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-v3.2-think": "deepseek-ai/DeepSeek-V3.2",
     "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
     "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
     "glm-4.7": "zai-org/GLM-4.7",
     "minimax-m2.1": "MiniMaxAI/MiniMax-M2.1",
 }
+
+# DeepSeek 系列模型使用定制编码逻辑（而非 HF chat_template）
+DEEPSEEK_MODEL_PREFIXES = ["deepseek-v3", "deepseek-v4"]
+
+# DeepSeek thinking 模型（默认 thinking_mode="thinking"）
+DEEPSEEK_THINKING_MODELS = ["deepseek-v4-pro", "deepseek-v3.2-think"]
+
+
+def _is_deepseek_model(model_name: str) -> bool:
+    """判断是否是 DeepSeek 系列模型"""
+    model_lower = model_name.lower()
+    return any(model_lower.startswith(prefix) for prefix in DEEPSEEK_MODEL_PREFIXES)
 
 
 # ============================================================
@@ -202,19 +216,24 @@ def extract_request_body(raw_str: str) -> Optional[Dict]:
     return None
 
 
-def apply_chat_template(tokenizer, messages: List[Dict], tools: Optional[List]) -> List[int]:
+def apply_chat_template(tokenizer, messages: List[Dict], tools: Optional[List], model_name: str = "", response_format: Optional[Dict] = None) -> List[int]:
     """
     使用 tokenizer 的 chat_template 将 messages 转换为 input_ids
 
-    使用 return_tensors=None 直接返回 Python list，无需 PyTorch。
-    兼容多种返回类型: list, dict, Tensor, Encoding
+    对于 DeepSeek 系列模型，使用定制的编码逻辑（encoding_dsv32），
+    正确处理 tools、response_format、thinking 等特殊格式。
+    其他模型使用 HF 的 apply_chat_template。
     """
-    # 尝试带 tools 的 apply_chat_template
+    # DeepSeek 系列：使用定制编码逻辑
+    if _is_deepseek_model(model_name):
+        return _apply_deepseek_encoding(tokenizer, messages, tools, response_format, model_name=model_name)
+
+    # 其他模型：使用 HF apply_chat_template
     if tools:
         try:
-            import io, sys as _sys
-            _backup = _sys.stderr
-            _sys.stderr = io.StringIO()  # 屏蔽 "Failed to convert tools" 噪音
+            import io
+            _backup = sys.stderr
+            sys.stderr = io.StringIO()  # 屏蔽 "Failed to convert tools" 噪音
             try:
                 raw_ret = tokenizer.apply_chat_template(
                     conversation=messages,
@@ -224,7 +243,7 @@ def apply_chat_template(tokenizer, messages: List[Dict], tools: Optional[List]) 
                     return_tensors=None,
                 )
             finally:
-                _sys.stderr = _backup
+                sys.stderr = _backup
             return _extract_input_ids(raw_ret)
         except (TypeError, ValueError, KeyError, Exception):
             # tools 转换失败（不支持 tools / JSON Schema 不完整等），回退到不带 tools
@@ -238,6 +257,75 @@ def apply_chat_template(tokenizer, messages: List[Dict], tools: Optional[List]) 
         return_tensors=None,
     )
     return _extract_input_ids(raw_ret)
+
+
+def _apply_deepseek_encoding(tokenizer, messages: List[Dict], tools: Optional[List], response_format: Optional[Dict] = None, model_name: str = "") -> List[int]:
+    """
+    DeepSeek 定制编码：使用 encoding_dsv32 逻辑构建 prompt，再用 tokenizer.encode 分词。
+    处理 tools、response_format、thinking_mode 等。
+    """
+    dsv32 = _load_encoding_dsv32()
+
+    # 构建消息列表：把 tools/response_format 注入到 system 消息
+    processed_messages = []
+    has_system = False
+    for msg in messages:
+        m = dict(msg)
+        if m.get("role") == "system":
+            has_system = True
+            if tools:
+                m["tools"] = tools
+            if response_format:
+                m["response_format"] = response_format
+        processed_messages.append(m)
+
+    # 如果没有 system 消息，但有 tools/response_format，创建空 system 消息
+    if not has_system and (tools or response_format):
+        sys_msg = {"role": "system", "content": ""}
+        if tools:
+            sys_msg["tools"] = tools
+        if response_format:
+            sys_msg["response_format"] = response_format
+        processed_messages.insert(0, sys_msg)
+
+    # 判断 thinking_mode：
+    # - thinking 模型（v4-pro, v3.2）默认用 thinking 模式
+    # - 非 thinking 模型（v4-flash）默认用 chat 模式
+    model_lower = model_name.lower()
+    is_thinking_model = any(model_lower.startswith(m) for m in DEEPSEEK_THINKING_MODELS)
+    thinking_mode = "thinking" if is_thinking_model else "chat"
+
+    # 使用 encoding_dsv32 的 encode_messages 构建完整 prompt
+    prompt = dsv32.encode_messages(processed_messages, thinking_mode=thinking_mode)
+
+    # 用 tokenizer.encode 分词
+    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    return input_ids
+
+
+_dsv32_module_cache = None
+
+
+def _load_encoding_dsv32():
+    """加载 encoding_dsv32 模块（带进程内缓存）"""
+    global _dsv32_module_cache
+    if _dsv32_module_cache is not None:
+        return _dsv32_module_cache
+
+    import importlib.util
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _encoding_module_path = os.path.join(_script_dir, "encoding_dsv32.py")
+    if not os.path.exists(_encoding_module_path):
+        _encoding_module_path = os.path.join(
+            _script_dir, "..", "local_workspace", "diff_online_result",
+            "dsv4-pro-2026-05-17_20:00-21:00", "encoding_dsv32.py"
+        )
+
+    spec = importlib.util.spec_from_file_location("encoding_dsv32", _encoding_module_path)
+    dsv32 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dsv32)
+    _dsv32_module_cache = dsv32
+    return dsv32
 
 
 def _extract_input_ids(raw_ret) -> List[int]:
@@ -321,6 +409,7 @@ def convert_record(
             return None
 
         tools = body.get("tools") or None
+        response_format = body.get("response_format") or None
 
         # 提取模型名，优先级: override > qianfan_model
         qianfan_model = extract_qianfan_model(raw_str)
@@ -358,7 +447,7 @@ def convert_record(
             return "TOO_LONG"  # 特殊标记：与 None（解析失败）区分，用于统计
 
         # 应用 chat_template
-        input_ids = apply_chat_template(tokenizer, valid_messages, tools)
+        input_ids = apply_chat_template(tokenizer, valid_messages, tools, model_name=model_for_tokenizer, response_format=response_format)
 
         return {
             "as_id": as_id,

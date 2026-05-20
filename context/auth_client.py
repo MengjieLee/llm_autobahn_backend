@@ -251,20 +251,21 @@ async def is_user_valid(target_token: str) -> bool:
         logger.warning(f"❌ 用户【{username}】已存在且账号未激活！")
         return False
 
+    # [禁用] 登录过期校验：skill 场景下用户无法主动刷新 last_login，导致验证失败
     # 永久用户跳过登录过期校验
-    if username.strip() in PERMANENT_USERS:
-        return True
+    # if username.strip() in PERMANENT_USERS:
+    #     return True
 
     # 校验登录是否过期
-    try:
-        last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT).replace(tzinfo=_BJT)
-        if datetime.now(_BJT) > last_login_time + timedelta(days=USER_LOGIN_VALID_DAYS):
-            logger.warning(f"❌ 用户【{username}】已存在且未登录超过{USER_LOGIN_VALID_DAYS}天！请重新登录！")
-            return False
-    except ValueError as e:
-        logger.error(f"❌ 用户【{username}】最后登录时间格式错误：{str(e)}")
-        return False
-    
+    # try:
+    #     last_login_time = datetime.strptime(last_login_str, settings.TIME_FORMAT).replace(tzinfo=_BJT)
+    #     if datetime.now(_BJT) > last_login_time + timedelta(days=USER_LOGIN_VALID_DAYS):
+    #         logger.warning(f"❌ 用户【{username}】已存在且未登录超过{USER_LOGIN_VALID_DAYS}天！请重新登录！")
+    #         return False
+    # except ValueError as e:
+    #     logger.error(f"❌ 用户【{username}】最后登录时间格式错误：{str(e)}")
+    #     return False
+
     return True
 
 async def update_user(target_token: str, column_name: str, new_value) -> bool:

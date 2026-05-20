@@ -978,18 +978,19 @@ async def _run_simulate_stage(task_id: str):
     tokenize_stage = status.get("pipeline", {}).get("stages", {}).get("tokenize", {})
     model_outputs = tokenize_stage.get("model_outputs", {})
 
-    # ---- file 模式 ----
-    if not model_outputs:
-        tokenized_dir = os.path.join(task_data_dir, "tokenized")
-        for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "**", "*_input_ids.txt"), recursive=True)):
-            fname = os.path.basename(txt_file)
-            m = re.match(r'kv_\d{8}_\d{6}_\d{8}_\d{6}_(.+)_input_ids\.txt$', fname)
-            if m:
-                model = m.group(1)
-            else:
-                model = fname.replace("_input_ids.txt", "").split("_")[-1]
-            if os.path.getsize(txt_file) > 0:
-                model_outputs.setdefault(model, []).append(txt_file)
+    # ---- 始终从 tokenized 目录补全：确保 status 中遗漏的模型文件也能被发现 ----
+    tokenized_dir = os.path.join(task_data_dir, "tokenized")
+    for txt_file in sorted(glob.glob(os.path.join(tokenized_dir, "**", "*_input_ids.txt"), recursive=True)):
+        fname = os.path.basename(txt_file)
+        m = re.match(r'kv_\d{8}_\d{6}_\d{8}_\d{6}_(.+)_input_ids\.txt$', fname)
+        if m:
+            model = m.group(1)
+        else:
+            model = fname.replace("_input_ids.txt", "").split("_")[-1]
+        if os.path.getsize(txt_file) > 0:
+            model_outputs.setdefault(model, [])
+            if txt_file not in model_outputs[model]:
+                model_outputs[model].append(txt_file)
 
     for model in list(model_outputs.keys()):
         model_outputs[model] = [
