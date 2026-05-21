@@ -32,6 +32,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # ============================================================
 MODEL_TOKENIZER_MAPPING = {
     "kimi-k2.5": "moonshotai/Kimi-K2.5",
+    "kimi-k2.6": "moonshotai/Kimi-K2.6",
     "glm-5.1": "zai-org/GLM-5.1",
     "glm-5": "zai-org/GLM-5",
     "minimax-m2.5": "MiniMaxAI/MiniMax-M2.5",

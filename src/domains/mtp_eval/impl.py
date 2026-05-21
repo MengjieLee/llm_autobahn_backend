@@ -31,7 +31,7 @@ class MtpEvalClient:
             base_url=f"{host}/api/v2",
             headers=headers,
             cookies=cookies,
-            timeout=120.0,
+            timeout=600.0,
             verify=False,
         )
         self.client_v1 = httpx.AsyncClient(
@@ -140,7 +140,7 @@ class MtpEvalClient:
 
     async def launch_task(self, payload: dict) -> dict:
         logger.debug("请求发起评测任务，payload=%s", payload)
-        response = await self.client.post("/tasks/launch", json=payload)
+        response = await self.client.post("/tasks/launch", json=payload, timeout=600.0)
         response.raise_for_status()
         return response.json()
 
