@@ -826,7 +826,7 @@ olap_database/
   "olap_qpd_limit": 100,
   "models": ["glm-5", "glm-4.7", "deepseek-v3.2", "kimi-k2.5", "minimax-m2.5", "minimax-m2.1"],
   "k8s_enabled": true,
-  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.5.4",
+  "k8s_image": "ccr-xxx.baidubce.com/qianfan-data/llm_autobahn_backend:0.5.5",
   "k8s_job_cpu_request": "28",
   "k8s_job_memory_request": "110Gi"
 }

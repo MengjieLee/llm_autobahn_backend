@@ -1431,6 +1431,14 @@ async def _run_trend_stage(task_id: str):
             "output_file": output_file,
         })
         logger.info("[trend] 已保存: %s (%d series)", output_file, n_series)
+
+        # 双写 TSDB（非阻塞，失败仅 log）
+        try:
+            from src.domains.kv.tsdb_service import write_trend_to_tsdb
+            await write_trend_to_tsdb(task_id, series)
+        except Exception as e:
+            logger.warning("[trend] TSDB 双写失败 (non-blocking): %s", e)
+
         return
 
     # ---- Fallback: 调用 compute_trend 重算 ----
@@ -1472,6 +1480,15 @@ async def _run_trend_stage(task_id: str):
             "output_file": output_file,
         })
         logger.info("[trend] 趋势计算完成: %s -> %s", task_id, output_file)
+
+        # 双写 TSDB（非阻塞，失败仅 log）
+        try:
+            from src.domains.kv.tsdb_service import write_trend_to_tsdb
+            with open(output_file, "r", encoding="utf-8") as f:
+                trend_data = json.load(f)
+            await write_trend_to_tsdb(task_id, trend_data)
+        except Exception as e:
+            logger.warning("[trend] TSDB 双写失败 (non-blocking): %s", e)
     except Exception as e:
         logger.warning(f"[trend] 趋势计算失败: {task_id}: {e}", exc_info=True)
         _update_stage(task_id, "trend", {

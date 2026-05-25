@@ -106,6 +106,13 @@ class Settings(BaseSettings):
 
     # Pipeline / QPD 参数已迁移至 app/conf/olap_config.json（热更新，无需重启）
 
+    # ---- TSDB (百度时序数据库) ----
+    TSDB_ENDPOINT: str = Field(default="https://mtdataaischeduletpm.tsdb.iot.bj.baidubce.com")
+    TSDB_DATABASE: str = Field(default="mtdataaischeduletpm")
+    TSDB_ACCESS_KEY_ID: str = Field(default="")
+    TSDB_SECRET_ACCESS_KEY: str = Field(default="")
+    TSDB_ENABLED: bool = Field(default=False)
+
     # HuggingFace
     HF_TOKEN: str = Field(default="")
 

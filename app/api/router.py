@@ -7,6 +7,7 @@ from app.api.v1.process_scheduler import router as process_scheduler_router
 from app.api.v1.sql import router as sql_router
 from app.api.v1.olap import router as olap_router
 from app.api.v1.mtp_eval import router as mtp_eval_router
+from app.api.v1.kv_tsdb import router as kv_tsdb_router
 
 
 api_router = APIRouter()
@@ -19,3 +20,4 @@ api_router.include_router(process_scheduler_router, prefix="/process_scheduler",
 api_router.include_router(sql_router, prefix="/sql", tags=["sql"])
 api_router.include_router(olap_router, prefix="/olap", tags=["olap"])
 api_router.include_router(mtp_eval_router, prefix="/mtp_eval", tags=["mtp_eval"])
+api_router.include_router(kv_tsdb_router, prefix="/olap/kv-tsdb", tags=["kv-tsdb"])
