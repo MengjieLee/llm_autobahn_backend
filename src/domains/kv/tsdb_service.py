@@ -77,15 +77,16 @@ def trend_data_to_datapoints(
     return datapoints
 
 
-async def write_trend_to_tsdb(task_id: str, trend_data: dict, year: int | None = None) -> int:
+async def write_trend_to_tsdb(task_id: str, trend_data: dict, year: int | None = None, app_id: str = "") -> int:
     """将一个任务的 trend 数据写入 TSDB。返回写入的数据点数量。"""
     if not settings.TSDB_ENABLED:
         return 0
 
     from context.tsdb_connector import get_tsdb_connector
 
-    # 尝试从 task status 中获取 app_id
-    app_id = _get_task_app_id(task_id)
+    # 如果调用方没传 app_id，尝试从 status 文件读取（API 侧 ingest 场景）
+    if not app_id:
+        app_id = _get_task_app_id(task_id)
 
     datapoints = trend_data_to_datapoints(task_id, trend_data, year, app_id=app_id)
     if not datapoints:
@@ -99,17 +100,33 @@ async def write_trend_to_tsdb(task_id: str, trend_data: dict, year: int | None =
 
 
 def _get_task_app_id(task_id: str) -> str:
-    """从 task status 文件中读取 app_id。"""
+    """从 task status 文件中读取 app_id。
+
+    兼容两种运行环境:
+    - API 服务: 使用 settings.OLAP_BASE_DIR
+    - K8s Job: 使用脚本推导的 BASE_DIR (scripts/../)
+    """
     import os, json
     username = task_id.split("-kv_", 1)[0] if "-kv_" in task_id else "unknown"
-    base_dir = os.path.join(settings.OLAP_BASE_DIR, settings.OLAP_DATABASE_DIR)
-    status_file = os.path.join(base_dir, "status", username, f"{task_id}.json")
-    try:
-        with open(status_file, "r", encoding="utf-8") as f:
-            status = json.load(f)
-        return status.get("query", {}).get("app_id", "")
-    except Exception:
-        return ""
+
+    # 尝试多个可能的路径
+    candidates = []
+    # 1. settings 配置的路径（API 服务）
+    candidates.append(os.path.join(settings.OLAP_BASE_DIR, settings.OLAP_DATABASE_DIR, "status", username, f"{task_id}.json"))
+    # 2. 从当前文件位置推导（兼容 K8s Job，脚本和此文件在同一项目下）
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidates.append(os.path.join(_project_root, "olap_database", "status", username, f"{task_id}.json"))
+
+    for status_file in candidates:
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                status = json.load(f)
+            return status.get("query", {}).get("app_id", "")
+        except (FileNotFoundError, OSError):
+            continue
+        except Exception:
+            continue
+    return ""
 
 
 async def query_hit_rate_trend(
@@ -218,6 +235,7 @@ def _parse_tsdb_result(result, model_data: dict[str, list[dict]]):
 
             # 从 groupInfos 中取 model 名
             # 实际结构: [{name: 'Tag', tags: {model: 'glm-5.1'}}]
+            # 注意: tags 可能是 Expando 对象而非 dict
             model = "unknown"
             if isinstance(group_infos, list):
                 for info in group_infos:
@@ -226,13 +244,13 @@ def _parse_tsdb_result(result, model_data: dict[str, list[dict]]):
                         tags_in_info = info.tags
                     elif isinstance(info, dict):
                         tags_in_info = info.get("tags", {})
-                    if isinstance(tags_in_info, dict) and "model" in tags_in_info:
-                        model = tags_in_info["model"]
-                        break
-                    # fallback: 直接在 info 顶层找 model
-                    if isinstance(info, dict) and "model" in info:
-                        model = info["model"]
-                        break
+                    if tags_in_info is not None:
+                        if hasattr(tags_in_info, "model"):
+                            model = tags_in_info.model
+                            break
+                        elif isinstance(tags_in_info, dict) and "model" in tags_in_info:
+                            model = tags_in_info["model"]
+                            break
 
             # 提取 values: [[ts_ms, value], ...]
             values = getattr(group, "values", None)

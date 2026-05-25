@@ -46,17 +46,23 @@ async def tsdb_hit_rate_trend(
 ):
     """从 TSDB 查询某任务的分钟级命中率趋势。返回格式与 /kv/hit-rate-trend/{task_id} 一致。"""
     _ensure_tsdb_enabled()
-    from src.domains.kv.tsdb_service import query_hit_rate_trend
+    from src.domains.kv.tsdb_service import query_hit_rate_trend, _get_task_app_id
 
     # 将纯数字字符串转为 int（epoch ms）
     st = int(start_time) if start_time and start_time.isdigit() else start_time
     et = int(end_time) if end_time and end_time.isdigit() else end_time
 
     trend_data = await query_hit_rate_trend(task_id, st, et, app_id=app_id)
+
+    # 补充 app_id 到响应
+    resolved_app_id = app_id or _get_task_app_id(task_id)
+    trend_data["app_id"] = resolved_app_id
+    trend_data["task_id"] = task_id
+
     if not trend_data.get("series"):
         return StandardResponse(
             code=0, message="TSDB 中无该任务的趋势数据",
-            data={"series": []}, trace_id=None
+            data=trend_data, trace_id=None
         )
     return StandardResponse(code=0, message="success", data=trend_data, trace_id=None)
 
