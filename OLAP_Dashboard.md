@@ -233,7 +233,7 @@ API: GET /api/v1/olap/kv/realtime?time_range=1h
   "pipeline_es_scroll_size": 10000,
   "pipeline_block_size": 16,
   "pipeline_cache_size": 200000000,
-  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.2.5",
+  "k8s_image": "ccr-2663zxft-vpc.cnc.bj.baidubce.com/qianfan-data/llm_autobahn_backend:0.5.4",
   "k8s_cpu_request": "28",
   "k8s_cpu_limit": "28",
   "k8s_memory_request": "110Gi",
