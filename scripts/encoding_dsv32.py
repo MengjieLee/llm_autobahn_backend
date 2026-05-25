@@ -95,9 +95,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     P_dsml_strs = []
 
-    arguments = tool_call["arguments"]
-    if isinstance(arguments, str):
-        arguments = json.loads(arguments)
+    arguments = json.loads(tool_call["arguments"])
     # 处理双重 JSON 编码：arguments 被多 dumps 了一次，解出来还是 str
     while isinstance(arguments, str):
         arguments = json.loads(arguments)
@@ -243,7 +241,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         summary_content = content or ""
 
         if thinking_mode == "thinking" and index > last_user_idx:
-            # 日志数据中历史 assistant 消息可能缺失 reasoning_content，容错处理
+            assert reasoning_content or tool_calls, f"ThinkingMode: {thinking_mode}, invalid message without reasoning_content/tool_calls `{msg}` after last user message"
             thinking_part = thinking_template.format(reasoning_content=reasoning_content or "") + thinking_end_token
 
         prompt += assistant_msg_template.format(

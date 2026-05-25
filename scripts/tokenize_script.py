@@ -272,6 +272,21 @@ def _apply_deepseek_encoding(tokenizer, messages: List[Dict], tools: Optional[Li
     has_system = False
     for msg in messages:
         m = dict(msg)
+        # encoding_dsv32 要求 content 为纯字符串；
+        # 线上日志中 content 可能是 OpenAI multimodal 格式 [{"type":"text","text":"..."}]
+        if isinstance(m.get("content"), list):
+            m["content"] = "\n".join(
+                part["text"] for part in m["content"]
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        # encoding_dsv32 要求 tool_calls[].function.arguments 为 JSON 字符串；
+        # sanitize_message 可能已将其解析为 dict，这里重新序列化回 str
+        if "tool_calls" in m and isinstance(m.get("tool_calls"), list):
+            for tc in m["tool_calls"]:
+                if isinstance(tc, dict):
+                    func = tc.get("function", tc)
+                    if isinstance(func, dict) and isinstance(func.get("arguments"), dict):
+                        func["arguments"] = json.dumps(func["arguments"], ensure_ascii=False)
         if m.get("role") == "system":
             has_system = True
             if tools:
