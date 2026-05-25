@@ -113,8 +113,9 @@ def _get_task_app_id(task_id: str) -> str:
     candidates = []
     # 1. settings 配置的路径（API 服务）
     candidates.append(os.path.join(settings.OLAP_BASE_DIR, settings.OLAP_DATABASE_DIR, "status", username, f"{task_id}.json"))
-    # 2. 从当前文件位置推导（兼容 K8s Job，脚本和此文件在同一项目下）
-    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # 2. 从当前文件位置推导（兼容 K8s Job）
+    # tsdb_service.py 在 src/domains/kv/ 下，往上 4 层到项目根目录
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     candidates.append(os.path.join(_project_root, "olap_database", "status", username, f"{task_id}.json"))
 
     for status_file in candidates:
