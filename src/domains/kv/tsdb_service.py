@@ -37,6 +37,7 @@ def trend_data_to_datapoints(
     trend_data: dict,
     year: int | None = None,
     app_id: str = "",
+    scenario: str = "",
 ) -> list[dict]:
     """将 hit_rate_trend.json 格式的数据转为 TSDB datapoints。
 
@@ -67,6 +68,8 @@ def trend_data_to_datapoints(
             }
             if app_id:
                 tags["app_id"] = app_id
+            if scenario:
+                tags["scenario"] = scenario
             datapoints.append({
                 "metric": METRIC_NAME,
                 "tags": tags,
@@ -77,30 +80,37 @@ def trend_data_to_datapoints(
     return datapoints
 
 
-async def write_trend_to_tsdb(task_id: str, trend_data: dict, year: int | None = None, app_id: str = "") -> int:
+async def write_trend_to_tsdb(task_id: str, trend_data: dict, year: int | None = None, app_id: str = "", scenario: str = "") -> int:
     """将一个任务的 trend 数据写入 TSDB。返回写入的数据点数量。"""
     if not settings.TSDB_ENABLED:
         return 0
 
     from context.tsdb_connector import get_tsdb_connector
 
-    # 如果调用方没传 app_id，尝试从 status 文件读取（API 侧 ingest 场景）
-    if not app_id:
-        app_id = _get_task_app_id(task_id)
+    # 如果调用方没传 app_id 或 scenario，尝试从 status 文件读取
+    if not app_id or not scenario:
+        meta = _get_task_meta(task_id)
+        if not app_id:
+            app_id = meta.get("app_id", "")
+        if not scenario:
+            scenario = meta.get("scenario", "")
 
-    datapoints = trend_data_to_datapoints(task_id, trend_data, year, app_id=app_id)
+    datapoints = trend_data_to_datapoints(task_id, trend_data, year, app_id=app_id, scenario=scenario)
     if not datapoints:
         logger.info("[tsdb] No datapoints to write for task %s", task_id)
         return 0
 
     connector = get_tsdb_connector()
-    await connector.write_datapoints(datapoints)
-    logger.info("[tsdb] Wrote %d datapoints for task %s (app_id=%s)", len(datapoints), task_id, app_id)
+    # TSDB 单次写入限制 10000 个 datapoints，需分批
+    BATCH_SIZE = 10000
+    for i in range(0, len(datapoints), BATCH_SIZE):
+        await connector.write_datapoints(datapoints[i:i + BATCH_SIZE])
+    logger.info("[tsdb] Wrote %d datapoints for task %s (app_id=%s, scenario=%s)", len(datapoints), task_id, app_id, scenario)
     return len(datapoints)
 
 
-def _get_task_app_id(task_id: str) -> str:
-    """从 task status 文件中读取 app_id。
+def _get_task_meta(task_id: str) -> dict:
+    """从 task status 文件中读取 app_id 和 scenario。
 
     兼容两种运行环境:
     - API 服务: 使用 settings.OLAP_BASE_DIR
@@ -122,12 +132,15 @@ def _get_task_app_id(task_id: str) -> str:
         try:
             with open(status_file, "r", encoding="utf-8") as f:
                 status = json.load(f)
-            return status.get("query", {}).get("app_id", "")
+            return {
+                "app_id": status.get("query", {}).get("app_id", ""),
+                "scenario": status.get("scenario", {}).get("label", ""),
+            }
         except (FileNotFoundError, OSError):
             continue
         except Exception:
             continue
-    return ""
+    return {"app_id": "", "scenario": ""}
 
 
 async def query_hit_rate_trend(
@@ -135,6 +148,7 @@ async def query_hit_rate_trend(
     start_time: str | int | None = None,
     end_time: str | int | None = None,
     app_id: str | None = None,
+    scenario: str | None = None,
 ) -> dict:
     """从 TSDB 查询分钟级命中率趋势，返回与文件版相同的格式。
 
@@ -159,6 +173,8 @@ async def query_hit_rate_trend(
         tags["task_id"] = [task_id]
     if app_id:
         tags["app_id"] = [app_id]
+    if scenario:
+        tags["scenario"] = [scenario]
     if not tags:
         return {"series": []}
 

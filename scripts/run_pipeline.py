@@ -1437,7 +1437,8 @@ async def _run_trend_stage(task_id: str):
             from src.domains.kv.tsdb_service import write_trend_to_tsdb
             _status = _read_status(task_id)
             _app_id = (_status or {}).get("query", {}).get("app_id", "")
-            await write_trend_to_tsdb(task_id, series, app_id=_app_id)
+            _scenario = (_status or {}).get("scenario", {}).get("label", "")
+            await write_trend_to_tsdb(task_id, series, app_id=_app_id, scenario=_scenario)
         except Exception as e:
             logger.warning("[trend] TSDB 双写失败 (non-blocking): %s", e)
 
@@ -1490,7 +1491,8 @@ async def _run_trend_stage(task_id: str):
                 trend_data = json.load(f)
             _status = _read_status(task_id)
             _app_id = (_status or {}).get("query", {}).get("app_id", "")
-            await write_trend_to_tsdb(task_id, trend_data, app_id=_app_id)
+            _scenario = (_status or {}).get("scenario", {}).get("label", "")
+            await write_trend_to_tsdb(task_id, trend_data, app_id=_app_id, scenario=_scenario)
         except Exception as e:
             logger.warning("[trend] TSDB 双写失败 (non-blocking): %s", e)
     except Exception as e:

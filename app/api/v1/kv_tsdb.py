@@ -43,21 +43,23 @@ async def tsdb_hit_rate_trend(
     start_time: Optional[str] = Query(None, description="起始时间，支持相对时间如 '30 days ago' 或 epoch 毫秒"),
     end_time: Optional[str] = Query(None, description="结束时间，支持相对时间或 epoch 毫秒"),
     app_id: Optional[str] = Query(None, description="按 app_id 过滤"),
+    scenario: Optional[str] = Query(None, description="按场景过滤，如 'all' 或 'coding plan'"),
 ):
     """从 TSDB 查询某任务的分钟级命中率趋势。返回格式与 /kv/hit-rate-trend/{task_id} 一致。"""
     _ensure_tsdb_enabled()
-    from src.domains.kv.tsdb_service import query_hit_rate_trend, _get_task_app_id
+    from src.domains.kv.tsdb_service import query_hit_rate_trend, _get_task_meta
 
     # 将纯数字字符串转为 int（epoch ms）
     st = int(start_time) if start_time and start_time.isdigit() else start_time
     et = int(end_time) if end_time and end_time.isdigit() else end_time
 
-    trend_data = await query_hit_rate_trend(task_id, st, et, app_id=app_id)
+    trend_data = await query_hit_rate_trend(task_id, st, et, app_id=app_id, scenario=scenario)
 
-    # 补充 app_id 到响应
-    resolved_app_id = app_id or _get_task_app_id(task_id)
-    trend_data["app_id"] = resolved_app_id
+    # 补充 app_id / scenario 到响应
+    meta = _get_task_meta(task_id)
+    trend_data["app_id"] = app_id or meta.get("app_id", "")
     trend_data["task_id"] = task_id
+    trend_data["scenario"] = scenario or meta.get("scenario", "")
 
     if not trend_data.get("series"):
         return StandardResponse(
@@ -74,6 +76,7 @@ async def tsdb_hit_rate_by_app(
     app_id: str,
     start_time: Optional[str] = Query(None, description="起始时间"),
     end_time: Optional[str] = Query(None, description="结束时间"),
+    scenario: Optional[str] = Query(None, description="按场景过滤，如 'all' 或 'coding plan'"),
 ):
     """按 app_id 聚合查询，返回该 app 下所有任务的分钟级命中率。"""
     _ensure_tsdb_enabled()
@@ -82,7 +85,7 @@ async def tsdb_hit_rate_by_app(
     st = int(start_time) if start_time and start_time.isdigit() else start_time
     et = int(end_time) if end_time and end_time.isdigit() else end_time
 
-    trend_data = await query_hit_rate_trend(task_id=None, start_time=st, end_time=et, app_id=app_id)
+    trend_data = await query_hit_rate_trend(task_id=None, start_time=st, end_time=et, app_id=app_id, scenario=scenario)
     if not trend_data.get("series"):
         return StandardResponse(
             code=0, message=f"TSDB 中无 app_id={app_id} 的趋势数据",
