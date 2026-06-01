@@ -97,9 +97,9 @@ class MtpEvalService:
     # Tasks
     # ------------------------------------------------------------------
 
-    async def list_tasks(self) -> list:
+    async def list_tasks(self, include_deleted: bool = False) -> list:
         try:
-            tasks = await self.client.list_tasks()
+            tasks = await self.client.list_tasks(include_deleted=include_deleted)
             tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
             return tasks
         except Exception as exc:  # noqa: BLE001
@@ -134,6 +134,20 @@ class MtpEvalService:
             return await self.client.continue_task(task_id)
         except Exception as exc:  # noqa: BLE001
             self._handle_error(exc, "继续评测任务")
+
+    async def archive_task(self, task_id: str) -> dict:
+        """归档任务（软删）。"""
+        try:
+            return await self.client.archive_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_error(exc, "归档任务")
+
+    async def unarchive_task(self, task_id: str) -> dict:
+        """取消归档任务（恢复）。"""
+        try:
+            return await self.client.unarchive_task(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_error(exc, "取消归档任务")
 
     # ------------------------------------------------------------------
     # Statistics

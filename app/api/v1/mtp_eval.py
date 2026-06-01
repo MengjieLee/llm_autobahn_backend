@@ -201,6 +201,7 @@ async def preview_service(
 
 @router.get("/tasks", summary="获取评测任务列表")
 async def list_tasks(
+    include_deleted: bool = False,
     service: MtpEvalService = Depends(get_service),
     poll: Optional[int] = None,
 ) -> StandardResponse[list]:
@@ -208,7 +209,7 @@ async def list_tasks(
         pass
         # [TODO] 先 pass 待污染源清理后再人工恢复。
         # log_usage("mtp_eval_list_tasks")
-    data = await service.list_tasks()
+    data = await service.list_tasks(include_deleted=include_deleted)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 
@@ -290,6 +291,30 @@ async def continue_task(
     if not task_id:
         raise HTTPException(status_code=400, detail="task_id 不能为空")
     data = await service.continue_task(task_id)
+    return StandardResponse(code=0, message="success", data=data, trace_id=None)
+
+
+@router.post("/tasks/{task_id}/archive", summary="归档评测任务（软删）")
+async def archive_task(
+    task_id: str,
+    service: MtpEvalService = Depends(get_service),
+) -> StandardResponse[dict]:
+    log_usage("mtp_eval_archive_task")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id 不能为空")
+    data = await service.archive_task(task_id)
+    return StandardResponse(code=0, message="success", data=data, trace_id=None)
+
+
+@router.post("/tasks/{task_id}/unarchive", summary="取消归档评测任务（恢复）")
+async def unarchive_task(
+    task_id: str,
+    service: MtpEvalService = Depends(get_service),
+) -> StandardResponse[dict]:
+    log_usage("mtp_eval_unarchive_task")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id 不能为空")
+    data = await service.unarchive_task(task_id)
     return StandardResponse(code=0, message="success", data=data, trace_id=None)
 
 

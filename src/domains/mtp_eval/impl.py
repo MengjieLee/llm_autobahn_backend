@@ -120,9 +120,9 @@ class MtpEvalClient:
     # Tasks
     # ------------------------------------------------------------------
 
-    async def list_tasks(self) -> list:
-        logger.debug("请求获取评测任务列表")
-        response = await self.client.get("/tasks")
+    async def list_tasks(self, include_deleted: bool = False) -> list:
+        logger.debug("请求获取评测任务列表, include_deleted=%s", include_deleted)
+        response = await self.client.get("/tasks", params={"include_deleted": include_deleted})
         response.raise_for_status()
         return response.json()
 
@@ -153,6 +153,18 @@ class MtpEvalClient:
     async def continue_task(self, task_id: str) -> dict:
         logger.debug("请求继续评测任务，task_id=%s", task_id)
         response = await self.client.post(f"/tasks/{task_id}/continue")
+        response.raise_for_status()
+        return response.json()
+
+    async def archive_task(self, task_id: str) -> dict:
+        logger.debug("请求归档任务，task_id=%s", task_id)
+        response = await self.client.post(f"/tasks/{task_id}/archive")
+        response.raise_for_status()
+        return response.json()
+
+    async def unarchive_task(self, task_id: str) -> dict:
+        logger.debug("请求取消归档任务，task_id=%s", task_id)
+        response = await self.client.post(f"/tasks/{task_id}/unarchive")
         response.raise_for_status()
         return response.json()
 
