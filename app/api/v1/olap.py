@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from app.core.api_schema import StandardResponse
+from app.core.exceptions import BizException
 from app.conf.config import settings
 from app.core.request_context import log_usage
 from src.domains.kv.svc import ESIndexService
@@ -573,6 +574,8 @@ async def _run_streaming_fetch_tokenize(
     _progress_dirty = [False] # 标记是否有新进度需要刷盘
 
     cfg = _load_olap_config()
+    status = _read_status(task_id)
+    selected_models = status.get("query", {}).get("models", []) if status else []
     fetch_sem = asyncio.Semaphore(cfg["pipeline_fetch_concurrency"])
     tokenize_sem = asyncio.Semaphore(cfg["pipeline_tokenize_concurrency"])
     tokenize_tasks = []  # 收集所有 tokenize 协程
@@ -635,7 +638,7 @@ async def _run_streaming_fetch_tokenize(
 
         max_scroll_retries = 8
         for scroll_attempt in range(max_scroll_retries + 1):
-            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
+            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path, models=selected_models)
 
             async with fetch_sem:
                 await _update_fetch_progress()
@@ -793,55 +796,7 @@ async def _run_streaming_fetch_tokenize(
         for model, txt_file in r.get("outputs", {}).items():
             model_txt_files.setdefault(model, []).append(txt_file)
 
-    # 按用户选择的模型过滤（不选则保留全部）
-    status = _read_status(task_id)
-    selected_models = status.get("query", {}).get("models", []) if status else []
     all_detected_models = list(model_txt_files.keys())
-    if selected_models:
-        skipped_models = [m for m in model_txt_files if m not in selected_models]
-        model_txt_files = {m: fs for m, fs in model_txt_files.items() if m in selected_models}
-        if skipped_models:
-            logger.info(f"[tokenize] 按模型过滤: 保留 {list(model_txt_files.keys())}，跳过 {skipped_models}")
-
-    # 选定模型在数据中不存在：序列化成功但过滤后无匹配模型
-    if success_files and selected_models and not model_txt_files:
-        msg = (
-            f"序列化完成，但所选模型 {selected_models} 在数据中未检测到。"
-            f"实际检测到的模型: {all_detected_models}"
-        )
-        logger.warning(f"[tokenize] {msg}")
-        await _update_stage(task_id, "tokenize", {
-            "status": "completed",
-            "message": msg,
-            "model_outputs": {},
-            "total_lines": 0,
-            "success_count": len(success_files),
-            "failed_count": len(failed_files),
-            "models": [],
-            "all_detected_models": all_detected_models,
-            "files": tokenize_results
-        })
-        await _update_stage(task_id, "simulate", {"status": "skipped", "message": "所选模型未匹配，跳过模拟"})
-        # 为每个选定模型返回 0 结果
-        zero_result = {}
-        for m in selected_models:
-            zero_result[m] = {
-                "hit_rate": 0, "hit_rate_percent": 0,
-                "hit_count": 0, "total_queries": 0,
-                "total_tokens": 0, "total_entries": 0,
-                "input_files_count": 0
-            }
-        zero_result["all_detected_models"] = all_detected_models
-        zero_result["message"] = msg
-        status = _read_status(task_id)
-        if status:
-            status["pipeline"]["current_stage"] = "done"
-            status["result"] = zero_result
-            _write_status(status)
-        fetch_results.clear()
-        fetch_incomplete.clear()
-        tokenize_results.clear()
-        raise RuntimeError(f"Selected models {selected_models} not found in data, detected: {all_detected_models}")
 
     if not success_files:
         await _update_stage(task_id, "tokenize", {
@@ -858,8 +813,6 @@ async def _run_streaming_fetch_tokenize(
         f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，"
         f"{tokenize_total_lines[0]} 条，{len(model_txt_files)} 个模型"
     )
-    if selected_models:
-        status_msg += f"（已过滤，检测到 {len(all_detected_models)} 个模型）"
     await _update_stage(task_id, "tokenize", {
         "status": "completed",
         "message": status_msg,
@@ -1451,8 +1404,10 @@ _TIME_RANGE_MAP = {
     "30d": 2592000,
 }
 
-# 缓存: scenario → {task_id, trend_data, updated_at}
+# 缓存: time_range → {data, expires_at}，避免 dashboard 高频轮询反复扫 status/trend 文件
+_DASHBOARD_CACHE_TTL_SECONDS = 10
 _dashboard_cache: dict = {}
+_dashboard_cache_lock = asyncio.Lock()
 
 
 def _find_latest_task_for_scenario(scenario: str) -> Optional[dict]:
@@ -1699,17 +1654,7 @@ def _aggregate_task_trends_to_points(tasks: List[dict], year: int, cutoff_naive:
     return overall_points, models_points
 
 
-@router.get("/kv/dashboard", summary="获取命中率趋势数据（实时）")
-async def kv_dashboard(time_range: str = Query(default="1d", description="时间范围: 1h, 6h, 1d, 7d, 30d")):
-    """
-    Dashboard API：8 个固定场景的命中率趋势数据。
-    - 实时场景（全场景_各模型）：使用单个任务的分钟级 trend 数据
-    - 非实时场景：聚合时间范围内多个任务的 hit_rate_trend.json 分钟级数据
-    返回: {scenarios: {name: {task_id, points: [{time, hit_rate}], stats: {mean, max, min}, models}}}
-    """
-    if time_range not in _TIME_RANGE_MAP:
-        raise HTTPException(status_code=400, detail=f"不支持的 time_range: {time_range}，可选: {list(_TIME_RANGE_MAP.keys())}")
-
+def _build_kv_dashboard(time_range: str) -> dict:
     range_seconds = _TIME_RANGE_MAP[time_range]
     now_bjt = datetime.now(BJT)
     cutoff_bjt = now_bjt - timedelta(seconds=range_seconds)
@@ -1836,6 +1781,36 @@ async def kv_dashboard(time_range: str = Query(default="1d", description="时间
             }
 
     return {"scenarios": result, "time_range": time_range}
+
+
+@router.get("/kv/dashboard", summary="获取命中率趋势数据（实时）")
+async def kv_dashboard(time_range: str = Query(default="1d", description="时间范围: 1h, 6h, 1d, 7d, 30d")):
+    """
+    Dashboard API：8 个固定场景的命中率趋势数据。
+    - 实时场景（全场景_各模型）：使用单个任务的分钟级 trend 数据
+    - 非实时场景：聚合时间范围内多个任务的 hit_rate_trend.json 分钟级数据
+    返回: {scenarios: {name: {task_id, points: [{time, hit_rate}], stats: {mean, max, min}, models}}}
+    """
+    if time_range not in _TIME_RANGE_MAP:
+        raise HTTPException(status_code=400, detail=f"不支持的 time_range: {time_range}，可选: {list(_TIME_RANGE_MAP.keys())}")
+
+    now = time.time()
+    cached = _dashboard_cache.get(time_range)
+    if cached and cached["expires_at"] > now:
+        return cached["data"]
+
+    async with _dashboard_cache_lock:
+        now = time.time()
+        cached = _dashboard_cache.get(time_range)
+        if cached and cached["expires_at"] > now:
+            return cached["data"]
+
+        data = await asyncio.to_thread(_build_kv_dashboard, time_range)
+        _dashboard_cache[time_range] = {
+            "data": data,
+            "expires_at": time.time() + _DASHBOARD_CACHE_TTL_SECONDS,
+        }
+        return data
 
 
 # ============================================================
@@ -2196,7 +2171,7 @@ async def es_fetch(
     ),
     path: Optional[str] = Query(
         default=None,
-        description="场景过滤路径，非空添加 match_phrase 过滤，为空则使用配置默认值",
+        description="场景过滤路径，非空添加 term 过滤，为空则使用配置默认值",
     ),
     scheduled_at: Optional[str] = Query(
         default=None,
@@ -2352,6 +2327,51 @@ async def es_fetch(
         data={"task_id": task_id},
         trace_id=None
     )
+
+
+@router.get("/kv/attribution-report", summary="获取日报命中率变化归因报告")
+async def kv_attribution_report(
+    start: str = Query(..., description="开始日期，格式 MM-DD"),
+    end: str = Query(..., description="结束日期，格式 MM-DD"),
+    scenario: str = Query("20~21_全场景_各模型", description="日报场景名"),
+    k: float = Query(1.5, ge=0, description="IQR 异常检测灵敏度，越小越敏感"),
+    min_delta_pp: float = Query(2.0, ge=0, description="纳入关注的最小变化百分点"),
+    max_days: int = Query(5, ge=1, le=30, description="最多返回关注峰谷日数量"),
+    weight_metric: str = Query("total_queries", description="归因权重口径: total_queries 或 total_tokens"),
+    top_n: int = Query(5, ge=1, le=20, description="每个关注日返回 Top N 正/负贡献项"),
+    include_markdown: bool = Query(False, description="是否同时返回 Markdown 汇报文本"),
+    use_llm: bool = Query(True, description="是否使用 LLM 生成归因总结，默认启用"),
+):
+    """基于 daily_reports 生成模型级命中率变化归因报告。"""
+    from src.domains.kv.attribution_service import apply_llm_summary, build_attribution_report, render_markdown_report
+
+    def _build_report():
+        report = build_attribution_report(
+            start,
+            end,
+            scenario=scenario,
+            reports_dir=DAILY_REPORTS_DIR,
+            k=k,
+            min_delta_pp=min_delta_pp,
+            max_days=max_days,
+            weight_metric=weight_metric,
+            top_n=top_n,
+        )
+        if use_llm:
+            report = apply_llm_summary(report)
+        if include_markdown:
+            report["markdown"] = render_markdown_report(report)
+        return report
+
+    try:
+        report = await asyncio.to_thread(_build_report)
+    except ValueError as e:
+        raise BizException(status_code=400, code=400, message=str(e))
+    except Exception as e:
+        logger.warning("[attribution] 归因报告生成失败: %s", e, exc_info=True)
+        raise BizException(status_code=500, code=500, message="归因报告生成失败", detail=str(e))
+
+    return StandardResponse(code=0, message="success", data=report, trace_id=None)
 
 
 @router.get("/kv/hit-rate-trend/{task_id}", summary="获取分钟级命中率趋势（预计算）")

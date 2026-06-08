@@ -209,65 +209,7 @@ def _set_failed(task_id: str, stage: str, error_msg: str):
 
 
 # ============================================================
-# Stage 1.5: 逐文件原地预过滤（Fetch → Tokenize 之间）
-# ============================================================
-def _prefilter_inplace(jsonl_files, model_filter):
-    """
-    逐文件原地预过滤：只保留目标模型行，直接覆写原文件。
-
-    保留原始 kv_YYYYMMDD_HHMMSS 文件名 → trend 时间轴正常。
-    全程逐行流式处理，无整文件加载，无 OOM 风险。
-
-    :param jsonl_files: 原始 per-minute jsonl 文件路径列表
-    :param model_filter: 模型名集合，如 {"glm-5", "kimi-k2.5"}；为空则不过滤
-    :return: 过滤后非空文件路径列表（保留原始文件名）
-    """
-    import re as _re
-
-    if not model_filter:
-        return [f for f in jsonl_files if os.path.exists(f) and os.path.getsize(f) > 0]
-
-    escaped = [_re.escape(m) for m in model_filter]
-    pattern = _re.compile(r'qianfan_model:(' + '|'.join(escaped) + r')(?:[^a-zA-Z0-9._-]|$)')
-
-    total_count = 0
-    matched_count = 0
-    result_files = []
-
-    for jf in jsonl_files:
-        if not os.path.exists(jf) or os.path.getsize(jf) == 0:
-            continue
-        tmp_path = jf + ".tmp"
-        file_matched = 0
-        try:
-            with open(jf, "r", encoding="utf-8") as fin, \
-                 open(tmp_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024) as fout:
-                for line in fin:
-                    total_count += 1
-                    if pattern.search(line):
-                        fout.write(line)
-                        file_matched += 1
-            matched_count += file_matched
-            if file_matched > 0:
-                os.replace(tmp_path, jf)
-                result_files.append(jf)
-            else:
-                os.remove(tmp_path)
-                os.remove(jf)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
-
-    filter_pct = matched_count * 100 // max(total_count, 1)
-    logger.info(f"[prefilter] {total_count} → {matched_count} 条 ({filter_pct}%), "
-                f"保留 {len(result_files)} 个 per-minute 文件")
-
-    return result_files
-
-
-# ============================================================
-# Stage 1+2: fetch → prefilter → tokenize (streaming pipeline)
+# Stage 1+2: fetch → tokenize (streaming pipeline)
 # ============================================================
 async def _run_streaming_fetch_tokenize(
     task_id: str, start_datetime: str, end_datetime: str, app_id: str, path: str = ""
@@ -318,12 +260,11 @@ async def _run_streaming_fetch_tokenize(
     # simulate 不再流式逐文件执行（1440 次 -f -c 调用太慢），
     # 改为 tokenize 全部完成后由 _run_simulate_stage 统一走 -L 批量模式
 
-    # 预过滤使用的模型列表（与 tokenize daemon 一致）
+    # 源头 ES 模型过滤列表
     _status_data = _read_status(task_id)
     selected_models = (_status_data.get("query", {}).get("models", []) if _status_data else [])
     if not selected_models:
         selected_models = cfg.get("models", [])
-    prefilter_model_set = set(selected_models) if selected_models else set()
 
     # 启动共享 tokenize daemon —— 整个 pipeline 生命周期内 tokenizer 只加载一次
     if SCRIPTS_DIR not in sys.path:
@@ -388,7 +329,7 @@ async def _run_streaming_fetch_tokenize(
 
         max_scroll_retries = 8
         for scroll_attempt in range(max_scroll_retries + 1):
-            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path)
+            es = ESIndexService(h_start.strftime("%Y-%m-%d"), app_id=app_id, path=path, models=selected_models)
 
             async with fetch_sem:
                 _update_fetch_progress()
@@ -406,8 +347,7 @@ async def _run_streaming_fetch_tokenize(
                     fetch_total_count[0] += hour_count
                     fetch_done_count[0] += 1
 
-                    # 收集本 hour 的 per-minute 文件
-                    hour_jsonl_files = []
+                    # 收集本 hour 的 per-minute 文件，源头已按 api_name 过滤，直接进入 tokenize
                     for fi in result["files"]:
                         fetch_results.append({
                             "file": fi["file"],
@@ -416,21 +356,9 @@ async def _run_streaming_fetch_tokenize(
                             "count": fi["count"]
                         })
                         if fi["count"] > 0 and os.path.exists(fi["file"]):
-                            hour_jsonl_files.append(fi["file"])
-
-                    # ---- Stage 1.5: 逐文件原地预过滤 ----
-                    # 用 regex 过滤目标模型，去除 99%+ 无效记录，
-                    # 保留原始 per-minute 文件名（trend 时间轴依赖）
-                    if hour_jsonl_files:
-                        loop = asyncio.get_event_loop()
-                        filtered_files = await loop.run_in_executor(
-                            None, _prefilter_inplace,
-                            hour_jsonl_files, prefilter_model_set
-                        )
-                        for sf in filtered_files:
                             tokenize_total_submitted[0] += 1
                             t = asyncio.create_task(
-                                _tokenize_single_with_tracking(sf, output_dir, task_id)
+                                _tokenize_single_with_tracking(fi["file"], output_dir, task_id)
                             )
                             tokenize_tasks.append(t)
 
@@ -561,41 +489,7 @@ async def _run_streaming_fetch_tokenize(
         for model, txt_file in r.get("outputs", {}).items():
             model_txt_files.setdefault(model, []).append(txt_file)
 
-    # 模型过滤
-    status = _read_status(task_id)
-    selected_models = status.get("query", {}).get("models", []) if status else []
     all_detected_models = list(model_txt_files.keys())
-    if selected_models:
-        skipped_models = [m for m in model_txt_files if m not in selected_models]
-        model_txt_files = {m: fs for m, fs in model_txt_files.items() if m in selected_models}
-        if skipped_models:
-            logger.info(f"[tokenize] 按模型过滤: 保留 {list(model_txt_files.keys())}，跳过 {skipped_models}")
-
-    if success_files and selected_models and not model_txt_files:
-        msg = (
-            f"序列化完成，但所选模型 {selected_models} 在数据中未检测到。"
-            f"实际检测到的模型: {all_detected_models}"
-        )
-        _update_stage(task_id, "tokenize", {
-            "status": "completed", "message": msg,
-            "model_outputs": {}, "total_lines": 0,
-            "success_count": len(success_files), "failed_count": len(failed_files),
-            "models": [], "all_detected_models": all_detected_models,
-            "files": tokenize_results
-        })
-        _update_stage(task_id, "simulate", {"status": "skipped", "message": "所选模型未匹配，跳过模拟"})
-        zero_result = {}
-        for m in selected_models:
-            zero_result[m] = {
-                "hit_rate": 0, "hit_rate_percent": 0,
-                "hit_count": 0, "total_queries": 0,
-                "total_tokens": 0, "total_entries": 0,
-                "input_files_count": 0
-            }
-        zero_result["all_detected_models"] = all_detected_models
-        zero_result["message"] = msg
-        _set_result(task_id, zero_result)
-        return
 
     if not success_files:
         _update_stage(task_id, "tokenize", {
@@ -610,8 +504,6 @@ async def _run_streaming_fetch_tokenize(
         f"序列化完成，{len(success_files)}/{len(tokenize_results)} 成功，"
         f"{tokenize_total_lines[0]} 条，{len(model_txt_files)} 个模型"
     )
-    if selected_models:
-        status_msg += f"（已过滤，检测到 {len(all_detected_models)} 个模型）"
     _update_stage(task_id, "tokenize", {
         "status": "completed", "message": status_msg,
         "model_outputs": {m: fs for m, fs in model_txt_files.items()},
@@ -662,14 +554,6 @@ async def _run_tokenize_via_daemon(
 
     cfg = _load_olap_config()
 
-    # 读取用户指定的模型过滤列表，透传给 daemon，只写入目标 model 的文件
-    # 用户未指定时，回退到 olap_config.json 的 models 作为默认白名单，
-    # 列表外的模型 tokenizer 未知，跳过以避免乱算浪费时间和磁盘
-    status = _read_status(task_id)
-    selected_models = status.get("query", {}).get("models", []) if status else []
-    if not selected_models:
-        selected_models = cfg.get("models", [])
-
     # 日志落盘目录：task_data_dir/tokenize_logs
     task_data_dir = _task_dir(task_id)
     log_dir = os.path.join(task_data_dir, "tokenize_logs")
@@ -680,7 +564,7 @@ async def _run_tokenize_via_daemon(
             output_dir=slice_output_dir,
             file_prefix=base_name,
             batch_size=cfg["pipeline_tokenize_batch_size"],
-            model_filter=selected_models if selected_models else None,
+            model_filter=None,
             log_dir=log_dir,
         )
         return daemon.wait(dt_id, timeout=86400.0)
@@ -1353,11 +1237,7 @@ async def _run_tokenize_only(task_id: str):
         for model, txt_file in r.get("outputs", {}).items():
             model_txt_files.setdefault(model, []).append(txt_file)
 
-    status = _read_status(task_id)
-    selected_models = status.get("query", {}).get("models", []) if status else []
     all_detected_models = list(model_txt_files.keys())
-    if selected_models:
-        model_txt_files = {m: fs for m, fs in model_txt_files.items() if m in selected_models}
 
     if not success_files:
         _set_failed(task_id, "tokenize", f"全部 {len(failed_files)} 个文件序列化失败")

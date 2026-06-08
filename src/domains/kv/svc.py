@@ -4,7 +4,7 @@ import gc
 import shutil
 import asyncio
 import threading
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, Optional, Sequence
 from datetime import datetime, timedelta
 from .impl import ESIndexClient, _malloc_trim
 from app.conf.config import settings
@@ -37,15 +37,21 @@ def _is_scroll_limit_error(exc: Exception) -> bool:
 
 
 class ESIndexService:
-    def __init__(self, date: str, app_id: str = DEFAULT_APP_ID, path: str = ""):
+    def __init__(self, date: str, app_id: str = DEFAULT_APP_ID, path: str = "",
+                 models: Optional[Sequence[str]] = None):
         """
         :param date: 日期，格式 YYYY-MM-DD，用于确定索引名称
         :param app_id: 应用 ID，默认 app-3Lut8O2E
-        :param path: 场景过滤路径，非空时添加 match_phrase filter
+        :param path: 场景过滤路径，非空时添加 term filter
+        :param models: 模型过滤列表，非空时按 api_name.keyword 精确匹配
         """
         self.date = date
         self.app_id = app_id
         self.path = path
+        raw_models = models.split(",") if isinstance(models, str) else (models or [])
+        self.models = [m.strip() for m in raw_models if m and m.strip()]
+        if self.models:
+            logger.info(f"[es_query] source model filter enabled: {len(self.models)} models")
         self.es = ESIndexClient(
             ES_HOST, ES_AUTH,
             f"{ES_INDEX_PREFIX}{self.date}"
@@ -119,7 +125,7 @@ class ESIndexService:
 
         filters = [
             {"match_all": {}},
-            {"match_phrase": {"function": "parseRequestV2"}},
+            {"term": {"function.keyword": "parseRequestV2"}},
             {
                 "range": {
                     "@timestamp": {
@@ -133,11 +139,15 @@ class ESIndexService:
 
         # app_id 非空时才添加过滤
         if self.app_id:
-            filters.append({"match_phrase": {"app_id": self.app_id}})
+            filters.append({"term": {"app_id.keyword": self.app_id}})
 
-        # 场景过滤：path 非空时添加 match_phrase
+        # 场景过滤：path 非空时添加 term
         if self.path:
-            filters.append({"match_phrase": {"path": self.path}})
+            filters.append({"term": {"path.keyword": self.path}})
+
+        # 模型过滤：models 非空时按 api_name 精确匹配
+        if self.models:
+            filters.append({"terms": {"api_name.keyword": self.models}})
 
         return {
             "query": {

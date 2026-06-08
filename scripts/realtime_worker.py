@@ -371,11 +371,11 @@ def _backup_checkpoint_to_cfs(tmpfs_checkpoint_path: str, model: str):
 
 
 # ============================================================
-# Stage 1.5: 预过滤 + 切片（Fetch → Tokenize 之间）
+# Stage 1.5: 切片（Fetch → Tokenize 之间）
 # ============================================================
-def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
+def _split_jsonl_files(jsonl_files, num_splits, output_dir, task_id):
     """
-    预过滤 + 按时序连续切片：只保留目标模型行，拆成 num_splits 个文件。
+    按时序连续切片，源头 ES 已按 api_name 过滤，不再按 qianfan_model 二次过滤。
 
     ★ 保序性：cache_calc LRU 模拟要求输入严格按时间递增。
     采用两遍扫描 + 连续分块（非 Round-Robin），确保：
@@ -384,38 +384,22 @@ def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
     - 合并切片结果时按编号顺序拼接即可还原完整时序
 
     ★ 流式读写：全程逐行 for line in f，无整文件加载，无 OOM 风险。
-
-    两遍扫描：
-    - Pass 1: 统计匹配行数 → 计算每个切片的行数边界
-    - Pass 2: 流式过滤 + 连续写入各切片文件
     """
-    import re
-
-    escaped = [re.escape(m) for m in models]
-    pattern = re.compile(r'qianfan_model:(' + '|'.join(escaped) + r')(?:[^a-zA-Z0-9._-]|$)')
-
-    # 筛选有效源文件
     valid_files = [f for f in jsonl_files if os.path.exists(f) and os.path.getsize(f) > 0]
     if not valid_files:
         return []
 
-    # ---- Pass 1: 统计匹配行数（纯 I/O，无内存压力）----
-    matched_count = 0
     total_count = 0
     for jf in valid_files:
         with open(jf, "r", encoding="utf-8") as f:
-            for line in f:
+            for _ in f:
                 total_count += 1
-                if pattern.search(line):
-                    matched_count += 1
 
-    if matched_count == 0:
-        logger.info(f"[{task_id}] prefilter: {total_count} 行扫描，0 匹配")
+    if total_count == 0:
+        logger.info(f"[{task_id}] split: 0 行")
         return []
 
-    chunk_size = -(-matched_count // num_splits)  # ceil division
-
-    # ---- Pass 2: 流式过滤 + 按时序连续切片 ----
+    chunk_size = -(-total_count // num_splits)  # ceil division
     split_files = []
     chunk_idx = 0
     written_in_chunk = 0
@@ -425,13 +409,10 @@ def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
         for jf in valid_files:
             with open(jf, "r", encoding="utf-8") as f:
                 for line in f:
-                    if not pattern.search(line):
-                        continue
-                    # 需要打开新切片？
                     if fh is None or (written_in_chunk >= chunk_size and len(split_files) < num_splits):
                         if fh is not None:
                             fh.close()
-                        path = os.path.join(output_dir, f"_filtered_{chunk_idx}.jsonl")
+                        path = os.path.join(output_dir, f"_split_{chunk_idx}.jsonl")
                         split_files.append(path)
                         fh = open(path, "w", encoding="utf-8")
                         written_in_chunk = 0
@@ -442,9 +423,7 @@ def _prefilter_and_split(jsonl_files, models, num_splits, output_dir, task_id):
         if fh is not None:
             fh.close()
 
-    filter_pct = matched_count * 100 // max(total_count, 1)
-    logger.info(f"[{task_id}] prefilter: {total_count} → {matched_count} 条 ({filter_pct}%), "
-                f"连续切为 {len(split_files)} 个文件 (chunk_size={chunk_size})")
+    logger.info(f"[{task_id}] split: {total_count} 条连续切为 {len(split_files)} 个文件 (chunk_size={chunk_size})")
 
     return [f for f in split_files if os.path.exists(f) and os.path.getsize(f) > 0]
 
@@ -480,7 +459,7 @@ async def _process_task(task: dict, daemon_client) -> dict:
         from src.domains.kv.svc import ESIndexService
 
         es_date = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
-        es = ESIndexService(es_date, app_id=app_id, path=path)
+        es = ESIndexService(es_date, app_id=app_id, path=path, models=models)
 
         cfg = _load_realtime_config()
 
@@ -504,19 +483,19 @@ async def _process_task(task: dict, daemon_client) -> dict:
             logger.warning(f"[{task_id}] fetch: 无数据，跳过后续阶段")
             return None
 
-        # ---- Stage 1.5: Pre-filter & Split ----
+        # ---- Stage 1.5: Split ----
         # ★ 通过 run_in_executor 让出事件循环，避免阻塞其他任务的回调
         num_daemons = cfg.get("pipeline_tokenize_concurrency", 2)
-        filtered_dir = os.path.join(task_data_dir, "filtered")
-        os.makedirs(filtered_dir, exist_ok=True)
+        split_dir = os.path.join(task_data_dir, "split")
+        os.makedirs(split_dir, exist_ok=True)
 
         loop = asyncio.get_event_loop()
         split_files = await loop.run_in_executor(
-            None, _prefilter_and_split, jsonl_files, models, num_daemons, filtered_dir, task_id
+            None, _split_jsonl_files, jsonl_files, num_daemons, split_dir, task_id
         )
 
         if not split_files:
-            logger.warning(f"[{task_id}] prefilter: 过滤后无数据，跳过 tokenize")
+            logger.warning(f"[{task_id}] split: 切片后无数据，跳过 tokenize")
             return None
 
         # ---- Stage 2: Tokenize (并行 N 个 daemon) ----
@@ -528,7 +507,7 @@ async def _process_task(task: dict, daemon_client) -> dict:
             base_name = os.path.splitext(os.path.basename(split_file))[0]
             out_dir = os.path.join(tokenized_dir, base_name)
             os.makedirs(out_dir, exist_ok=True)
-            return _tokenize_via_daemon(daemon_client, split_file, out_dir, base_name, models)
+            return _tokenize_via_daemon(daemon_client, split_file, out_dir, base_name)
 
         def _run_tokenize_all():
             """在线程池中并行 tokenize 所有 split 文件，返回 model_txt_files dict"""
@@ -551,9 +530,9 @@ async def _process_task(task: dict, daemon_client) -> dict:
         # ★ 通过 run_in_executor 让出事件循环，避免阻塞其他任务
         model_txt_files = await loop.run_in_executor(None, _run_tokenize_all)
 
-        # 清理预过滤临时文件
+        # 清理切片临时文件
         import shutil
-        shutil.rmtree(filtered_dir, ignore_errors=True)
+        shutil.rmtree(split_dir, ignore_errors=True)
 
         if not model_txt_files:
             logger.warning(f"[{task_id}] tokenize: 无有效输出")
@@ -709,14 +688,14 @@ async def _process_task(task: dict, daemon_client) -> dict:
         gc.collect()
 
 
-def _tokenize_via_daemon(daemon_client, input_file, output_dir, file_prefix, models) -> dict:
+def _tokenize_via_daemon(daemon_client, input_file, output_dir, file_prefix) -> dict:
     """通过常驻 daemon 执行 tokenize（同步阻塞，由 executor 调用）"""
     dt_id = daemon_client.submit(
         input_file=input_file,
         output_dir=output_dir,
         file_prefix=file_prefix,
         batch_size=_load_realtime_config().get("pipeline_tokenize_batch_size", 1000),
-        model_filter=models if models else None,
+        model_filter=None,
     )
     return daemon_client.wait(dt_id, timeout=3600.0)
 
